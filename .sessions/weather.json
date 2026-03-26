@@ -1,0 +1,38 @@
+{
+  "name": "weather",
+  "state": "active",
+  "created_at": "2026-03-26T13:02:59.359417+00:00",
+  "focus_files": [
+    "weather.py"
+  ],
+  "exclude_files": [
+    "data_loader.py",
+    "diag_enricher.py",
+    "explore_geology.py",
+    "grid_builder.py",
+    "landcover_detector.py",
+    "meteo_checker.py",
+    "scoring.py",
+    "species_enricher.py",
+    "visualize.py"
+  ],
+  "read_only_files": [
+    "config.py",
+    "main.py"
+  ],
+  "changes": [
+    {
+      "filename": "weather.py",
+      "hash_before": "7f26c613f3",
+      "hash_after": "7f26c613f3",
+      "lines_added": 0,
+      "lines_removed": 0,
+      "timestamp": "2026-03-26T13:41:34.300772+00:00",
+      "description": ""
+    }
+  ],
+  "description": "Système alertes météo pour prospection morilles",
+  "git_branch": "session/weather",
+  "context_file": "AI_CONTEXT_weather.md",
+  "merged_at": null
+}
