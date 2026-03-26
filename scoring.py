@@ -362,6 +362,25 @@ class MorilleScoring:
                 int(twi_elim.sum()),
             )
             
+        # ── Proximité urbaine éliminatoire ──
+        dist_urban = getattr(self.grid, "dist_urban_grid", None)
+        if isinstance(dist_urban, np.ndarray) and dist_urban.shape == (ny, nx):
+            _existing_urban = detail.get(
+                "urban", np.zeros((ny, nx), dtype=bool)
+            )
+            urban_prox_elim = (
+                np.isfinite(dist_urban)
+                & (dist_urban < config.URBAN_DIST_ELIMINATORY)
+                & ~_existing_urban
+            )
+            detail["urban_proximity"] = urban_prox_elim
+            combined |= urban_prox_elim
+            logger.info(
+                "  Proximité urb. (<%.0fm) : %8d cellules",
+                config.URBAN_DIST_ELIMINATORY,
+                int(urban_prox_elim.sum()),
+            )
+
         # ── Résumé ──
         total_elim = int(combined.sum())
         total_cells = self.final_score.size
@@ -926,3 +945,30 @@ class MorilleScoring:
             meta["class_distribution"] = dist
 
         return meta
+    
+    def get_twi_display_data(self) -> dict[str, Any]:
+        """Données TWI pour affichage cartographique.
+
+        Returns
+        -------
+        dict avec clés :
+            - ``raw``: np.ndarray | None — valeurs TWI brutes
+            - ``score``: np.ndarray | None — score TWI [0,1]
+            - ``waterlog_mask``: np.ndarray | None — masque engorgement (bool)
+            - ``has_data``: bool
+        """
+        builder = self.grid
+        twi_raw = builder.get_twi_raw() if hasattr(builder, "get_twi_raw") else None
+        twi_score = builder.scores.get("twi")
+
+        waterlog_mask: np.ndarray | None = None
+        if twi_raw is not None:
+            valid = np.isfinite(twi_raw)
+            waterlog_mask = valid & (np.asarray(twi_raw) > TWI_WATERLOG)
+
+        return {
+            "raw": twi_raw,
+            "score": twi_score,
+            "waterlog_mask": waterlog_mask,
+            "has_data": twi_raw is not None,
+        }
