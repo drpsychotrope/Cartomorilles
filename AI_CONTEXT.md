@@ -1,7 +1,7 @@
-# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 16:08 UTC | full
+# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 18:51 UTC | full
 
 > Auto-généré par `prepare_context.py` — optimisé Claude Opus
-> Project hash: `777aa58178`
+> Project hash: `f91709e16f`
 
 <role>
 Tu es un expert Python géospatial et mycologue computationnel.
@@ -43,7 +43,7 @@ Maintiens la cohérence avec tes choix antérieurs décrits ci-dessous.
 <style_reference>
 Ton style dans ce projet (à maintenir). Extraits auto-détectés :
 
-# Extrait 1: _zoom_dem (grid_builder.py L397) [score: 8.0]
+# Extrait 1: _zoom_dem (grid_builder.py L402) [score: 8.0]
         def _zoom_dem(self, dem: np.ndarray) -> np.ndarray:
             """Redimensionne le DEM en gérant les NaN."""
             nan_mask = np.isnan(dem)
@@ -64,7 +64,7 @@ Ton style dans ce projet (à maintenir). Extraits auto-détectés :
                 return dem_zoomed
             return np.asarray(zoom(dem, (zy, zx), order=1)).astype(np.float32)
 
-# Extrait 2: score_terrain_roughness (grid_builder.py L716) [score: 7.2]
+# Extrait 2: score_terrain_roughness (grid_builder.py L721) [score: 7.2]
         def score_terrain_roughness(self) -> GridBuilder:
             """Score de rugosité terrain — pénalise les zones accidentées."""
             self._require_terrain()
@@ -89,7 +89,7 @@ Ton style dans ce projet (à maintenir). Extraits auto-détectés :
             self._log_score_stats("terrain_roughness", score)
             return self
 
-# Extrait 3: apply_water_mask (grid_builder.py L1857) [score: 6.5]
+# Extrait 3: apply_water_mask (grid_builder.py L1920) [score: 6.5]
         def apply_water_mask(self) -> GridBuilder:
             """
             Applique le masque des plans d'eau — Fix #24.
@@ -108,14 +108,14 @@ Ton style dans ce projet (à maintenir). Extraits auto-détectés :
             return self
 
 Patterns récurrents détectés :
-- np.asarray() en entrée des fonctions de score (80× trouvé)
+- np.asarray() en entrée des fonctions de score (85× trouvé)
 - np.full_like + masque valid pour NaN-safety (2× trouvé)
-- np.clip en sortie des scores [0, 1] (38× trouvé)
-- Logger avec messages descriptifs pour chaque étape (257× trouvé)
-- Type hints sur toutes les signatures publiques (166× trouvé)
+- np.clip en sortie des scores [0, 1] (41× trouvé)
+- Logger avec messages descriptifs pour chaque étape (258× trouvé)
+- Type hints sur toutes les signatures publiques (173× trouvé)
 - Immutabilité sur les constantes (MappingProxyType, frozenset, tuple) (52× trouvé)
-- from __future__ import annotations en tête (14× trouvé)
-- isinstance guard avant accès .shape (29× trouvé)
+- from __future__ import annotations en tête (13× trouvé)
+- isinstance guard avant accès .shape (32× trouvé)
 </style_reference>
 
 ## IDENTITÉ DU PROJET
@@ -136,16 +136,15 @@ Patterns récurrents détectés :
 
 ```
 D:\Download\Cartomorilles\
-├── config.py                  ✅ (715L) — 🍄 CARTOMORILLES — Configuration du modèle (v2.2.0)
+├── config.py                  ✅ (730L) — 🍄 CARTOMORILLES — Configuration du modèle (v2.2.0)
 ├── data_loader.py             ✅ (2316L) — 🍄 CARTOMORILLES — Chargement des données géogra...
-├── grid_builder.py            ✅ (2154L) — 🍄 CARTOMORILLES — Construction du maillage et c...
-├── scoring.py                 ✅ (928L) — scoring.py — Modèle multicritère pondéré pour C...
-├── visualize.py               ✅ (1249L) — visualize.py — Cartomorilles v2.3.5
+├── grid_builder.py            ✅ (2217L) — 🍄 CARTOMORILLES — Construction du maillage et c...
+├── scoring.py                 ✅ (974L) — scoring.py — Modèle multicritère pondéré pour C...
+├── visualize.py               ✅ (1386L) — visualize.py — Cartomorilles v2.3.5
 ├── landcover_detector.py      ✅ (1153L) — landcover_detector.py — Détection landcover par...
 ├── species_enricher.py        ✅ (916L) — species_enricher.py — Enrichissement essences f...
-├── main.py                    ✅ v2.3.5 (1227L) — 🍄 CARTOMORILLES — Modèle de probabilité de prés...
-├── prepare_context.py         ✅ (3320L) — prepare_context.py — Générateur de contexte IA ...
-├── diag_enricher.py           ✅ (243L) — diag_enricher_viz.py — Visualisation de l'enric...
+├── main.py                    ✅ v2.3.5 (1231L) — 🍄 CARTOMORILLES — Modèle de probabilité de prés...
+├── prepare_context.py         ✅ (3415L) — prepare_context.py — Générateur de contexte IA ...
 ├── weather.py                 ✅ (648L) — weather.py — Alertes météo pour prospection mor...
 └── data/
     ├── Copernicus_DSM_COG_10_N45_00_E005_00_DEM.tif (41.6MB)
@@ -230,7 +229,7 @@ visualize → Folium + GeoTIFF + GPKG
 
 _🍄 CARTOMORILLES — Configuration du modèle (v2.2.0)_
 
-📊 `715L | 504L code | 5fn | 0cls | ebd76a6f`
+📊 `730L | 509L code | 5fn | 0cls | e498d5f5`
 
 **Fonctions publiques :**
 - `resolve_tree_name(raw_name: str | None) → str` — Normalise un nom d'essence vers la forme canonique.
@@ -262,11 +261,11 @@ _🍄 CARTOMORILLES — Chargement des données géographiques_
 
 _🍄 CARTOMORILLES — Construction du maillage et calcul des scores par critère_
 
-📊 `2154L | 1696L code | 0fn | 1cls | 733073ac`
+📊 `2217L | 1743L code | 0fn | 1cls | 49967560`
 
 **class GridBuilder**
   _Construit le maillage spatial et calcule les scores par critère._
-  Publiques : `compute_terrain(self, dem_data: dict[str, Any]) → GridBuilder, score_altitude(self) → GridBuilder, score_slope(self) → GridBuilder, score_terrain_roughness(self) → GridBuilder, score_aspect(self) → GridBuilder, score_twi(self) → GridBuilder, score_distance_water(self, hydro_gdf: gpd.GeoDataFrame | None) → GridBuilder, score_tree_species(self, forest_gdf: gpd.GeoDataFrame | None) → GridBuilder, score_geology(self, geology_gdf: gpd.GeoDataFrame | None) → GridBuilder, score_canopy_openness(self, canopy_data: np.ndarray | None) → GridBuilder, score_ground_cover(self) → GridBuilder, score_disturbance(self, disturbance_data: np.ndarray | None) → GridBuilder, score_forest_edge_distance(self) → GridBuilder, score_favorable_density(self, radius_m: float) → GridBuilder, apply_urban_mask(self, urban_gdf: gpd.GeoDataFrame | None, buffer_m: int) → GridBuilder, apply_water_mask(self) → GridBuilder, apply_landcover_mask(self, landcover_data: dict[str, Any] | None) → GridBuilder, validate_scores(self) → bool, get_score_summary(self) → dict[str, dict[str, float]], get_cell_info(self, ix: int, iy: int) → dict[str, Any]`
+  Publiques : `compute_terrain(self, dem_data: dict[str, Any]) → GridBuilder, score_altitude(self) → GridBuilder, score_slope(self) → GridBuilder, score_terrain_roughness(self) → GridBuilder, score_aspect(self) → GridBuilder, score_twi(self) → GridBuilder, get_twi_raw(self) → np.ndarray | None, score_distance_water(self, hydro_gdf: gpd.GeoDataFrame | None) → GridBuilder, score_tree_species(self, forest_gdf: gpd.GeoDataFrame | None) → GridBuilder, score_geology(self, geology_gdf: gpd.GeoDataFrame | None) → GridBuilder, score_canopy_openness(self, canopy_data: np.ndarray | None) → GridBuilder, score_ground_cover(self) → GridBuilder, score_disturbance(self, disturbance_data: np.ndarray | None) → GridBuilder, score_forest_edge_distance(self) → GridBuilder, score_favorable_density(self, radius_m: float) → GridBuilder, apply_urban_mask(self, urban_gdf: gpd.GeoDataFrame | None, buffer_m: int) → GridBuilder, score_urban_proximity(self) → GridBuilder, apply_water_mask(self) → GridBuilder, apply_landcover_mask(self, landcover_data: dict[str, Any] | None) → GridBuilder, validate_scores(self) → bool, get_score_summary(self) → dict[str, dict[str, float]], get_cell_info(self, ix: int, iy: int) → dict[str, Any]`
   Privées : `_require_terrain, _ensure_l93, _apply_nodata, _fill_nan_dem, _log_score_stats, _rasterize_max, _zoom_dem, _compute_slope_aspect, _compute_roughness, _log_terrain_stats, _compute_twi, _apply_water_type_bonus, _score_from_any_column, _score_geology_from_any_column, _estimate_canopy_from_edges`
 
 **← imports** : config
@@ -277,11 +276,11 @@ _🍄 CARTOMORILLES — Construction du maillage et calcul des scores par critè
 
 _scoring.py — Modèle multicritère pondéré pour Cartomorilles._
 
-📊 `928L | 708L code | 0fn | 1cls | e6b6a53b`
+📊 `974L | 748L code | 0fn | 1cls | 61d77f23`
 
 **class MorilleScoring**
   _Modèle de scoring multicritère pour la probabilité de morilles._
-  Publiques : `compute_weighted_score(self) → MorilleScoring, apply_eliminatory_factors(self) → MorilleScoring, apply_spatial_smoothing(self, sigma: float) → MorilleScoring, classify_probability(self) → MorilleScoring, get_hotspots(self, threshold: float, min_cluster_size: int | None, max_hotspots: int | None) → list[dict[str, Any]], get_elimination_stats(self) → dict[str, int], get_model_metadata(self) → dict[str, Any]`
+  Publiques : `compute_weighted_score(self) → MorilleScoring, apply_eliminatory_factors(self) → MorilleScoring, apply_spatial_smoothing(self, sigma: float) → MorilleScoring, classify_probability(self) → MorilleScoring, get_hotspots(self, threshold: float, min_cluster_size: int | None, max_hotspots: int | None) → list[dict[str, Any]], get_elimination_stats(self) → dict[str, int], get_model_metadata(self) → dict[str, Any], get_twi_display_data(self) → dict[str, Any]`
   Privées : `_require_step, _compute_global_confidence, _build_eliminatory_species_mask, _build_eliminatory_geology_mask, _apply_soft_transition, _get_dominant_value_in_cluster, _reverse_lookup_score, _estimate_perimeter`
 
 **← imports** : config, grid_builder
@@ -292,12 +291,12 @@ _scoring.py — Modèle multicritère pondéré pour Cartomorilles._
 
 _visualize.py — Cartomorilles v2.3.5_
 
-📊 `1249L | 1046L code | 1fn | 1cls | e0301125`
+📊 `1386L | 1166L code | 1fn | 1cls | 9647a9d2`
 
 **class MorilleVisualizer**
   _Génère les sorties visuelles à partir d'un MorilleScoring terminé._
   Publiques : `create_folium_map(self, output: str | Path) → Path, export_geotiff(self, output: str | Path) → Path, export_gpkg_grid(self, output: str | Path, threshold: float) → Path`
-  Privées : `_validate_model, _l93_to_wgs84, _orient_for_overlay, _reproject_to_wgs84, _render_score_png, _render_mask_png, _png_to_data_uri, _build_data_png_uri, _add_interactive_controls, _add_basemaps, _add_probability_overlay, _add_elimination_layers, _add_hotspot_markers, _add_landmarks`
+  Privées : `_validate_model, _l93_to_wgs84, _orient_for_overlay, _reproject_to_wgs84, _render_score_png, _render_mask_png, _png_to_data_uri, _build_data_png_uri, _add_interactive_controls, _add_basemaps, _add_probability_overlay, _add_elimination_layers, _add_hotspot_markers, _add_landmarks, _render_twi_raw_png, _render_twi_score_png, _render_waterlog_png, _add_twi_layers`
 
 **Privées** : `_default_landmarks`
 
@@ -339,7 +338,7 @@ _species_enricher.py — Enrichissement essences forestières inconnues._
 
 _🍄 CARTOMORILLES — Modèle de probabilité de présence de morilles_
 
-📊 `1227L | 905L code | 14fn | 0cls | b6860d2c`
+📊 `1231L | 907L code | 14fn | 0cls | 8357537c`
 
 **Fonctions publiques :**
 - `setup_logging(output_dir: Path, verbose: bool) → None` — Configure le logging : console (INFO ou DEBUG) + fichier ...
@@ -364,7 +363,7 @@ _🍄 CARTOMORILLES — Modèle de probabilité de présence de morilles_
 
 _prepare_context.py — Générateur de contexte IA + Gestionnaire de sessions._
 
-📊 `3320L | 2785L code | 16fn | 25cls | 71eb9f23`
+📊 `3415L | 2864L code | 17fn | 25cls | ccbf5324`
 
 **class FunctionInfo**
   _Métadonnées d'une fonction._
@@ -456,7 +455,7 @@ _prepare_context.py — Générateur de contexte IA + Gestionnaire de sessions._
 
 **class SessionManager**
   _Orchestrateur principal des sessions parallèles._
-  Publiques : `create(self, name: str, focus_files: list[str], description: str, read_only: list[str] | None) → Session, generate_context(self, name: str) → Path, apply_changes(self, session_name: str, filename: str, new_content: str, description: str) → FileChange, merge(self, session_name: str) → MergeResult, merge_all(self) → list[MergeResult], abort(self, session_name: str) → None, status(self, session_name: str) → dict[str, Any], list_sessions(self, state: SessionState | None) → list[Session], get_history(self) → list[dict[str, Any]]`
+  Publiques : `create(self, name: str, focus_files: list[str], description: str, read_only: list[str] | None) → Session, generate_context(self, name: str) → Path, apply_changes(self, session_name: str, filename: str, new_content: str, description: str) → FileChange, merge(self, session_name: str) → MergeResult, merge_all(self) → list[MergeResult], abort(self, session_name: str) → None, extend(self, session_name: str, new_files: list[str]) → Session, status(self, session_name: str) → dict[str, Any], list_sessions(self, state: SessionState | None) → list[Session], get_history(self) → list[dict[str, Any]]`
   Privées : `_ensure_dirs, _session_file, _load_session, _save_session, _load_history, _append_history, _generate_session_context, _regenerate_main_context`
 
 **Fonctions publiques :**
@@ -468,26 +467,11 @@ _prepare_context.py — Générateur de contexte IA + Gestionnaire de sessions._
 - `cli_session_merge(args: argparse.Namespace) → None`
 - `cli_session_merge_all(args: argparse.Namespace) → None`
 - `cli_session_abort(args: argparse.Namespace) → None`
+- `cli_session_extend(args: argparse.Namespace) → None`
 - `cli_session_history(args: argparse.Namespace) → None`
 - `main() → None`
 
 **Privées** : `_project_to_json, _log_session_table, _log_locks_table, _build_context_parser, _build_session_parser, _run_context`
-
----
-
-### diag_enricher.py
-
-_diag_enricher_viz.py — Visualisation de l'enrichissement species_enricher._
-
-📊 `243L | 194L code | 6fn | 0cls | bb6accfe`
-
-**Fonctions publiques :**
-- `main(args: argparse.Namespace) → int` — Point d'entrée principal.
-- `build_parser() → argparse.ArgumentParser` — Parser CLI.
-
-**Privées** : `_km_ticks, _stat_box, _build_pipeline, _render`
-
-**← imports** : config, data_loader, grid_builder, species_enricher
 
 ---
 
@@ -560,7 +544,7 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 | `BBOX` | `MappingProxyType({'xmin': _CENTER_X_L93 - _RADIUS_M, 'ymi...` |
 | `BBOX_WGS84` | `MappingProxyType({'west': 5.58653, 'south': 45.098498, 'e...` |
 | `MAP_CENTER` | `MappingProxyType({'lat': 45.1885, 'lon': 5.7245})` |
-| `CELL_SIZE` | `10.0` |
+| `CELL_SIZE` | `5.0` |
 
 ### Essences
 | Constante | Valeur |
@@ -610,7 +594,7 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 ### Poids
 | Constante | Valeur |
 |---|---|
-| `_WEIGHTS_DICT` | `{'geology': 0.2, 'canopy_openness': 0.14, 'tree_species':...` |
+| `_WEIGHTS_DICT` | `{'geology': 0.18, 'tree_species': 0.14, 'canopy_openness'...` |
 | `WEIGHTS` | `MappingProxyType(_WEIGHTS_DICT)` |
 
 ### TWI
@@ -627,6 +611,10 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 | Constante | Valeur |
 |---|---|
 | `DATA_BUFFER` | `500.0` |
+| `URBAN_DIST_ELIMINATORY` | `15.0` |
+| `URBAN_DIST_PENALTY` | `100.0` |
+| `URBAN_DIST_FULL` | `250.0` |
+| `URBAN_PROXIMITY_FLOOR` | `0.05` |
 | `_DISTURBANCE_DICT` | `{'coupe_recente_1_3ans': 0.9, 'chemin_forestier': 0.7, 'c...` |
 | `DISTURBANCE_SCORES` | `MappingProxyType(_DISTURBANCE_DICT)` |
 
@@ -635,7 +623,6 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 | Module | Importe depuis |
 |---|---|
 | `data_loader` | `config` |
-| `diag_enricher` | `config`, `data_loader`, `grid_builder`, `species_enricher` |
 | `grid_builder` | `config` |
 | `landcover_detector` | `config` |
 | `main` | `config`, `data_loader`, `grid_builder`, `landcover_detector`, `scoring`, `species_enricher`, `visualize` |
@@ -644,7 +631,7 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 | `visualize` | `config`, `scoring` |
 | `weather` | `config` |
 
-**Hub** : `config` (9×), `grid_builder` (3×), `scoring` (2×)
+**Hub** : `config` (8×), `grid_builder` (2×), `scoring` (2×)
 
 ## CONVENTIONS PYLANCE (P1-P10)
 
@@ -683,17 +670,20 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 
 | Sév. | Tag | Fichier | L | Description |
 |---|---|---|---|---|
+| 🟡 | TODO | `config.py` | 125 | grid_builder.py — implémenter score_urban_proximity() |
+| 🟡 | TODO | `config.py` | 131 | scoring.py — ajouter urban_proximity < URBAN_DIST_ELIMINATORY |
+| 🟡 | TODO | `grid_builder.py` | 1854 | main.py — appeler grid.score_urban_proximity() après apply_urban_mask(... |
 | 🟡 | TODO | `prepare_context.py` | 994 | `" |
 | 🟡 | TODO | `prepare_context.py` | 1041 | [desc]` dans le code, " |
 | 🟡 | TODO | `prepare_context.py` | 1731 | [desc]` mais ne PAS corriger." |
 
-**Total** : 3 (3 TODO)
+**Total** : 6 (6 TODO)
 
 ## STATISTIQUES
 
-**Code** : 11 modules | 14,869L total | 11,857L code | 50 fn | 35 cls
+**Code** : 10 modules | 14,986L total | 11,956L code | 45 fn | 35 cls
 **Data** : 48 fichiers | 413.4 MB
-**Santé** : 3 TODOs | 10 décisions verrouillées
+**Santé** : 6 TODOs | 10 décisions verrouillées
 
 <current_focus>
 FOCUS : [à définir dans ton premier message]
@@ -712,4 +702,4 @@ INTERDIT: ___
 </checkpoint>
 
 ---
-_Généré le 2026-03-26 16:08 UTC | 715 lignes | ~1038 lignes restantes pour prompt + code_
+_Généré le 2026-03-26 18:51 UTC | 705 lignes | ~1048 lignes restantes pour prompt + code_

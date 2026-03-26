@@ -56,5 +56,39 @@
       "landcover_detector.py"
     ],
     "timestamp": "2026-03-26T17:19:08.051070+00:00"
+  },
+  {
+    "action": "merge",
+    "session": "TWI",
+    "files": [
+      "scoring.py",
+      "visualize.py",
+      "grid_builder.py"
+    ],
+    "timestamp": "2026-03-26T18:51:36.385211+00:00"
+  },
+  {
+    "action": "extend",
+    "session": "poids",
+    "files": [
+      "grid_builder.py"
+    ],
+    "timestamp": "2026-03-26T18:51:47.019949+00:00"
+  },
+  {
+    "action": "extend",
+    "session": "poids",
+    "files": [
+      "main.py"
+    ],
+    "timestamp": "2026-03-26T18:51:49.690993+00:00"
+  },
+  {
+    "action": "extend",
+    "session": "poids",
+    "files": [
+      "scoring.py"
+    ],
+    "timestamp": "2026-03-26T18:52:08.673632+00:00"
   }
 ]
