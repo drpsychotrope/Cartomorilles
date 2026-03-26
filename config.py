@@ -77,7 +77,7 @@ MAP_CENTER: MappingProxyType = MappingProxyType({
     "lon": 5.7245,
 })
 
-CELL_SIZE: float = 10.0
+CELL_SIZE: float = 5.0
 DATA_BUFFER: float = 500.0
 
 

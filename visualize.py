@@ -166,11 +166,7 @@ class MorilleVisualizer:
         self._src_crs = CRS.from_epsg(2154)
         self._dst_crs = CRS.from_epsg(4326)
 
-        (
-            self._dst_transform,
-            self._dst_width,
-            self._dst_height,
-        ) = calculate_default_transform(
+        dst_transform, dst_width, dst_height = calculate_default_transform(
             self._src_crs,
             self._dst_crs,
             self.grid.nx,
@@ -180,6 +176,11 @@ class MorilleVisualizer:
             right=self._xmax_l93,
             top=self._ymax_l93,
         )
+        assert dst_width is not None, "calculate_default_transform returned None width"
+        assert dst_height is not None, "calculate_default_transform returned None height"
+        self._dst_transform = dst_transform
+        self._dst_width: int = dst_width
+        self._dst_height: int = dst_height
 
         # Emprise WGS84 exacte depuis le transform reprojeté
         self._west = self._dst_transform.c

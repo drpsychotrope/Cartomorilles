@@ -1,7 +1,7 @@
-# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 13:46 UTC | full
+# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 16:08 UTC | full
 
 > Auto-généré par `prepare_context.py` — optimisé Claude Opus
-> Project hash: `2bfb9e415c`
+> Project hash: `777aa58178`
 
 <role>
 Tu es un expert Python géospatial et mycologue computationnel.
@@ -108,14 +108,14 @@ Ton style dans ce projet (à maintenir). Extraits auto-détectés :
             return self
 
 Patterns récurrents détectés :
-- np.asarray() en entrée des fonctions de score (68× trouvé)
+- np.asarray() en entrée des fonctions de score (80× trouvé)
 - np.full_like + masque valid pour NaN-safety (2× trouvé)
-- np.clip en sortie des scores [0, 1] (35× trouvé)
+- np.clip en sortie des scores [0, 1] (38× trouvé)
 - Logger avec messages descriptifs pour chaque étape (257× trouvé)
-- Type hints sur toutes les signatures publiques (163× trouvé)
+- Type hints sur toutes les signatures publiques (166× trouvé)
 - Immutabilité sur les constantes (MappingProxyType, frozenset, tuple) (52× trouvé)
-- from __future__ import annotations en tête (15× trouvé)
-- isinstance guard avant accès .shape (30× trouvé)
+- from __future__ import annotations en tête (14× trouvé)
+- isinstance guard avant accès .shape (29× trouvé)
 </style_reference>
 
 ## IDENTITÉ DU PROJET
@@ -140,14 +140,12 @@ D:\Download\Cartomorilles\
 ├── data_loader.py             ✅ (2316L) — 🍄 CARTOMORILLES — Chargement des données géogra...
 ├── grid_builder.py            ✅ (2154L) — 🍄 CARTOMORILLES — Construction du maillage et c...
 ├── scoring.py                 ✅ (928L) — scoring.py — Modèle multicritère pondéré pour C...
-├── visualize.py               ✅ (1098L) — visualize.py — Cartomorilles v2.2.0
+├── visualize.py               ✅ (1249L) — visualize.py — Cartomorilles v2.3.5
 ├── landcover_detector.py      ✅ (1153L) — landcover_detector.py — Détection landcover par...
 ├── species_enricher.py        ✅ (916L) — species_enricher.py — Enrichissement essences f...
 ├── main.py                    ✅ v2.3.5 (1227L) — 🍄 CARTOMORILLES — Modèle de probabilité de prés...
-├── prepare_context.py         ✅ (3323L) — prepare_context.py — Générateur de contexte IA ...
+├── prepare_context.py         ✅ (3320L) — prepare_context.py — Générateur de contexte IA ...
 ├── diag_enricher.py           ✅ (243L) — diag_enricher_viz.py — Visualisation de l'enric...
-├── explore_geology.py         ✅ (101L) — explore_geology.py — Exploration BDCharm-50 Isère.
-├── meteo_checker.py           ✅ (0L)
 ├── weather.py                 ✅ (648L) — weather.py — Alertes météo pour prospection mor...
 └── data/
     ├── Copernicus_DSM_COG_10_N45_00_E005_00_DEM.tif (41.6MB)
@@ -232,7 +230,7 @@ visualize → Folium + GeoTIFF + GPKG
 
 _🍄 CARTOMORILLES — Configuration du modèle (v2.2.0)_
 
-📊 `715L | 504L code | 5fn | 0cls | cbf36e29`
+📊 `715L | 504L code | 5fn | 0cls | ebd76a6f`
 
 **Fonctions publiques :**
 - `resolve_tree_name(raw_name: str | None) → str` — Normalise un nom d'essence vers la forme canonique.
@@ -292,14 +290,14 @@ _scoring.py — Modèle multicritère pondéré pour Cartomorilles._
 
 ### visualize.py
 
-_visualize.py — Cartomorilles v2.2.0_
+_visualize.py — Cartomorilles v2.3.5_
 
-📊 `1098L | 907L code | 1fn | 1cls | f157ba00`
+📊 `1249L | 1046L code | 1fn | 1cls | e0301125`
 
 **class MorilleVisualizer**
   _Génère les sorties visuelles à partir d'un MorilleScoring terminé._
   Publiques : `create_folium_map(self, output: str | Path) → Path, export_geotiff(self, output: str | Path) → Path, export_gpkg_grid(self, output: str | Path, threshold: float) → Path`
-  Privées : `_validate_model, _l93_to_wgs84, _add_interactive_controls, _add_basemaps, _add_probability_overlay, _add_elimination_layers, _add_detailed_grid, _add_hotspot_markers, _add_landmarks`
+  Privées : `_validate_model, _l93_to_wgs84, _orient_for_overlay, _reproject_to_wgs84, _render_score_png, _render_mask_png, _png_to_data_uri, _build_data_png_uri, _add_interactive_controls, _add_basemaps, _add_probability_overlay, _add_elimination_layers, _add_hotspot_markers, _add_landmarks`
 
 **Privées** : `_default_landmarks`
 
@@ -366,7 +364,7 @@ _🍄 CARTOMORILLES — Modèle de probabilité de présence de morilles_
 
 _prepare_context.py — Générateur de contexte IA + Gestionnaire de sessions._
 
-📊 `3323L | 2788L code | 16fn | 25cls | 9b8e99b9`
+📊 `3320L | 2785L code | 16fn | 25cls | 71eb9f23`
 
 **class FunctionInfo**
   _Métadonnées d'une fonction._
@@ -493,22 +491,6 @@ _diag_enricher_viz.py — Visualisation de l'enrichissement species_enricher._
 
 ---
 
-### explore_geology.py
-
-_explore_geology.py — Exploration BDCharm-50 Isère._
-
-📊 `101L | 76L code | 0fn | 0cls | 0b7daee6`
-
-**← imports** : config
-
----
-
-### meteo_checker.py
-
-📊 `0L | 0L code | 0fn | 0cls | d41d8cd9`
-
----
-
 ### weather.py
 
 _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
@@ -578,7 +560,7 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 | `BBOX` | `MappingProxyType({'xmin': _CENTER_X_L93 - _RADIUS_M, 'ymi...` |
 | `BBOX_WGS84` | `MappingProxyType({'west': 5.58653, 'south': 45.098498, 'e...` |
 | `MAP_CENTER` | `MappingProxyType({'lat': 45.1885, 'lon': 5.7245})` |
-| `CELL_SIZE` | `20.0` |
+| `CELL_SIZE` | `10.0` |
 
 ### Essences
 | Constante | Valeur |
@@ -654,7 +636,6 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 |---|---|
 | `data_loader` | `config` |
 | `diag_enricher` | `config`, `data_loader`, `grid_builder`, `species_enricher` |
-| `explore_geology` | `config` |
 | `grid_builder` | `config` |
 | `landcover_detector` | `config` |
 | `main` | `config`, `data_loader`, `grid_builder`, `landcover_detector`, `scoring`, `species_enricher`, `visualize` |
@@ -663,7 +644,7 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 | `visualize` | `config`, `scoring` |
 | `weather` | `config` |
 
-**Hub** : `config` (10×), `grid_builder` (3×), `scoring` (2×)
+**Hub** : `config` (9×), `grid_builder` (3×), `scoring` (2×)
 
 ## CONVENTIONS PYLANCE (P1-P10)
 
@@ -702,15 +683,15 @@ _weather.py — Alertes météo pour prospection morilles (Meteoblue)._
 
 | Sév. | Tag | Fichier | L | Description |
 |---|---|---|---|---|
-| 🟡 | TODO | `prepare_context.py` | 997 | `" |
-| 🟡 | TODO | `prepare_context.py` | 1044 | [desc]` dans le code, " |
-| 🟡 | TODO | `prepare_context.py` | 1734 | [desc]` mais ne PAS corriger." |
+| 🟡 | TODO | `prepare_context.py` | 994 | `" |
+| 🟡 | TODO | `prepare_context.py` | 1041 | [desc]` dans le code, " |
+| 🟡 | TODO | `prepare_context.py` | 1731 | [desc]` mais ne PAS corriger." |
 
 **Total** : 3 (3 TODO)
 
 ## STATISTIQUES
 
-**Code** : 13 modules | 14,822L total | 11,797L code | 50 fn | 35 cls
+**Code** : 11 modules | 14,869L total | 11,857L code | 50 fn | 35 cls
 **Data** : 48 fichiers | 413.4 MB
 **Santé** : 3 TODOs | 10 décisions verrouillées
 
@@ -731,4 +712,4 @@ INTERDIT: ___
 </checkpoint>
 
 ---
-_Généré le 2026-03-26 13:46 UTC | 734 lignes | ~1019 lignes restantes pour prompt + code_
+_Généré le 2026-03-26 16:08 UTC | 715 lignes | ~1038 lignes restantes pour prompt + code_
