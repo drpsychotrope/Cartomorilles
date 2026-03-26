@@ -191,6 +191,7 @@ class GridBuilder:
         self.slope: np.ndarray | None = None
         self.aspect: np.ndarray | None = None
         self.roughness: np.ndarray | None = None
+        self.twi: np.ndarray | None = None 
         self.dist_water_grid: np.ndarray | None = None
 
         # Rasters intermédiaires (pour diagnostics)
@@ -383,7 +384,7 @@ class GridBuilder:
         self._terrain_computed = True
         self._log_terrain_stats()
 
-                # ── TWI — Topographic Wetness Index (fix #46 v2.3.5) ──
+    # ── TWI — Topographic Wetness Index (fix #46 v2.3.5) ──
         self._twi = self._compute_twi(dem_filled, self.cell_size)
         logger.info(
             "   TWI       : %.1f–%.1f (moy=%.1f)",
@@ -766,93 +767,85 @@ class GridBuilder:
         return self
 
     def score_twi(self) -> GridBuilder:
-        """
-        Score TWI — Topographic Wetness Index.
+        """Score TWI — courbe contrastée avec plateau optimal marqué."""
+        self._require_terrain()
+        _twi = self.twi
+        assert _twi is not None
 
-        Morilles : sol bien drainé mais humide → TWI optimal 6–10.
-        Crêtes sèches (TWI<3) et zones engorgées (TWI>14) pénalisées.
+        twi_arr = np.asarray(_twi, dtype=np.float32)
 
-        Fix #46 v2.3.5.
-        """
-        twi: np.ndarray | None = getattr(self, "_twi", None)  # P4
-        if twi is None:
-            logger.warning(
-                "⚠️ TWI non calculé — compute_terrain() d'abord"
-            )
-            self.scores["twi"] = np.full(
-                (self.ny, self.nx), 0.50, dtype=np.float32
-            )
-            return self
-
-        score = np.full_like(twi, dtype=np.float32, fill_value=0.0)
         opt_lo, opt_hi = TWI_OPTIMAL
+        dry_limit = TWI_DRY_LIMIT
+        wet_limit = TWI_WET_LIMIT
+        waterlog = TWI_WATERLOG
+        dry_floor = TWI_DRY_FLOOR
+        wet_floor = TWI_WET_FLOOR
 
-        # ── Zone optimale : score = 1.0 ──
-        optimal_mask = (twi >= opt_lo) & (twi <= opt_hi)
-        score[optimal_mask] = 1.0
+        score = np.full_like(twi_arr, np.nan, dtype=np.float32)
+        valid = np.isfinite(twi_arr)
 
-        # ── Zone sèche : TWI < opt_lo ──
-        # Transition linéaire de DRY_FLOOR (TWI=DRY_LIMIT) à 1.0 (TWI=opt_lo)
-        dry_zone = (twi >= TWI_DRY_LIMIT) & (twi < opt_lo)
-        if float(np.sum(dry_zone)) > 0:
-            score[dry_zone] = TWI_DRY_FLOOR + (1.0 - TWI_DRY_FLOOR) * (
-                (twi[dry_zone] - TWI_DRY_LIMIT) / (opt_lo - TWI_DRY_LIMIT)
-            )
+        # --- Plateau optimal [opt_lo, opt_hi] → 1.0 ---
+        m_opt = valid & (twi_arr >= opt_lo) & (twi_arr <= opt_hi)
+        score[m_opt] = 1.0
 
-        # Très sec : TWI < DRY_LIMIT
-        very_dry = twi < TWI_DRY_LIMIT
-        score[very_dry] = TWI_DRY_FLOOR
+        # --- Zone sèche : dry_limit → opt_lo ---
+        # Concave (exposant < 1) : remonte vite depuis dry_floor
+        m_dry_mid = valid & (twi_arr >= dry_limit) & (twi_arr < opt_lo)
+        if np.any(m_dry_mid):
+            t = (twi_arr[m_dry_mid] - dry_limit) / (opt_lo - dry_limit)
+            score[m_dry_mid] = dry_floor + (1.0 - dry_floor) * t**0.6
 
-        # ── Zone humide : TWI > opt_hi ──
-        # Transition linéaire de 1.0 (TWI=opt_hi) à WET_FLOOR (TWI=WET_LIMIT)
-        wet_zone = (twi > opt_hi) & (twi <= TWI_WET_LIMIT)
-        if float(np.sum(wet_zone)) > 0:
-            score[wet_zone] = 1.0 - (1.0 - TWI_WET_FLOOR) * (
-                (twi[wet_zone] - opt_hi) / (TWI_WET_LIMIT - opt_hi)
-            )
+        # --- Zone très sèche : < dry_limit → dry_floor
+        m_very_dry = valid & (twi_arr < dry_limit)
+        score[m_very_dry] = dry_floor
 
-        # Très humide : WET_LIMIT < TWI < WATERLOG
-        very_wet = (twi > TWI_WET_LIMIT) & (twi <= TWI_WATERLOG)
-        score[very_wet] = TWI_WET_FLOOR
+        # --- Zone humide : opt_hi → wet_limit ---
+        # Convexe (exposant > 1) : descend doucement puis accélère
+        m_wet_mid = valid & (twi_arr > opt_hi) & (twi_arr <= wet_limit)
+        if np.any(m_wet_mid):
+            t = (twi_arr[m_wet_mid] - opt_hi) / (wet_limit - opt_hi)
+            score[m_wet_mid] = 1.0 - (1.0 - wet_floor) * t**1.5
 
-        # Marécage : TWI > WATERLOG → 0.0
-        waterlog = twi > TWI_WATERLOG
-        score[waterlog] = 0.0
+        # --- Zone très humide : wet_limit → waterlog ---
+        m_wet_high = valid & (twi_arr > wet_limit) & (twi_arr <= waterlog)
+        if np.any(m_wet_high):
+            t = (twi_arr[m_wet_high] - wet_limit) / (waterlog - wet_limit)
+            score[m_wet_high] = wet_floor * (1.0 - t)
 
-        # ── Clip final ──
-        score = np.clip(score, 0.0, 1.0).astype(np.float32)
+        # --- Engorgement : > waterlog → 0.0 ---
+        m_waterlog = valid & (twi_arr > waterlog)
+        score[m_waterlog] = 0.0
 
+        score = self._apply_nodata(np.clip(score, 0, 1))
         self.scores["twi"] = score
+        self.score_confidence["twi"] = 0.85
+        self._log_score_stats("twi", score)
 
-        # ── Stats ──
-        n_optimal = int(np.sum(optimal_mask))
-        n_dry = int(np.sum(twi < opt_lo))
-        n_wet = int(np.sum(twi > opt_hi))
-        n_waterlog_cells = int(np.sum(waterlog))
-        logger.info(
-            "✅ Score twi                  : min=%.2f  max=%.2f  "
-            "moy=%.2f  med=%.2f  >0.7=%.1f%%  =0=%.1f%%",
-            float(np.min(score)),
-            float(np.max(score)),
-            float(np.mean(score)),
-            float(np.median(score)),
-            float(np.sum(score > 0.7)) / score.size * 100,
-            float(np.sum(score == 0.0)) / score.size * 100,
-        )
-        logger.info(
-            "   TWI : optimal(%.0f-%.0f)=%s | sec(<%s)=%s | humide(>%s)=%s | engorgé(>%s)=%s",
-            opt_lo,
-            opt_hi,
-            f"{n_optimal:,}",
-            f"{TWI_DRY_LIMIT:.0f}",
-            f"{n_dry:,}",
-            f"{opt_hi:.0f}",
-            f"{n_wet:,}",
-            f"{TWI_WATERLOG:.0f}",
-            f"{n_waterlog_cells:,}",
-        )
+        # --- Stats distribution pour diagnostic ---
+        if valid.any():
+            twi_valid = twi_arr[valid]
+            logger.info(
+                "  TWI distribution — min=%.1f  med=%.1f  max=%.1f  "
+                "dry(<%.0f)=%d  optimal(%s–%s)=%d  wet(>%.0f)=%d  waterlog(>%.0f)=%d",
+                float(np.nanmin(twi_valid)),
+                float(np.nanmedian(twi_valid)),
+                float(np.nanmax(twi_valid)),
+                dry_limit,
+                int(np.sum(m_very_dry)),
+                opt_lo,
+                opt_hi,
+                int(np.sum(m_opt)),
+                wet_limit,
+                int(np.sum(m_wet_mid)) + int(np.sum(m_wet_high)),
+                waterlog,
+                int(np.sum(m_waterlog)),
+            )
 
         return self
+
+    def get_twi_raw(self) -> np.ndarray | None:
+        """Retourne le raster TWI brut (valeurs hydrologiques). None si pas calculé."""
+        return self.twi if hasattr(self, "twi") and self.twi is not None else None
 
     # ═══════════════════════════════════════════════════════
     #  SCORES ÉCOLOGIQUES (données vectorielles)
