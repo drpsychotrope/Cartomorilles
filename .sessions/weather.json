@@ -1,6 +1,6 @@
 {
   "name": "weather",
-  "state": "active",
+  "state": "conflict",
   "created_at": "2026-03-26T13:02:59.359417+00:00",
   "focus_files": [
     "weather.py"
