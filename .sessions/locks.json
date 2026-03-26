@@ -1,0 +1,16 @@
+{
+  "species_enricher.py": {
+    "filename": "species_enricher.py",
+    "session_name": "enricher",
+    "lock_type": "exclusive",
+    "locked_at": "2026-03-26T13:02:56.982569+00:00",
+    "file_hash_at_lock": "b4b8c8a3ed"
+  },
+  "config.py": {
+    "filename": "config.py",
+    "session_name": "enricher",
+    "lock_type": "read_only",
+    "locked_at": "2026-03-26T13:02:56.982569+00:00",
+    "file_hash_at_lock": "357ff5b85c"
+  }
+}
