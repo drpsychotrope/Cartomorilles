@@ -99,17 +99,18 @@ DATA_BUFFER: float = 500.0
 #  disturbance    = 0.04
 
 _WEIGHTS_DICT: dict[str, float] = {
-    "geology":            0.20,
-    "canopy_openness":    0.14,
-    "tree_species":       0.16,
-    "altitude":           0.09,
-    "slope":              0.09,
-    "twi":                0.08,
-    "dist_water":         0.06,
-    "terrain_roughness":  0.06,
-    "aspect":             0.04,
+    "geology":            0.18,
+    "tree_species":       0.14,
+    "canopy_openness":    0.13,
+    "twi":                0.11,
+    "urban_proximity":    0.10,
+    "altitude":           0.08,
+    "slope":              0.06,
+    "dist_water":         0.05,
+    "terrain_roughness":  0.05,
     "ground_cover":       0.04,
-    "disturbance":        0.04,
+    "disturbance":        0.03,
+    "aspect":             0.03,
 }
 
 _w_total = sum(_WEIGHTS_DICT.values())
@@ -120,6 +121,20 @@ if abs(_w_total - 1.0) > 0.001:
 
 WEIGHTS: MappingProxyType = MappingProxyType(_WEIGHTS_DICT)
 
+# ── Proximité urbaine ─────────────────────────────────────────────
+# TODO: grid_builder.py — implémenter score_urban_proximity()
+#       EDT sur urban_mask inversé → distance en mètres × CELL_SIZE
+#       < URBAN_DIST_ELIMINATORY  → 0.0
+#       ELIMINATORY..PENALTY      → rampe linéaire [FLOOR..0.6]
+#       PENALTY..FULL             → rampe linéaire [0.6..1.0]
+#       > URBAN_DIST_FULL         → 1.0
+# TODO: scoring.py — ajouter urban_proximity < URBAN_DIST_ELIMINATORY
+#       comme facteur éliminatoire (score → 0)
+
+URBAN_DIST_ELIMINATORY: float = 15.0    # m — score dur → 0
+URBAN_DIST_PENALTY: float = 100.0       # m — fin de pénalité forte
+URBAN_DIST_FULL: float = 250.0          # m — plus aucune pénalité
+URBAN_PROXIMITY_FLOOR: float = 0.05     # plancher zone tampon
 
 # ═══════════════════════════════════════════════════════════════
 #  ESSENCES FORESTIÈRES
