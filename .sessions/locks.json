@@ -40,5 +40,12 @@
     "lock_type": "shared",
     "locked_at": "2026-03-26T17:04:12.929010+00:00",
     "file_hash_at_lock": "df0fc6697c"
+  },
+  "landcover_detector.py": {
+    "filename": "landcover_detector.py",
+    "session_name": "water",
+    "lock_type": "exclusive",
+    "locked_at": "2026-03-26T17:19:06.437120+00:00",
+    "file_hash_at_lock": "e7a36dbe2e"
   }
 }
