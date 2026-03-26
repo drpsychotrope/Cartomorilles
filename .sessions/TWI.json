@@ -1,0 +1,25 @@
+{
+  "name": "TWI",
+  "state": "active",
+  "created_at": "2026-03-26T17:03:22.011321+00:00",
+  "focus_files": [
+    "grid_builder.py",
+    "main.py",
+    "visualize.py",
+    "scoring.py"
+  ],
+  "exclude_files": [
+    "data_loader.py",
+    "landcover_detector.py",
+    "species_enricher.py",
+    "weather.py"
+  ],
+  "read_only_files": [
+    "config.py"
+  ],
+  "changes": [],
+  "description": "amélioration du twi",
+  "git_branch": "session/TWI",
+  "context_file": "AI_CONTEXT_TWI.md",
+  "merged_at": null
+}

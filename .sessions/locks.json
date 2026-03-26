@@ -36,9 +36,9 @@
   },
   "config.py": {
     "filename": "config.py",
-    "session_name": "TWI",
-    "lock_type": "read_only",
-    "locked_at": "2026-03-26T17:03:20.081084+00:00",
+    "session_name": "poids",
+    "lock_type": "shared",
+    "locked_at": "2026-03-26T17:04:12.929010+00:00",
     "file_hash_at_lock": "df0fc6697c"
   }
 }
