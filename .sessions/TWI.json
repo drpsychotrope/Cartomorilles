@@ -17,7 +17,17 @@
   "read_only_files": [
     "config.py"
   ],
-  "changes": [],
+  "changes": [
+    {
+      "filename": "scoring.py",
+      "hash_before": "0d119c5d41",
+      "hash_after": "0d119c5d41",
+      "lines_added": 0,
+      "lines_removed": 0,
+      "timestamp": "2026-03-26T18:20:24.087775+00:00",
+      "description": ""
+    }
+  ],
   "description": "amélioration du twi",
   "git_branch": "session/TWI",
   "context_file": "AI_CONTEXT_TWI.md",
