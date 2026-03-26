@@ -926,3 +926,30 @@ class MorilleScoring:
             meta["class_distribution"] = dist
 
         return meta
+    
+    def get_twi_display_data(self) -> dict[str, Any]:
+        """Données TWI pour affichage cartographique.
+
+        Returns
+        -------
+        dict avec clés :
+            - ``raw``: np.ndarray | None — valeurs TWI brutes
+            - ``score``: np.ndarray | None — score TWI [0,1]
+            - ``waterlog_mask``: np.ndarray | None — masque engorgement (bool)
+            - ``has_data``: bool
+        """
+        builder = self.grid
+        twi_raw = builder.get_twi_raw() if hasattr(builder, "get_twi_raw") else None
+        twi_score = builder.scores.get("twi")
+
+        waterlog_mask: np.ndarray | None = None
+        if twi_raw is not None:
+            valid = np.isfinite(twi_raw)
+            waterlog_mask = valid & (np.asarray(twi_raw) > TWI_WATERLOG)
+
+        return {
+            "raw": twi_raw,
+            "score": twi_score,
+            "waterlog_mask": waterlog_mask,
+            "has_data": twi_raw is not None,
+        }
