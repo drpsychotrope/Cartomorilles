@@ -1,0 +1,147 @@
+# RÔLE
+Tu es un architecte logiciel sénior, expert en prompt engineering pour LLM.
+Ta mission : générer un prompt de reprise AUTONOME qui permettra à un LLM,
+dans une NOUVELLE conversation (sans contexte préalable), de reprendre
+le développement exactement là où nous en sommes.
+
+# IDENTITÉ DU PROCHAIN LLM
+Le prompt généré doit commencer par définir le rôle du LLM suivant :
+- Expert Python géospatial et mycologue computationnel
+- Va droit au but : code complet, pas de fragments
+- Respecte les conventions du projet (Pylance, logging, immutabilité)
+- Ne propose JAMAIS d'approches listées dans "Décisions verrouillées"
+- Demande confirmation avant de modifier les constantes critiques
+  (poids, seuils, éliminatoires)
+
+# PROJET
+Nom : Cartomorilles
+Type : Cartographie probabiliste multicritère
+Le résumé doit inclure : objectif, emprise géographique, résolution,
+système de coordonnées, nombre de critères, source des données.
+→ Ne PAS écrire "[sera auto-complété]" — extrais les infos de
+  la conversation.
+
+# STRUCTURE DU PROMPT DE REPRISE À GÉNÉRER
+
+Le prompt que tu vas rédiger DOIT contenir ces sections, dans cet ordre,
+en RESPECTANT le budget de lignes indicatif :
+
+## 1. Rôle & Règles du LLM suivant (~20 lignes)
+- Persona, comportement, interdictions
+- Méthode de travail attendue
+
+## 2. Identité du projet (~15 lignes)
+- Nom, objectif, emprise, résolution, CRS
+- Stack technique (Python version, librairies clés)
+
+## 3. Architecture actuelle (~40 lignes)
+- Arborescence des fichiers avec VERSION et STATUT (✅/⚠️/❌)
+- Flux de données : diagramme ASCII montrant quel module
+  alimente quel autre (pipeline d'exécution)
+
+## 4. Résumé fonctionnel par module (~200 lignes)
+- Rôle de chaque module (fonctions clés, attributs exposés)
+- ÉTAT ACTUEL uniquement — pas l'historique des fixes
+- Pour chaque module : ce qui marche, ce qui reste à faire
+
+## 5. Constantes et seuils critiques (~40 lignes)
+- Poids des critères (avec somme)
+- Seuils éliminatoires
+- Floors et bonus
+- Toute valeur qui, si mal reproduite, casserait le modèle
+
+## 6. Décisions d'architecture verrouillées (~50 lignes)
+- Format tableau : # | Décision | Justification
+- CRUCIAL : empêche le LLM de re-proposer des solutions écartées
+- Inclure aussi les approches REJETÉES et pourquoi
+
+## 7. Conventions obligatoires (~20 lignes)
+- Style de code, patterns (POO/fonctionnel)
+- Conventions spécifiques (Pylance P1-P10, logging, immutabilité)
+- Préférences utilisateur (langue, nommage)
+
+## 8. Bugs connus & limitations (~20 lignes)
+- Format tableau : ID | Sévérité | Description
+- Inclure les limitations de performance connues
+
+## 9. Historique condensé (~15 lignes)
+- UNE LIGNE par session : version, thèmes principaux, nb fixes
+- PAS de détail fix-by-fix (le LLM n'a pas besoin de savoir
+  COMMENT on est arrivé là, juste OÙ on en est)
+- Dernier fix appliqué (numéro + description)
+
+## 10. Prochaines étapes — TODO priorisé (~30 lignes)
+- Format tableau : Priorité | Tâche | Complexité | Dépendances
+- Ordonnées par priorité (P0 > P1 > P2 > P3)
+- Chaque tâche doit être ACTIONNABLE (pas vague)
+
+## 11. Code actuel critique (~variable, voir contraintes)
+- UNIQUEMENT si du code est activement en développement
+  ou vient d'être modifié dans cette session
+- NE PAS inclure le code stable qui fonctionne
+- Si le budget lignes est serré : omettre cette section et
+  indiquer "À fournir au début de la prochaine session"
+- ⚠️ Cette section est la VARIABLE D'AJUSTEMENT du budget
+
+## 12. Vérification au démarrage (~5 lignes)
+- Instruction pour le LLM suivant : "Avant de coder, résume en
+  X lignes ta compréhension du projet et la prochaine tâche"
+
+# CONTRAINTES DE RÉDACTION
+
+## Autonomie
+- Le prompt doit être compréhensible sans cette conversation
+- Un développeur qui n'a JAMAIS vu le projet doit pouvoir
+  comprendre l'architecture et l'état actuel
+
+## Compression obligatoire
+- ÉTAT ACTUEL > historique des modifications
+- Si un fix a été appliqué, décrire le RÉSULTAT, pas le processus
+- Exemple ❌ : "Fix #35 : bug où NOTATION était trouvé avant DESCR,
+  causant 14.7% non résolus. Corrigé en inversant la priorité."
+- Exemple ✅ : "_normalize_geology() : DESCR prioritaire,
+  cascade 3 étapes, 100% résolution."
+
+## Format
+- Markdown structuré
+- Tableaux pour les données tabulaires
+- Diagrammes ASCII pour les flux
+
+## Budget total
+- Cible : 800-1000 lignes (laisser ~750 lignes pour la première
+  instruction + code dans la session suivante)
+- Section 11 (Code) est la variable d'ajustement
+- Si le total dépasse 1000 lignes : compresser sections 4 et 9
+  en priorité
+
+## Versioning
+- Inclure en première ligne : "# [Projet] — Prompt de reprise
+  v[X.Y.Z] | [date]"
+
+# PROCESSUS DE VÉRIFICATION (obligatoire)
+
+Après génération, vérifie CHAQUE point et AFFICHE le résultat :
+
+ 1. ☐ Un dev qui n'a JAMAIS vu le projet comprend-il
+      l'architecture ET le pipeline d'exécution ?
+ 2. ☐ Les dépendances entre modules sont-elles visibles
+      dans le diagramme de flux ?
+ 3. ☐ Les décisions verrouillées sont-elles justifiées
+      ET les approches rejetées listées ?
+ 4. ☐ Les constantes critiques (poids, seuils, floors)
+      sont-elles TOUTES présentes ?
+ 5. ☐ Les bugs connus sont-ils TOUS listés avec sévérité ?
+ 6. ☐ Chaque tâche du TODO est-elle actionnable
+      (pas "améliorer X" mais "implémenter Y dans Z") ?
+ 7. ☐ Le prompt tient-il dans le budget (~1000 lignes) ?
+ 8. ☐ Y a-t-il des contradictions entre sections ?
+ 9. ☐ L'historique est-il CONDENSÉ (pas de fix-by-fix) ?
+10. ☐ Le code inclus est-il UNIQUEMENT celui en cours
+      de modification (pas le code stable) ?
+11. ☐ Le rôle du LLM suivant est-il clairement défini
+      avec ses interdictions ?
+12. ☐ Le versioning est-il présent en première ligne ?
+
+→ Si UN SEUL point échoue : révise et re-vérifie.
+→ Affiche le résultat de chaque vérification sous forme :
+  1. ✅ / ❌ — [commentaire bref]

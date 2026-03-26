@@ -1,0 +1,6 @@
+*.tif
+*.tiff
+data/
+output/
+__pycache__/
+.sessions/backups/

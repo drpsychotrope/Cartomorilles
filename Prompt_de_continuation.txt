@@ -1,0 +1,267 @@
+# 🍄 CARTOMORILLES — Prompt de reprise v2.3.5 | 2025-07-12
+
+---
+
+## RÔLE & RÈGLES
+
+Tu es un expert Python géospatial et mycologue computationnel.
+
+**Règles absolues :**
+- Code complet uniquement, pas d'extraits partiels
+- Respecte les conventions Pylance (section dédiée ci-dessous)
+- Ne propose JAMAIS d'approches listées dans "Décisions verrouillées"
+- Logger uniquement (jamais print)
+- Demande confirmation avant de modifier config.py (poids/seuils)
+
+---
+
+## PROJET
+
+**Nom :** Cartomorilles
+**Objectif :** Cartographie probabiliste multicritère des zones 
+favorables aux morilles en région grenobloise
+**Stack :** Python 3.12+, numpy, rasterio, geopandas, folium, 
+scipy, shapely, scikit-image
+**Emprise :** 20×20 km centrée Grenoble, L93 (913_100, 6_458_800)
+**Résolution :** Grille régulière L93, DEM BD ALTI 25m (6000×6000px)
+
+---
+
+## ARBORESCENCE & ÉTAT
+
+D:\Download\Cartomorilles\
+├── config.py          ✅ v2.3.5 — 11 poids (somme=1.00), TWI constantes
+├── data_loader.py     ✅ v2.3.3 — DESCR prioritaire, 100% résolution géologie
+├── grid_builder.py    ✅ v2.3.5 — 11 scores, TWI D8, fix #37/#39/#46
+├── scoring.py         ✅ v2.3.5 — TWI waterlog éliminatoire, Pylance-clean
+├── visualize.py       ✅ v2.3.2 — export_gpkg_grid vectorisé
+├── landcover_detector.py ✅ v2.3.1 — cache-only, thread-safe
+├── species_enricher.py   ✅ v2.3.1 — cascade 4 niveaux
+├── main.py            ✅ v2.3.5 — pipeline complet 10 étapes
+├── grenoble_bdalti25.tif ✅ EPSG:2154
+├── diag_v233.py       ✅ Diagnostic géologie + landcover
+├── diag_champy.py     ⚠️ v2.3.4 — cache paths cassés (output\cache\)
+├── verify_v231.py     ✅ Smoke test
+└── data/
+    ├── FORMATION_VEGETALE.shp  ✅ BD Forêt v2 Isère (20 191 poly)
+    ├── rfifn250_l93.shp        ✅ IFN régions forestières (DEP=38)
+    └── geologie_38/
+        └── GEO050K_HARM_038_S_FGEOL_2154.shp ✅ BDCharm-50 (1 086 poly bbox)
+
+---
+
+## FLUX DE DONNÉES (PIPELINE main.py)
+
+    DEM (.tif)
+        ↓
+    data_loader.load_dem()
+        ↓
+    grid_builder.compute_terrain()
+        → altitude, slope, aspect, roughness, TWI
+        ↓
+    data_loader.load_forest/hydro/urban/geology()
+        ↓
+    grid_builder.score_*() ──→ 11 scores [0,1]
+        ↓                         ↑
+    species_enricher ─────────────┘ (remplace unknown 0.25)
+        ↓
+    grid_builder.apply_urban_mask()      ← AVANT micro-habitats
+    grid_builder.score_canopy/ground/disturbance()
+    grid_builder.apply_water_mask()
+    grid_builder.apply_landcover_mask()  ← forest floor + green_clip
+        ↓
+    scoring.compute_weighted_score()     ← somme pondérée NaN-safe
+    scoring.apply_eliminatory_factors()  ← 7 masques → score=0
+    scoring.apply_spatial_smoothing()    ← gaussien normalisé
+    scoring.classify_probability()       ← 6 classes
+    scoring.get_hotspots()               ← clusters 8-connexité
+        ↓
+    visualize.create_map()               ← Folium + PNG + GeoJSON
+    visualize.export_geotiff/gpkg()
+
+---
+
+## RÉSUMÉ FONCTIONNEL PAR MODULE
+
+### config.py (v2.3.5)
+Constantes centrales immutables (MappingProxyType/frozenset/tuple).
+
+- **WEIGHTS** (11 critères, Σ=1.0) : geology 0.20, tree_species 0.16,
+  canopy_openness 0.14, altitude 0.09, slope 0.09, twi 0.08,
+  dist_water 0.06, terrain_roughness 0.06, aspect 0.04,
+  ground_cover 0.04, disturbance 0.04
+- **Altitude** : optimal (200,600), range (150,900),
+  bonus gaussien centré 350m
+- **Pente** : seuils non chevauchants 10/20/35/45°
+- **TWI** : optimal (6.0,10.0), dry<3→floor 0.10, wet>14→floor 0.10,
+  waterlog>18→éliminatoire
+- **Essences** : 22 espèces scorées, unknown=0.25,
+  châtaignier=0.80 (PAS éliminatoire). ELIMINATORY_SPECIES set.
+- **Géologie** : 17 catégories, granite/gneiss/siliceux éliminatoires.
+  _GEOLOGY_KEYWORD_MAP : 32 patterns BDCharm-50.
+  resolve_geology() : cascade 3 niveaux (direct→normalisé→keywords).
+  1086/1086 résolus.
+- **Floors** : LANDCOVER_FOREST_FLOOR=0.80, DIST_WATER_FOREST_FLOOR=0.15
+- 7 basemaps Géoplateforme + OSM + Esri + OpenTopo
+
+### data_loader.py (v2.3.3)
+Chargement données brutes. WFS IGN/BRGM + fallback local/synthétique.
+
+- load_dem() : lecture fenêtrée (src.index + Window positionnels)
+- _normalize_geology() : DESCR prioritaire, cascade 3 étapes vectorisée,
+  _BDCHARM_DESCR_OVERRIDES (21 patterns). 1232/1232 = 100%.
+- Normalise colonnes (essence_canonical, geology_canonical, etc.)
+
+### grid_builder.py (v2.3.5)
+Grille régulière L93, calcul de 11 scores [0,1].
+
+- **Terrain** : compute_terrain() → altitude, slope, aspect,
+  roughness, TWI. _compute_twi() = D8 vectorisé + tri topologique
+  (boucle Python ~4M pixels, ~10-30s estimé, NON MESURÉ).
+- **Scores terrain** : altitude (bonus gaussien), slope (seuils),
+  roughness (σ local), aspect (sinusoïdal 170°), twi (zone optimale)
+- **Scores écologiques** : dist_water (EDT + bonus type),
+  tree_species (rasterize max), geology (rasterize max).
+  Stockent rasters int-codés + lookups pour hotspot enrichment.
+- **Micro-habitat** : canopy (transition 30m), ground_cover
+  (forêt-only), disturbance (lisières + urbain)
+- **Masques** : urban (buffers), water (all scores→0),
+  landcover (forest floor + green_clip × _VEGETATION_CRITERIA)
+- **_VEGETATION_CRITERIA** = (canopy, ground_cover, disturbance)
+  — tree_species EXCLU (fix #37)
+- **Attributs exposés** : scores dict, eliminatory masks,
+  _raw_tree_species, _landcover_green_score, _twi,
+  rasters int-codés + lookups, score_confidence
+
+### scoring.py (v2.3.5)
+Agrégation finale.
+
+- compute_weighted_score() : somme pondérée NaN-safe × pénalité
+  couverture (floor=0.5)
+- apply_eliminatory_factors() : 7 masques (urban, water, nodata,
+  species, geology, slope, altitude, TWI waterlog) → score=0
+  + transition douce EDT
+- apply_spatial_smoothing() : gaussien normalisé
+- classify_probability() : 6 classes
+- get_hotspots() : clusters 8-connexité +
+  _get_dominant_value_in_cluster() (raster int-codé + lookup)
+
+### visualize.py (v2.3.2)
+Carte Folium interactive + exports.
+
+- 4 panneaux draggable (CSS fixed, JS drag), minimisables
+- Overlay PNG géoréférencé + Grille GeoJSON (seuil 0.15, cap 100k)
+- export_gpkg_grid() vectorisé numpy (fancy indexing)
+- export_geotiff() (EPSG:2154, LZW)
+
+### landcover_detector.py (v2.3.1)
+Détection colorimétrique HSV de tuiles OSM. 9 classes.
+Cache-only, thread-safe (Lock), session HTTP close + context manager.
+
+### species_enricher.py (v2.3.1)
+Cascade 4 niveaux : A. BD Forêt ESSENCE/CODE_TFV → B. IFN régional
+→ C. Observations JSON → D. Modèle altitude-only.
+Remplace scores unknown (0.25) → régionaux.
+
+---
+
+## DÉCISIONS D'ARCHITECTURE VERROUILLÉES ⚠️
+
+Ne PAS proposer d'alternative à ces choix sans demande explicite :
+
+| # | Décision | Justification |
+|---|----------|--------------|
+| D1 | TWI algorithme D8 (pas D∞/MFD) | Suffisant pour 25m, complexité moindre |
+| D2 | DESCR prioritaire sur NOTATION pour géologie | NOTATION donnait 14.7% non résolus vs 0% avec DESCR |
+| D3 | Châtaignier score 0.80, PAS éliminatoire | Association fréquente morilles post-perturbation |
+| D4 | tree_species hors _VEGETATION_CRITERIA | Évite double pénalisation par green_score (fix #37) |
+| D5 | apply_urban_mask AVANT micro-habitats | Sinon disturbance recalculé sur zones masquées |
+| D6 | Rasters int-codés + lookups pour hotspots | Performance vs string matching sur clusters |
+| D7 | Landcover cache-only (pas de téléchargement) | Stabilité, reproductibilité |
+| D8 | Forest floor 0.80 pour cellules BD Forêt | Évite sous-notation forêts par landcover HSV |
+| D9 | dist_water floor 0.15 en forêt | Cours d'eau temporaires non cartographiés |
+| D10 | Pénalité couverture NaN-safe floor=0.5 | Évite score=0 si quelques critères manquants |
+
+**Approches REJETÉES :**
+| Proposition | Raison du rejet |
+|---|---|
+| score_slope seuils renforcés (0,8)/(15)/(25)/(45) | Supersédé par TWI |
+| dist_water pénalité engorgement <5m | Supersédé par TWI waterlog |
+
+---
+
+## CONVENTIONS PYLANCE (P1-P10)
+
+P1. `from __future__ import annotations` en tête
+P2. Types modernes : `dict` pas `Dict`, `str | None` pas `Optional`
+P3. Attributs Optional → variable locale + assert + type hint
+P4. `getattr()` + `isinstance()` pour attributs optionnels grid
+P5. `np.asarray()` autour de rasterize/gaussian/EDT/zoom/.values/.isin.
+    `np.any()/np.sum()/np.all()` au lieu de méthodes Series
+P6. Import direct si sous-module échoue
+P7. `# type: ignore[…]` pour : Window(...), .html.add_child(...),
+    _read_vector_file, _normalize_geology, _generate_synthetic_geology,
+    load_hydro, load_urban
+P8. Scores dict : isinstance guard avant .shape
+P9. Logger `logging.getLogger("cartomorilles.<module>")` — jamais print
+P10. Immutabilité : MappingProxyType, frozenset, tuple sur constantes
+
+---
+
+## BUGS CONNUS & LIMITATIONS
+
+| ID | Sévérité | Description |
+|----|----------|-------------|
+| B1 | ⚠️ Moyen | diag_champy.py : cache paths `output\cache\` introuvable |
+| B2 | ⚠️ Moyen | _compute_twi() boucle Python ~4M pixels (10-30s estimé, NON MESURÉ). Peut nécessiter optimisation Cython/numba si trop lent |
+| B3 | ℹ️ Info | Grille GeoJSON cap 100k features — zones denses tronquées |
+| B4 | ℹ️ Info | Landcover HSV imprécis sous couvert nuageux (mitigé par forest floor) |
+
+---
+
+## HISTORIQUE CONDENSÉ (46 fixes en 5 sessions)
+
+| Session | Version | Thèmes principaux |
+|---------|---------|-------------------|
+| S1 (10 fixes) | v2.2.0 | DEM windowed, landcover 9 classes, UI panneaux, seuils pente, poids v1 |
+| S2 (16 fixes) | v2.3.0–2.3.1 | Species enricher, masques éliminatoires, canopy continu, water mask, thread safety |
+| S3 (9 fixes) | v2.3.2 | BDCharm-50 intégration, rasters int-codés, export vectorisé, resolve_geology 30 patterns |
+| S4 (3 fixes) | v2.3.3 | DESCR prioritaire (100% résolution), forest floor 0.80, diag_v233 |
+| S5 (6 fixes) | v2.3.4–2.3.5 | tree_species hors VEGETATION_CRITERIA, dist_water floor, **TWI 11ème critère** |
+
+**Dernier fix :** #46c — TWI waterlog éliminatoire dans scoring.py
+
+---
+
+## PERFORMANCE (estimations)
+
+| Étape | Durée estimée | Mémoire |
+|-------|--------------|---------|
+| load_dem + compute_terrain | ~5-10s | ~1 GB (DEM 6000²) |
+| _compute_twi (D8) | ~10-30s ⚠️ | ~500 MB |
+| score_* (11 critères) | ~2-5s chacun | ~200 MB/score |
+| Pipeline complet | ~3-5 min estimé | ~4-6 GB pic |
+
+---
+
+## TODO PRIORISÉ
+
+| Priorité | Tâche | Complexité | Dépendances |
+|----------|-------|-----------|-------------|
+| 🔴 P0 | **Exécuter le pipeline v2.3.5 et valider TWI** | Faible | Aucune — premier run avec TWI |
+| 🔴 P0 | Mesurer temps réel _compute_twi() | Faible | Exécution pipeline |
+| 🟠 P1 | Fix diag_champy.py cache paths (B1) | Faible | Aucune |
+| 🟠 P1 | Robinier score 0.05 (allélopathie) | Faible | config.py |
+| 🟡 P2 | Optimiser _compute_twi si >30s (numba/cython) | Moyenne | Mesure P0 |
+| 🟡 P2 | diag_champy lire coords depuis main.py | Faible | Aucune |
+| 🟢 P3 | Validation terrain (spots connus morilles) | Moyenne | Pipeline fonctionnel |
+| 🟢 P3 | Tests unitaires scoring/grid_builder | Élevée | — |
+
+---
+
+## POUR COMMENCER CETTE SESSION
+
+Avant de coder, confirme en 5 lignes max :
+1. Ta compréhension du projet
+2. L'état actuel (v2.3.5)
+3. La prochaine tâche prioritaire selon le TODO
