@@ -6,39 +6,11 @@
     "locked_at": "2026-03-26T13:02:57.970614+00:00",
     "file_hash_at_lock": "d41d8cd98f"
   },
-  "config.py": {
-    "filename": "config.py",
-    "session_name": "poids",
-    "lock_type": "shared",
-    "locked_at": "2026-03-26T17:04:12.929010+00:00",
-    "file_hash_at_lock": "df0fc6697c"
-  },
   "landcover_detector.py": {
     "filename": "landcover_detector.py",
     "session_name": "water",
     "lock_type": "exclusive",
     "locked_at": "2026-03-26T17:19:06.437120+00:00",
     "file_hash_at_lock": "e7a36dbe2e"
-  },
-  "grid_builder.py": {
-    "filename": "grid_builder.py",
-    "session_name": "poids",
-    "lock_type": "exclusive",
-    "locked_at": "2026-03-26T18:51:47.018373+00:00",
-    "file_hash_at_lock": "f02dddcda0"
-  },
-  "main.py": {
-    "filename": "main.py",
-    "session_name": "poids",
-    "lock_type": "exclusive",
-    "locked_at": "2026-03-26T18:51:49.689564+00:00",
-    "file_hash_at_lock": "ba2374fb76"
-  },
-  "scoring.py": {
-    "filename": "scoring.py",
-    "session_name": "poids",
-    "lock_type": "exclusive",
-    "locked_at": "2026-03-26T18:52:08.672464+00:00",
-    "file_hash_at_lock": "f5d892e835"
   }
 }

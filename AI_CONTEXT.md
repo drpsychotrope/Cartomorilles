@@ -1,4 +1,4 @@
-# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 18:51 UTC | full
+# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 18:53 UTC | full
 
 > Auto-généré par `prepare_context.py` — optimisé Claude Opus
 > Project hash: `f91709e16f`
@@ -702,4 +702,4 @@ INTERDIT: ___
 </checkpoint>
 
 ---
-_Généré le 2026-03-26 18:51 UTC | 705 lignes | ~1048 lignes restantes pour prompt + code_
+_Généré le 2026-03-26 18:53 UTC | 705 lignes | ~1048 lignes restantes pour prompt + code_

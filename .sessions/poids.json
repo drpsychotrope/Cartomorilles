@@ -1,6 +1,6 @@
 {
   "name": "poids",
-  "state": "active",
+  "state": "merged",
   "created_at": "2026-03-26T17:04:14.549624+00:00",
   "focus_files": [
     "config.py",
@@ -66,5 +66,5 @@
   "description": "amélioration des poids",
   "git_branch": "session/poids",
   "context_file": "AI_CONTEXT_poids.md",
-  "merged_at": null
+  "merged_at": "2026-03-26T18:53:50.808258+00:00"
 }

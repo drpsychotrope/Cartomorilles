@@ -9,6 +9,7 @@ Interface attendue par grid_builder.apply_landcover_mask() :
     {
         "urban_mask":  np.ndarray bool    (ny, nx),
         "green_score": np.ndarray float32 (ny, nx),
+        "water_mask":  np.ndarray bool    (ny, nx),
         "landcover":   np.ndarray int8    (ny, nx),
         "quality":     dict  — métriques qualité de la détection,
     }
@@ -18,6 +19,10 @@ Limitations connues :
   Préférer un serveur de tuiles sans labels si disponible.
 - Calibré pour le style OSM Carto standard.
 
+v2.3.5 — Fix #25 : water_mask détecté par colorimétrie HSV (2 sous-règles)
+         water_stream (H:185-220) pour cours d'eau fins OSM (#aad3df)
+         water_body (H:180-260) pour plans d'eau larges
+         _build_masks retourne (urban_mask, green_score, water_mask)
 v2.3.0 — Fix #18 : detect_from_cache() cache-only (aucun téléchargement)
          Fix #19 : _get_altitude_mask() intégré dans _build_masks()
          Fix #20 : uniform_filter supprimé (import inutilisé)
@@ -99,38 +104,45 @@ _STRUCT_8CONN = generate_binary_structure(2, 2)
 # Priorité = ordre dans la liste : premier match gagne.
 #
 # Classes (i+1 car result[match]=i+1) :
-#   0 = other (indéterminé)          5 = road_major
-#   1 = green_dark (forêt)           6 = road_major2 (hue wrap)
-#   2 = green_light (prairie, parc)  7 = road_yellow
-#   3 = green_pale (jardin pâle)     8 = farmland
-#   4 = water                        9 = background
+#   0 = other (indéterminé)            6 = road_major
+#   1 = green_dark (forêt)             7 = road_major2 (hue wrap)
+#   2 = green_light (prairie, parc)    8 = road_yellow
+#   3 = green_pale (jardin pâle)       9 = farmland
+#   4 = water_stream (cours d'eau)    10 = background
+#   5 = water_body (plan d'eau)
 #  -1 = nodata (alpha invalide)
+#
+# Fix #25 : water splitté en water_stream (H:185-220, tight OSM #aad3df)
+#           et water_body (H:180-260, large). Premier match gagne,
+#           donc water_stream capture le bleu clair OSM avant water_body.
 
 _COLOR_RULES: tuple[tuple[str, float, float, float, float, float, float], ...] = (
-    # (nom,        H_min, H_max, S_min, S_max, V_min, V_max)
-    ("green_dark",    70, 170, 0.10, 1.00, 0.15, 0.70),   # forêt
-    ("green_light",   60, 160, 0.08, 0.60, 0.70, 0.95),   # prairie, parc
-    ("green_pale",    60, 150, 0.03, 0.15, 0.85, 1.00),   # jardin pâle OSM
-    ("water",        180, 260, 0.10, 1.00, 0.30, 1.00),   # eau
-    ("road_major",   330, 360, 0.05, 0.50, 0.70, 1.00),   # route rose/rouge
-    ("road_major2",    0,  15, 0.05, 0.50, 0.70, 1.00),   # route rose (hue wrap)
-    ("road_yellow",   35,  55, 0.10, 0.70, 0.80, 1.00),   # route secondaire jaune
-    ("farmland",      25,  65, 0.02, 0.12, 0.85, 1.00),   # champs beige pâle OSM
-    ("background",     0, 360, 0.00, 0.05, 0.80, 1.00),   # fond blanc/gris clair
+    # (nom,            H_min, H_max, S_min, S_max, V_min, V_max)
+    ("green_dark",        70, 170, 0.10, 1.00, 0.15, 0.70),   # forêt
+    ("green_light",       60, 160, 0.08, 0.60, 0.70, 0.95),   # prairie, parc
+    ("green_pale",        60, 150, 0.03, 0.15, 0.85, 1.00),   # jardin pâle OSM
+    ("water_stream",     185, 220, 0.08, 0.50, 0.70, 1.00),   # cours d'eau OSM #aad3df
+    ("water_body",       180, 260, 0.10, 1.00, 0.30, 1.00),   # plans d'eau larges
+    ("road_major",       330, 360, 0.05, 0.50, 0.70, 1.00),   # route rose/rouge
+    ("road_major2",        0,  15, 0.05, 0.50, 0.70, 1.00),   # route rose (hue wrap)
+    ("road_yellow",       35,  55, 0.10, 0.70, 0.80, 1.00),   # route secondaire jaune
+    ("farmland",          25,  65, 0.02, 0.12, 0.85, 1.00),   # champs beige pâle OSM
+    ("background",         0, 360, 0.00, 0.05, 0.80, 1.00),   # fond blanc/gris clair
 )
 
-# ── Mapping unique classe_id → nom (9 classes + other) ────────────
+# ── Mapping unique classe_id → nom (10 classes + other) ───────────
 _CLASS_NAMES: dict[int, str] = {
     0: "other",
     1: "green_dark",
     2: "green_light",
     3: "green_pale",
-    4: "water",
-    5: "road_major",
-    6: "road_major2",
-    7: "road_yellow",
-    8: "farmland",
-    9: "background",
+    4: "water_stream",
+    5: "water_body",
+    6: "road_major",
+    7: "road_major2",
+    8: "road_yellow",
+    9: "farmland",
+    10: "background",
 }
 
 # ── Scores de verdure par classe — Fix #11 v2.2.0 ────────────────
@@ -139,16 +151,20 @@ _GREEN_SCORES: dict[int, float] = {
     1: 1.00,   # forêt certaine
     2: 0.80,   # prairie
     3: 0.50,   # jardin, parc
-    4: 0.10,   # eau
-    5: 0.00,   # route
+    4: 0.10,   # eau (cours d'eau)
+    5: 0.10,   # eau (plan d'eau)
     6: 0.00,   # route
     7: 0.00,   # route
-    8: 0.10,   # champs — Fix #11 (était 0.55)
-    9: 0.05,   # fond de carte — Fix #11 (était 0.20)
+    8: 0.00,   # route
+    9: 0.10,   # champs — Fix #11 (était 0.55)
+    10: 0.05,  # fond de carte — Fix #11 (était 0.20)
 }
 
 # Classes considérées comme routes pour le masque urbain
-_ROAD_CLASSES: frozenset[int] = frozenset({5, 6, 7})
+_ROAD_CLASSES: frozenset[int] = frozenset({6, 7, 8})
+
+# Classes considérées comme eau pour le masque water — Fix #25
+_WATER_CLASSES: frozenset[int] = frozenset({4, 5})
 
 # ── Couleurs pour l'image de debug ────────────────────────────────
 _DEBUG_COLORS: dict[int, tuple[int, int, int]] = {
@@ -156,12 +172,13 @@ _DEBUG_COLORS: dict[int, tuple[int, int, int]] = {
     1: (0, 100, 0),        # green_dark
     2: (100, 200, 100),    # green_light
     3: (180, 230, 180),    # green_pale
-    4: (50, 50, 200),      # water
-    5: (255, 100, 100),    # road_major
-    6: (255, 100, 100),    # road_major2
-    7: (255, 200, 50),     # road_yellow
-    8: (230, 220, 180),    # farmland
-    9: (240, 240, 240),    # background
+    4: (100, 150, 255),    # water_stream — bleu clair
+    5: (50, 50, 200),      # water_body — bleu foncé
+    6: (255, 100, 100),    # road_major
+    7: (255, 100, 100),    # road_major2
+    8: (255, 200, 50),     # road_yellow
+    9: (230, 220, 180),    # farmland
+    10: (240, 240, 240),   # background
 }
 
 
@@ -317,7 +334,7 @@ class LandcoverDetector:
 
         Returns
         -------
-        dict avec urban_mask, green_score, landcover, quality
+        dict avec urban_mask, green_score, water_mask, landcover, quality
         """
         # Reset compteurs en début de pipeline
         self._reset_counters()
@@ -408,8 +425,8 @@ class LandcoverDetector:
         # 5. Rééchantillonner à la grille L93
         class_resized = self._resample_to_grid(classification, ny, nx)
 
-        # 6. Construire les masques — Fix #19 : altitude intégrée
-        urban_mask, green_score = self._build_masks(
+        # 6. Construire les masques — Fix #19 : altitude, Fix #25 : water
+        urban_mask, green_score, water_mask = self._build_masks(
             class_resized, ny, nx, bbox_l93
         )
 
@@ -420,16 +437,19 @@ class LandcoverDetector:
         if self.debug:
             self._save_debug_images(cropped, classification, class_resized)
 
+        # TODO: grid_builder.apply_landcover_mask() doit consommer water_mask
         result: dict[str, Any] = {
             "urban_mask": urban_mask,
             "green_score": green_score,
+            "water_mask": water_mask,
             "landcover": class_resized,
             "quality": quality,
         }
 
         logger.info(
-            "  Résultat : urbain=%.1f%%, vert(>0.5)=%.1f%%",
+            "  Résultat : urbain=%.1f%%, eau=%.1f%%, vert(>0.5)=%.1f%%",
             urban_mask.sum() / max(urban_mask.size, 1) * 100,
+            water_mask.sum() / max(water_mask.size, 1) * 100,
             (green_score > 0.5).sum() / max(green_score.size, 1) * 100,
         )
 
@@ -445,6 +465,7 @@ class LandcoverDetector:
         return {
             "urban_mask": np.zeros((ny, nx), dtype=bool),
             "green_score": np.full((ny, nx), 0.3, dtype=np.float32),
+            "water_mask": np.zeros((ny, nx), dtype=bool),
             "landcover": np.zeros((ny, nx), dtype=np.int8),
             "quality": {
                 "tiles_total": 0,
@@ -902,7 +923,7 @@ class LandcoverDetector:
         return resized
 
     # ═══════════════════════════════════════════════════════════════
-    # CONSTRUCTION DES MASQUES — Fix #19 : altitude intégrée
+    # CONSTRUCTION DES MASQUES — Fix #19 : altitude, Fix #25 : water
     # ═══════════════════════════════════════════════════════════════
 
     def _build_masks(
@@ -911,9 +932,9 @@ class LandcoverDetector:
         ny: int,
         nx: int,
         bbox_l93: dict[str, float],
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Construit urban_mask et green_score depuis la classification.
+        Construit urban_mask, green_score et water_mask depuis la classification.
 
         Stratégie corrigée :
         - urban_mask ← UNIQUEMENT routes détectées (dilatées 1px)
@@ -924,6 +945,9 @@ class LandcoverDetector:
         set_terrain_grids) protège les zones de montagne en forçant un
         green_score minimum — évite que les pixels haute altitude soient
         classés « autre » par manque de couleur verte sur les tuiles.
+
+        Fix #25 : water_mask construit depuis water_stream + water_body,
+        dilaté 1px (8-conn) pour couvrir les berges, lissé median 3×3.
         """
         # ── Green score ───────────────────────────────────────
         green_score = np.full((ny, nx), 0.3, dtype=np.float32)
@@ -947,9 +971,29 @@ class LandcoverDetector:
                 dtype=bool,
             )
 
+        # ── Water mask ← water_stream + water_body — Fix #25 ─
+        water_mask = np.zeros((ny, nx), dtype=bool)
+        for water_cls in _WATER_CLASSES:
+            water_mask[class_resized == water_cls] = True
+
+        # Dilatation 1px pour couvrir les berges immédiates
+        if water_mask.any():
+            water_mask = np.asarray(
+                binary_dilation(
+                    water_mask,
+                    structure=_STRUCT_8CONN,
+                    iterations=1,
+                ),
+                dtype=bool,
+            )
+
         # ── Lissage morphologique ─────────────────────────────
         urban_mask = np.asarray(
             median_filter(urban_mask.astype(np.uint8), size=5),
+            dtype=np.uint8,
+        ).astype(bool)
+        water_mask = np.asarray(
+            median_filter(water_mask.astype(np.uint8), size=3),
             dtype=np.uint8,
         ).astype(bool)
         green_score = np.asarray(
@@ -964,8 +1008,8 @@ class LandcoverDetector:
         # sur les tuiles OSM mais sont probablement forestières.
         alt_mask = self._get_altitude_mask(ny, nx, bbox_l93)
         if alt_mask is not None:
-            # Ne pas booster les routes ni l'eau
-            protect = alt_mask & ~urban_mask & (class_resized != 4)
+            # Ne pas booster les routes ni l'eau (masque dilaté inclus)
+            protect = alt_mask & ~urban_mask & ~water_mask
             green_score[protect] = np.maximum(green_score[protect], 0.4)
             logger.debug(
                 "  Protection altitude : %d cellules boostées (%.1f%%)",
@@ -976,7 +1020,13 @@ class LandcoverDetector:
         green_score = np.clip(green_score, 0.0, 1.0)
         green_score[urban_mask] = 0.0
 
-        return urban_mask, green_score
+        logger.info(
+            "  Water mask : %d cellules (%.1f%%)",
+            int(water_mask.sum()),
+            water_mask.sum() / max(water_mask.size, 1) * 100,
+        )
+
+        return urban_mask, green_score, water_mask
 
     def _get_altitude_mask(
         self,
