@@ -76,9 +76,6 @@ MODULE_ORDER = [
     "landcover_detector.py",
     "species_enricher.py",
     "main.py",
-    "diag_v233.py",
-    "diag_champy.py",
-    "verify_v231.py",
     "prepare_context.py",
 ]
 
@@ -86,7 +83,7 @@ MODULE_ORDER = [
 INTERNAL_MODULES = {
     "config", "data_loader", "grid_builder", "scoring",
     "visualize", "landcover_detector", "species_enricher",
-    "main", "diag_v233", "diag_champy", "verify_v231",
+    "main",
 }
 
 # Fichiers auto-générés (jamais verrouillés par les sessions)

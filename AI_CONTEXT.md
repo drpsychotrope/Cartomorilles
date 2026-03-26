@@ -1,7 +1,7 @@
-# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 12:47 UTC | full
+# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 13:46 UTC | full
 
 > Auto-généré par `prepare_context.py` — optimisé Claude Opus
-> Project hash: `9e8af2d326`
+> Project hash: `2bfb9e415c`
 
 <role>
 Tu es un expert Python géospatial et mycologue computationnel.
@@ -108,13 +108,13 @@ Ton style dans ce projet (à maintenir). Extraits auto-détectés :
             return self
 
 Patterns récurrents détectés :
-- np.asarray() en entrée des fonctions de score (69× trouvé)
+- np.asarray() en entrée des fonctions de score (68× trouvé)
 - np.full_like + masque valid pour NaN-safety (2× trouvé)
-- np.clip en sortie des scores [0, 1] (23× trouvé)
-- Logger avec messages descriptifs pour chaque étape (255× trouvé)
-- Type hints sur toutes les signatures publiques (158× trouvé)
-- Immutabilité sur les constantes (MappingProxyType, frozenset, tuple) (49× trouvé)
-- from __future__ import annotations en tête (17× trouvé)
+- np.clip en sortie des scores [0, 1] (35× trouvé)
+- Logger avec messages descriptifs pour chaque étape (257× trouvé)
+- Type hints sur toutes les signatures publiques (163× trouvé)
+- Immutabilité sur les constantes (MappingProxyType, frozenset, tuple) (52× trouvé)
+- from __future__ import annotations en tête (15× trouvé)
 - isinstance guard avant accès .shape (30× trouvé)
 </style_reference>
 
@@ -144,13 +144,11 @@ D:\Download\Cartomorilles\
 ├── landcover_detector.py      ✅ (1153L) — landcover_detector.py — Détection landcover par...
 ├── species_enricher.py        ✅ (916L) — species_enricher.py — Enrichissement essences f...
 ├── main.py                    ✅ v2.3.5 (1227L) — 🍄 CARTOMORILLES — Modèle de probabilité de prés...
-├── diag_champy.py             ✅ (242L) — diag_champy.py — Diagnostic des points de valid...
 ├── prepare_context.py         ✅ (3323L) — prepare_context.py — Générateur de contexte IA ...
-├── check_data.py              ✅ (96L)
-├── diag.py                    ✅ (99L) — Diagnostic géologie + landcover — identifie les...
 ├── diag_enricher.py           ✅ (243L) — diag_enricher_viz.py — Visualisation de l'enric...
 ├── explore_geology.py         ✅ (101L) — explore_geology.py — Exploration BDCharm-50 Isère.
-├── get-pip.py                 ✅ (27506L)
+├── meteo_checker.py           ✅ (0L)
+├── weather.py                 ✅ (648L) — weather.py — Alertes météo pour prospection mor...
 └── data/
     ├── Copernicus_DSM_COG_10_N45_00_E005_00_DEM.tif (41.6MB)
     ├── dem_10f2356d.tif                   (0.6MB)
@@ -164,7 +162,10 @@ D:\Download\Cartomorilles\
     ├── FORMATION_VEGETALE.prj             (<0.1MB)
     ├── FORMATION_VEGETALE.shp             (140.1MB)
     ├── FORMATION_VEGETALE.shx             (0.2MB)
-    ├── FORMATION_VEGETALE_38.shp          (11.7MB)
+    ├── FORMATION_VEGETALE_38.cpg          (<0.1MB)
+    ├── FORMATION_VEGETALE_38.dbf          (0.4MB)
+    ├── FORMATION_VEGETALE_38.prj          (<0.1MB)
+    ├── FORMATION_VEGETALE_38.shp          (9.7MB)
     ├── FORMATION_VEGETALE_38.shx          (<0.1MB)
     ├── GEO050K_HARM_038_L_DIVERS_2154.dbf (5.1MB)
     ├── GEO050K_HARM_038_L_DIVERS_2154.prj (<0.1MB)
@@ -195,6 +196,7 @@ D:\Download\Cartomorilles\
     ├── rfifn250_l93.prj                   (<0.1MB)
     ├── rfifn250_l93.shp                   (5.1MB)
     ├── rfifn250_l93.shx                   (<0.1MB)
+    ├── weather_cache.json                 (<0.1MB)
     ├── grenoble_bdalti25.tif              (74.5MB)
 ```
 
@@ -360,21 +362,6 @@ _🍄 CARTOMORILLES — Modèle de probabilité de présence de morilles_
 
 ---
 
-### diag_champy.py
-
-_diag_champy.py — Diagnostic des points de validation éliminés (v2.3.4)._
-
-📊 `242L | 197L code | 2fn | 0cls | 81c9dbbe`
-
-**Fonctions publiques :**
-- `check_point(name: str, x: float, y: float, expected: float) → dict[str, str]` — Diagnostic complet d'un point de validation.
-
-**Privées** : `_read_safe`
-
-**← imports** : config
-
----
-
 ### prepare_context.py
 
 _prepare_context.py — Générateur de contexte IA + Gestionnaire de sessions._
@@ -490,25 +477,6 @@ _prepare_context.py — Générateur de contexte IA + Gestionnaire de sessions._
 
 ---
 
-### check_data.py
-
-📊 `96L | 70L code | 0fn | 0cls | b3aef440`
-
----
-
-### diag.py
-
-_Diagnostic géologie + landcover — identifie les causes exactes._
-
-📊 `99L | 76L code | 1fn | 0cls | f6df3424`
-
-**Fonctions publiques :**
-- `main() → None`
-
-**← imports** : config
-
----
-
 ### diag_enricher.py
 
 _diag_enricher_viz.py — Visualisation de l'enrichissement species_enricher._
@@ -535,17 +503,38 @@ _explore_geology.py — Exploration BDCharm-50 Isère._
 
 ---
 
-### get-pip.py
+### meteo_checker.py
 
-📊 `27506L | 27127L code | 6fn | 0cls | 8f055dda`
+📊 `0L | 0L code | 0fn | 0cls | d41d8cd9`
+
+---
+
+### weather.py
+
+_weather.py — Alertes météo pour prospection morilles (Meteoblue)._
+
+📊 `648L | 510L code | 2fn | 4cls | b9521290`
+
+**class DayForecast**
+  _Prévision journalière Meteoblue._
+
+**class BurstSignal**
+  _Signal d'explosion de fructification détecté._
+
+**class ProspectingDay**
+  _Évaluation d'un jour pour la prospection morilles._
+
+**class WeatherChecker**
+  _Check météo locale pour prospection morilles via Meteoblue._
+  Publiques : `fetch(self, use_cache: bool) → list[DayForecast], evaluate(self) → list[ProspectingDay], format_report(days: list[ProspectingDay]) → str`
+  Privées : `_detect_burst, _score_day, _score_temperature, _score_frost, _score_precip_day, _recent_precipitation, _score_recent_precip, _score_humidity, _score_wind, _score_to_level, _fetch_api, _parse_response, _load_cache, _save_cache`
 
 **Fonctions publiques :**
-- `include_setuptools(args)` — Install setuptools only if absent, not excluded and when ...
-- `include_wheel(args)` — Install wheel only if absent, not excluded and when using...
-- `determine_pip_install_arguments()`
-- `monkeypatch_for_cert(tmpdir)` — Patches `pip install` to provide default certificate with...
-- `bootstrap(tmpdir)`
-- `main()`
+- `check_weather(api_key: str | None, lat: float | None, lon: float | None) → list[ProspectingDay]` — Fetch + évalue + log le rapport prospection.
+
+**Privées** : `_format_date_fr`
+
+**← imports** : config
 
 ---
 
@@ -664,8 +653,6 @@ _explore_geology.py — Exploration BDCharm-50 Isère._
 | Module | Importe depuis |
 |---|---|
 | `data_loader` | `config` |
-| `diag` | `config` |
-| `diag_champy` | `config` |
 | `diag_enricher` | `config`, `data_loader`, `grid_builder`, `species_enricher` |
 | `explore_geology` | `config` |
 | `grid_builder` | `config` |
@@ -674,8 +661,9 @@ _explore_geology.py — Exploration BDCharm-50 Isère._
 | `scoring` | `config`, `grid_builder` |
 | `species_enricher` | `config` |
 | `visualize` | `config`, `scoring` |
+| `weather` | `config` |
 
-**Hub** : `config` (11×), `grid_builder` (3×), `scoring` (2×)
+**Hub** : `config` (10×), `grid_builder` (3×), `scoring` (2×)
 
 ## CONVENTIONS PYLANCE (P1-P10)
 
@@ -722,8 +710,8 @@ _explore_geology.py — Exploration BDCharm-50 Isère._
 
 ## STATISTIQUES
 
-**Code** : 15 modules | 42,117L total | 38,757L code | 57 fn | 31 cls
-**Data** : 44 fichiers | 415.1 MB
+**Code** : 13 modules | 14,822L total | 11,797L code | 50 fn | 35 cls
+**Data** : 48 fichiers | 413.4 MB
 **Santé** : 3 TODOs | 10 décisions verrouillées
 
 <current_focus>
@@ -743,4 +731,4 @@ INTERDIT: ___
 </checkpoint>
 
 ---
-_Généré le 2026-03-26 12:47 UTC | 746 lignes | ~1007 lignes restantes pour prompt + code_
+_Généré le 2026-03-26 13:46 UTC | 734 lignes | ~1019 lignes restantes pour prompt + code_

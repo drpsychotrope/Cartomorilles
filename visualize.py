@@ -46,7 +46,7 @@ __all__ = ["MorilleVisualizer"]
 # Constantes
 # ───────────────────────────────────────────────────────────
 _NODATA: float = -9999.0
-_MAX_GRID_CELLS: int = 100_000
+_MAX_GRID_CELLS: int = 500_000
 _MAX_HOTSPOT_MARKERS: int = 30
 
 _CMAP_STOPS: tuple[tuple[float, str], ...] = (
