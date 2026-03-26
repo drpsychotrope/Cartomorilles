@@ -1,14 +1,15 @@
-# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 13:02 UTC | full | session:enricher
+# 🍄 CARTOMORILLES — AI Context v2.3.5 | 2026-03-26 14:06 UTC | full | session:enricher
 
 > Auto-généré par `prepare_context.py` — optimisé Claude Opus
-> Project hash: `5f3a1e67eb`
+> Project hash: `2f1bd8a0f7`
 
 > 🔀 SESSION PARALLÈLE : **enricher**
 > Branche git : `session/enricher`
-> Créée le : 2026-03-26T13:02:57.538389+00:00
+> Créée le : 2026-03-26T14:06:00.326454+00:00
 >
 > **Fichiers modifiables (verrouillés) :**
-> - 🔒 `species_enricher.py` (exclusif)
+> - 🔒 `visualize.py` (exclusif)
+> - 🔒 `main.py` (exclusif)
 > **Lecture seule :**
 > - 👁️ `config.py`
 >
@@ -29,7 +30,7 @@ Maintiens la cohérence avec tes choix antérieurs décrits ci-dessous.
 - Demande confirmation avant de modifier config.py (poids/seuils/éliminatoires)
 - Bug hors scope → `# TODO: [desc]` dans le code, ne PAS corriger
 - Rien de plus que ce qui est demandé — pas de features spontanées
-- SESSION 'enricher' : modifier UNIQUEMENT species_enricher.py
+- SESSION 'enricher' : modifier UNIQUEMENT visualize.py, main.py
 </rules>
 
 <forbidden>
@@ -50,7 +51,7 @@ Maintiens la cohérence avec tes choix antérieurs décrits ci-dessous.
 - Ne PAS utiliser print() au lieu du logger
 - Ne PAS produire de code partiel / fragmenté
 - Ne PAS ajouter de features non demandées
-- Ne PAS modifier : data_loader.py, grid_builder.py, scoring.py, visualize.py, landcover_detector.py, main.py, diag_enricher.py, explore_geology.py, weather.py
+- Ne PAS modifier : data_loader.py, grid_builder.py, scoring.py, landcover_detector.py, species_enricher.py, diag_enricher.py, explore_geology.py, weather.py
 </forbidden>
 
 <style_reference>
@@ -123,11 +124,11 @@ Ton style dans ce projet (à maintenir). Extraits auto-détectés :
 Patterns récurrents détectés :
 - np.asarray() en entrée des fonctions de score (68× trouvé)
 - np.full_like + masque valid pour NaN-safety (2× trouvé)
-- np.clip en sortie des scores [0, 1] (23× trouvé)
-- Logger avec messages descriptifs pour chaque étape (255× trouvé)
-- Type hints sur toutes les signatures publiques (158× trouvé)
-- Immutabilité sur les constantes (MappingProxyType, frozenset, tuple) (49× trouvé)
-- from __future__ import annotations en tête (14× trouvé)
+- np.clip en sortie des scores [0, 1] (35× trouvé)
+- Logger avec messages descriptifs pour chaque étape (257× trouvé)
+- Type hints sur toutes les signatures publiques (163× trouvé)
+- Immutabilité sur les constantes (MappingProxyType, frozenset, tuple) (52× trouvé)
+- from __future__ import annotations en tête (15× trouvé)
 - isinstance guard avant accès .shape (30× trouvé)
 </style_reference>
 
@@ -153,14 +154,14 @@ D:\Download\Cartomorilles\
 ├── data_loader.py             ⏭️ (2316L) — 🍄 CARTOMORILLES — Chargement des données géogra... (hors scope)
 ├── grid_builder.py            ⏭️ (2154L) — 🍄 CARTOMORILLES — Construction du maillage et c... (hors scope)
 ├── scoring.py                 ⏭️ (928L) — scoring.py — Modèle multicritère pondéré pour C... (hors scope)
-├── visualize.py               ⏭️ (1098L) — visualize.py — Cartomorilles v2.2.0 (hors scope)
+├── visualize.py               ✅ (1098L) — visualize.py — Cartomorilles v2.2.0 ◄ SESSION
 ├── landcover_detector.py      ⏭️ (1153L) — landcover_detector.py — Détection landcover par... (hors scope)
-├── species_enricher.py        ✅ (916L) — species_enricher.py — Enrichissement essences f... ◄ SESSION
-├── main.py                    ⏭️ v2.3.5 (1227L) — 🍄 CARTOMORILLES — Modèle de probabilité de prés... (hors scope)
-├── prepare_context.py         ✅ (3323L) — prepare_context.py — Générateur de contexte IA ...
+├── species_enricher.py        ⏭️ (916L) — species_enricher.py — Enrichissement essences f... (hors scope)
+├── main.py                    ✅ v2.3.5 (1227L) — 🍄 CARTOMORILLES — Modèle de probabilité de prés... ◄ SESSION
+├── prepare_context.py         ✅ (3320L) — prepare_context.py — Générateur de contexte IA ...
 ├── diag_enricher.py           ⏭️ (243L) — diag_enricher_viz.py — Visualisation de l'enric... (hors scope)
 ├── explore_geology.py         ⏭️ (101L) — explore_geology.py — Exploration BDCharm-50 Isère. (hors scope)
-├── weather.py                 ⏭️ (0L) (hors scope)
+├── weather.py                 ⏭️ (648L) — weather.py — Alertes météo pour prospection mor... (hors scope)
 └── data/
     ├── Copernicus_DSM_COG_10_N45_00_E005_00_DEM.tif (41.6MB)
     ├── dem_10f2356d.tif                   (0.6MB)
@@ -174,7 +175,10 @@ D:\Download\Cartomorilles\
     ├── FORMATION_VEGETALE.prj             (<0.1MB)
     ├── FORMATION_VEGETALE.shp             (140.1MB)
     ├── FORMATION_VEGETALE.shx             (0.2MB)
-    ├── FORMATION_VEGETALE_38.shp          (11.7MB)
+    ├── FORMATION_VEGETALE_38.cpg          (<0.1MB)
+    ├── FORMATION_VEGETALE_38.dbf          (0.4MB)
+    ├── FORMATION_VEGETALE_38.prj          (<0.1MB)
+    ├── FORMATION_VEGETALE_38.shp          (9.7MB)
     ├── FORMATION_VEGETALE_38.shx          (<0.1MB)
     ├── GEO050K_HARM_038_L_DIVERS_2154.dbf (5.1MB)
     ├── GEO050K_HARM_038_L_DIVERS_2154.prj (<0.1MB)
@@ -205,6 +209,7 @@ D:\Download\Cartomorilles\
     ├── rfifn250_l93.prj                   (<0.1MB)
     ├── rfifn250_l93.shp                   (5.1MB)
     ├── rfifn250_l93.shx                   (<0.1MB)
+    ├── weather_cache.json                 (<0.1MB)
     ├── grenoble_bdalti25.tif              (74.5MB)
 ```
 
@@ -257,32 +262,57 @@ _🍄 CARTOMORILLES — Configuration du modèle (v2.2.0)_
 
 ### scoring.py ⏭️ (hors scope cette session)
 
-### visualize.py ⏭️ (hors scope cette session)
+### visualize.py
 
-### landcover_detector.py ⏭️ (hors scope cette session)
+_visualize.py — Cartomorilles v2.2.0_
 
-### species_enricher.py
+📊 `1098L | 907L code | 1fn | 1cls | e35e374a`
 
-_species_enricher.py — Enrichissement essences forestières inconnues._
+**class MorilleVisualizer**
+  _Génère les sorties visuelles à partir d'un MorilleScoring terminé._
+  Publiques : `create_folium_map(self, output: str | Path) → Path, export_geotiff(self, output: str | Path) → Path, export_gpkg_grid(self, output: str | Path, threshold: float) → Path`
+  Privées : `_validate_model, _l93_to_wgs84, _add_interactive_controls, _add_basemaps, _add_probability_overlay, _add_elimination_layers, _add_detailed_grid, _add_hotspot_markers, _add_landmarks`
 
-📊 `916L | 713L code | 0fn | 1cls | 035acf2a`
+**Privées** : `_default_landmarks`
 
-**class SpeciesEnricher**
-  _Enrichit les essences forestières via cascade A→B→C→D._
-  Publiques : `load_bd_foret(self) → gpd.GeoDataFrame | None, enrich_grid_scores(self, grid: Any, forest_gdf: Any) → None, get_stats(self, grid: Any) → dict[str, Any]`
-  Privées : `_compute_regional_scores, _filter_by_forest_type, _weighted_morel_score, _build_forest_type_grid, _build_region_grid, _rasterize_regions, _heuristic_regions, _load_observations, _apply_observations, _parse_tfv`
-
-**← imports** : config
+**← imports** : config, scoring
 
 ---
 
-### main.py ⏭️ (hors scope cette session)
+### landcover_detector.py ⏭️ (hors scope cette session)
+
+### species_enricher.py ⏭️ (hors scope cette session)
+
+### main.py (v2.3.5)
+
+_🍄 CARTOMORILLES — Modèle de probabilité de présence de morilles_
+
+📊 `1227L | 905L code | 14fn | 0cls | b6860d2c`
+
+**Fonctions publiques :**
+- `setup_logging(output_dir: Path, verbose: bool) → None` — Configure le logging : console (INFO ou DEBUG) + fichier ...
+- `validate_weights() → bool` — Vérifie la somme des poids et affiche le détail.
+- `estimate_grid_size(cell_size: float) → dict[str, Any]` — Estime le nombre de cellules, la surface et la RAM nécess...
+- `summarize_data(dem_data: dict[str, Any], forest_gdf: Any, geology_gdf: Any, hydro_gdf: Any, urban_gdf: Any, ...) → None` — Affiche un tableau récapitulatif des données chargées.
+- `compute_statistics(final_score: np.ndarray, threshold: float) → dict[str, Any]` — Calcule les statistiques du score final.
+- `display_statistics(stats: dict[str, Any]) → None` — Affiche les statistiques en console/log.
+- `validate_against_terrain(model: MorilleScoring) → float | None` — Compare le score modèle aux observations de terrain.
+- `display_hotspots(hotspots: list[dict[str, Any]], max_display: int) → None` — Affiche les meilleurs hotspots avec coordonnées GPS et li...
+- `save_report(output_dir: Path, stats: dict[str, Any], hotspots: list[dict[str, Any]], config_snapshot: dict[str, Any], duration: float, ...) → Path` — Sauvegarde un rapport JSON complet et reproductible.
+- `main(args: argparse.Namespace) → int` — Pipeline principal Cartomorilles.
+- `build_parser() → argparse.ArgumentParser` — Construit le parser d'arguments CLI.
+
+**Privées** : `_purge_cache, _resolve_data_path, _on_interrupt`
+
+**← imports** : config, data_loader, grid_builder, landcover_detector, scoring, species_enricher, visualize
+
+---
 
 ### prepare_context.py
 
 _prepare_context.py — Générateur de contexte IA + Gestionnaire de sessions._
 
-📊 `3323L | 2788L code | 16fn | 25cls | 9b8e99b9`
+📊 `3320L | 2785L code | 16fn | 25cls | 71eb9f23`
 
 **class FunctionInfo**
   _Métadonnées d'une fonction._
@@ -522,8 +552,9 @@ _prepare_context.py — Générateur de contexte IA + Gestionnaire de sessions._
 | `scoring` | `config`, `grid_builder` |
 | `species_enricher` | `config` |
 | `visualize` | `config`, `scoring` |
+| `weather` | `config` |
 
-**Hub** : `config` (9×), `grid_builder` (3×), `scoring` (2×)
+**Hub** : `config` (10×), `grid_builder` (3×), `scoring` (2×)
 
 ## CONVENTIONS PYLANCE (P1-P10)
 
@@ -562,22 +593,22 @@ _prepare_context.py — Générateur de contexte IA + Gestionnaire de sessions._
 
 | Sév. | Tag | Fichier | L | Description |
 |---|---|---|---|---|
-| 🟡 | TODO | `prepare_context.py` | 997 | `" |
-| 🟡 | TODO | `prepare_context.py` | 1044 | [desc]` dans le code, " |
-| 🟡 | TODO | `prepare_context.py` | 1734 | [desc]` mais ne PAS corriger." |
+| 🟡 | TODO | `prepare_context.py` | 994 | `" |
+| 🟡 | TODO | `prepare_context.py` | 1041 | [desc]` dans le code, " |
+| 🟡 | TODO | `prepare_context.py` | 1731 | [desc]` mais ne PAS corriger." |
 
 **Total** : 3 (3 TODO)
 
 ## STATISTIQUES
 
-**Code** : 12 modules | 14,174L total | 11,287L code | 48 fn | 31 cls
-**Data** : 44 fichiers | 415.1 MB
+**Code** : 12 modules | 14,819L total | 11,794L code | 50 fn | 35 cls
+**Data** : 48 fichiers | 413.4 MB
 **Santé** : 3 TODOs | 10 décisions verrouillées
 
 <current_focus>
-FOCUS DE CETTE SESSION : enricher — species_enricher.py
-DESCRIPTION : Refactor species_enricher
-HORS SCOPE (ne pas toucher) : data_loader.py, diag_enricher.py, explore_geology.py, grid_builder.py, landcover_detector.py, main.py, scoring.py, visualize.py, weather.py
+FOCUS DE CETTE SESSION : enricher — visualize.py, main.py
+DESCRIPTION : alternative de display
+HORS SCOPE (ne pas toucher) : data_loader.py, diag_enricher.py, explore_geology.py, grid_builder.py, landcover_detector.py, scoring.py, species_enricher.py, weather.py
 Si bug détecté hors scope → `# TODO: [desc]` mais ne PAS corriger.
 </current_focus>
 
@@ -594,4 +625,4 @@ BRANCHE: session/enricher
 </checkpoint>
 
 ---
-_Généré le 2026-03-26 13:02 UTC | 597 lignes | ~1156 lignes restantes pour prompt + code_
+_Généré le 2026-03-26 14:06 UTC | 628 lignes | ~1125 lignes restantes pour prompt + code_

@@ -1,39 +1,43 @@
-"""
-visualize.py — Cartomorilles v2.2.0
-Visualisation interactive (Folium), export GeoTIFF et GeoPackage.
+# visualize.py
+"""visualize.py — Cartomorilles v2.3.5
 
-v2.2.0 :
-  - Panneaux déplaçables (drag & drop) : légende, colorbar, opacité, info
-  - GeoJsonTooltip sticky sur la grille
-  - Panneau info cellule (bottomright)
-  - Colorbar HTML custom (remplace branca LinearColormap)
-  - JS consolidé en un seul bloc
-"""
+Visualisation interactive (Folium ImageOverlay raster), export GeoTIFF et
+GeoPackage.
 
+v2.3.5 :
+  - ImageOverlay raster remplace GeoJSON polygones (probabilité + éliminations)
+  - HTML < 5 MB, toutes cellules visibles, carte fluide
+  - Hotspots conservés en marqueurs Folium natifs
+  - Panneaux déplaçables (drag & drop) : légende, colorbar, opacité
+  - Panneau info simplifié (plus de mouseover GeoJSON)
+"""
 from __future__ import annotations
 
+import base64
+import io
+import json
 import logging
-import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import matplotlib
+
 matplotlib.use("Agg")
 
-import folium                                                  # noqa: E402
-import geopandas as gpd                                        # noqa: E402
-import matplotlib.colors as mcolors                            # noqa: E402
-import matplotlib.pyplot as plt                                # noqa: E402
-import numpy as np                                             # noqa: E402
-import rasterio                                                # noqa: E402
+import folium  # noqa: E402
+import geopandas as gpd  # noqa: E402
+import matplotlib.colors as mcolors  # noqa: E402
+import numpy as np  # noqa: E402
+import rasterio  # noqa: E402
 from branca.element import Element  # type: ignore[import-untyped]  # noqa: E402
 from folium.plugins import MeasureControl, MiniMap, MousePosition  # noqa: E402
-from folium.raster_layers import ImageOverlay                  # noqa: E402
-from pyproj import Transformer                                 # noqa: E402
-from rasterio.transform import from_bounds                     # noqa: E402
-from shapely.geometry import box as shapely_box                # noqa: E402
+from folium.raster_layers import ImageOverlay  # noqa: E402
+from PIL import Image  # noqa: E402
+from pyproj import Transformer  # noqa: E402
+from rasterio.transform import from_bounds  # noqa: E402
+from shapely.geometry import box as shapely_box  # noqa: E402
 
-import config                                                  # noqa: E402
+import config  # noqa: E402
 
 if TYPE_CHECKING:
     from scoring import MorilleScoring
@@ -46,7 +50,6 @@ __all__ = ["MorilleVisualizer"]
 # Constantes
 # ───────────────────────────────────────────────────────────
 _NODATA: float = -9999.0
-_MAX_GRID_CELLS: int = 500_000
 _MAX_HOTSPOT_MARKERS: int = 30
 
 _CMAP_STOPS: tuple[tuple[float, str], ...] = (
@@ -65,8 +68,23 @@ _CMAP = mcolors.LinearSegmentedColormap.from_list(
 )
 
 _CLASS_COLORS: tuple[str, ...] = (
-    "#d73027", "#f46d43", "#fdae61", "#fee08b", "#1a9850", "#006837",
+    "#d73027",
+    "#f46d43",
+    "#fdae61",
+    "#fee08b",
+    "#1a9850",
+    "#006837",
 )
+
+_ELIM_LABEL_MAP: dict[str, tuple[str, str]] = {
+    "urban": ("🏠 Zones urbaines", "#555555"),
+    "water": ("💧 Cours d'eau", "#0077cc"),
+    "nodata": ("❓ NoData", "#000000"),
+    "species": ("🌳 Espèces éliminatoires", "#8b0000"),
+    "geology": ("🪨 Géologie éliminatoire", "#800080"),
+    "slope": ("⛰️ Pente éliminatoire", "#ff8c00"),
+    "altitude": ("📏 Altitude éliminatoire", "#8b4513"),
+}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -82,7 +100,6 @@ class MorilleVisualizer:
         hotspots: list[dict[str, Any]] | None = None,
         landmarks: list[dict[str, Any]] | None = None,
         max_hotspot_markers: int = _MAX_HOTSPOT_MARKERS,
-        max_grid_cells: int = _MAX_GRID_CELLS,
     ) -> None:
         self._validate_model(scoring_model)
         self.model: MorilleScoring = scoring_model
@@ -90,7 +107,6 @@ class MorilleVisualizer:
         self.hotspots: list[dict[str, Any]] = hotspots or []
         self.landmarks: list[dict[str, Any]] = landmarks or _default_landmarks()
         self.max_hotspot_markers = max_hotspot_markers
-        self.max_grid_cells = max_grid_cells
 
         _fs = scoring_model.final_score
         _pc = scoring_model.probability_classes
@@ -106,7 +122,9 @@ class MorilleVisualizer:
         self._elim_detail: dict[str, Any] = _ed
 
         self._to_wgs84 = Transformer.from_crs(
-            "EPSG:2154", "EPSG:4326", always_xy=True,
+            "EPSG:2154",
+            "EPSG:4326",
+            always_xy=True,
         )
 
         half = config.CELL_SIZE / 2.0
@@ -115,10 +133,18 @@ class MorilleVisualizer:
         self._ymin_l93 = float(np.min(self.grid.y_coords)) - half
         self._ymax_l93 = float(np.max(self.grid.y_coords)) + half
 
-        corners_x = [self._xmin_l93, self._xmax_l93,
-                      self._xmin_l93, self._xmax_l93]
-        corners_y = [self._ymin_l93, self._ymin_l93,
-                      self._ymax_l93, self._ymax_l93]
+        corners_x = [
+            self._xmin_l93,
+            self._xmax_l93,
+            self._xmin_l93,
+            self._xmax_l93,
+        ]
+        corners_y = [
+            self._ymin_l93,
+            self._ymin_l93,
+            self._ymax_l93,
+            self._ymax_l93,
+        ]
         lons, lats = self._to_wgs84.transform(corners_x, corners_y)
         self._south = float(np.min(lats))
         self._north = float(np.max(lats))
@@ -127,7 +153,10 @@ class MorilleVisualizer:
 
         logger.debug(
             "Emprise WGS84 : S=%.5f N=%.5f W=%.5f E=%.5f",
-            self._south, self._north, self._west, self._east,
+            self._south,
+            self._north,
+            self._west,
+            self._east,
         )
 
     # ──────────────────────────────────────────────────────
@@ -136,23 +165,37 @@ class MorilleVisualizer:
     @staticmethod
     def _validate_model(model: Any) -> None:
         required_attrs = [
-            "final_score", "probability_classes", "grid",
-            "elimination_mask", "elimination_detail",
+            "final_score",
+            "probability_classes",
+            "grid",
+            "elimination_mask",
+            "elimination_detail",
         ]
         missing = [a for a in required_attrs if not hasattr(model, a)]
         if missing:
             raise AttributeError(
                 f"MorilleScoring incomplet — attributs manquants : {missing}"
             )
-        for attr in ["final_score", "probability_classes",
-                     "elimination_mask", "elimination_detail"]:
+        for attr in [
+            "final_score",
+            "probability_classes",
+            "elimination_mask",
+            "elimination_detail",
+        ]:
             if getattr(model, attr) is None:
                 raise ValueError(
                     f"MorilleScoring.{attr} is None — pipeline incomplet ?"
                 )
         grid_attrs = [
-            "x_coords", "y_coords", "transform", "nx", "ny",
-            "urban_mask", "water_mask", "nodata_mask", "scores",
+            "x_coords",
+            "y_coords",
+            "transform",
+            "nx",
+            "ny",
+            "urban_mask",
+            "water_mask",
+            "nodata_mask",
+            "scores",
         ]
         grid_missing = [a for a in grid_attrs if not hasattr(model.grid, a)]
         if grid_missing:
@@ -168,10 +211,77 @@ class MorilleVisualizer:
         return float(lon), float(lat)
 
     # ──────────────────────────────────────────────────────
-    # JS consolidé : drag + opacité + info curseur
+    # Rasterisation → PNG base64 data-URI
+    # ──────────────────────────────────────────────────────
+    @staticmethod
+    def _render_score_png(
+        score: np.ndarray,
+        cmap: mcolors.LinearSegmentedColormap,
+        thresholds: list[float],
+    ) -> bytes:
+        """Rasterise un array 2D de scores en PNG RGBA.
+
+        L'alpha est gradué par palier selon *thresholds* pour que les
+        zones à faible score soient quasi-transparentes.
+        """
+        arr = np.asarray(score, dtype=np.float32)
+        assert arr.ndim == 2
+
+        valid = np.asarray(np.isfinite(arr))
+        safe = np.where(valid, arr, 0.0)
+
+        rgba_f = np.asarray(cmap(safe))  # (H, W, 4) float [0,1]
+
+        # Alpha gradué par palier de seuils
+        alpha = np.zeros(arr.shape, dtype=np.float32)
+        steps = np.linspace(0.15, 0.65, len(thresholds) + 1)[1:]
+        for i, th in enumerate(thresholds):
+            alpha[safe >= th] = float(steps[i])
+        if thresholds:
+            alpha[safe >= thresholds[-1]] = 0.70
+        alpha[~valid] = 0.0
+
+        rgba_f[:, :, 3] = alpha
+
+        rgba_u8 = np.clip(rgba_f * 255, 0, 255).astype(np.uint8)
+        img = Image.fromarray(rgba_u8, mode="RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    @staticmethod
+    def _render_mask_png(
+        mask: np.ndarray,
+        color_hex: str,
+        alpha: float = 0.45,
+    ) -> bytes:
+        """Convertit un masque bool 2D en PNG RGBA monochrome."""
+        m = np.asarray(mask, dtype=bool)
+        assert m.ndim == 2
+        r_f, g_f, b_f = mcolors.hex2color(color_hex)
+        h, w = m.shape
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[m, 0] = int(r_f * 255)
+        rgba[m, 1] = int(g_f * 255)
+        rgba[m, 2] = int(b_f * 255)
+        rgba[m, 3] = int(alpha * 255)
+
+        img = Image.fromarray(rgba, mode="RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    @staticmethod
+    def _png_to_data_uri(png_bytes: bytes) -> str:
+        """Encode des bytes PNG en data-URI base64 inline."""
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+
+    # ──────────────────────────────────────────────────────
+    # JS consolidé : drag + opacité + légende
     # ──────────────────────────────────────────────────────
     def _add_interactive_controls(self, folium_map: folium.Map) -> None:
-        """Injecte le JS unique pour : panneaux draggable, opacité, info curseur."""
+        """Injecte le JS unique pour : panneaux draggable, opacité, légende."""
         js_block = r"""
         <style>
         .cartom-panel {
@@ -247,11 +357,13 @@ class MorilleVisualizer:
 
         <div id="cartom-info" class="cartom-panel">
             <div class="cartom-titlebar">
-                <span>📍 Cellule</span>
+                <span>📍 Info</span>
                 <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
             </div>
             <div class="cartom-body" id="cartom-info-body">
-                Survolez la grille…
+                Cliquez sur un hotspot 🔥 pour les détails.<br>
+                <span style="font-size:10px;color:#888;">
+                Export GPKG pour données cellule par cellule.</span>
             </div>
         </div>
 
@@ -271,7 +383,6 @@ class MorilleVisualizer:
                     e.preventDefault();
                     mx = e.clientX; my = e.clientY;
 
-                    /* Convertir bottom/right en top/left avant drag */
                     var rect = panel.getBoundingClientRect();
                     panel.style.top  = rect.top + 'px';
                     panel.style.left = rect.left + 'px';
@@ -283,7 +394,6 @@ class MorilleVisualizer:
                         mx = ev.clientX;      my = ev.clientY;
                         var t = parseInt(panel.style.top)  + dy;
                         var l = parseInt(panel.style.left) + dx;
-                        /* Clamp dans la fenêtre */
                         t = Math.max(0, Math.min(t, window.innerHeight - 40));
                         l = Math.max(0, Math.min(l, window.innerWidth - 40));
                         panel.style.top  = t + 'px';
@@ -297,13 +407,12 @@ class MorilleVisualizer:
                     document.addEventListener('mouseup', onUp);
                 });
 
-                /* Empêcher Leaflet d'intercepter les événements */
                 L.DomEvent.disableClickPropagation(panel);
                 L.DomEvent.disableScrollPropagation(panel);
             });
 
             /* ═══════════════════════════════════════════
-               LÉGENDE discrète — remplir #cartom-legend-body
+               LÉGENDE discrète
                ═══════════════════════════════════════════ */
             var legendBody = document.getElementById('cartom-legend-body');
             if (legendBody) {
@@ -330,7 +439,7 @@ class MorilleVisualizer:
             }
 
             /* ═══════════════════════════════════════════
-               COLORBAR continue — remplir #cartom-colorbar-body
+               COLORBAR continue
                ═══════════════════════════════════════════ */
             var cbBody = document.getElementById('cartom-colorbar-body');
             if (cbBody) {
@@ -348,7 +457,7 @@ class MorilleVisualizer:
             }
 
             /* ═══════════════════════════════════════════
-               OPACITÉ — slider — cible TOUTES les couches
+               OPACITÉ — slider → ImageOverlay layers
                ═══════════════════════════════════════════ */
             var slider = document.getElementById('cartom_opacity_slider');
             var opVal  = document.getElementById('cartom_opval');
@@ -358,93 +467,22 @@ class MorilleVisualizer:
                     try { if (window[k] instanceof L.Map) { map = window[k]; break; } }
                     catch(e){}
                 }
-                if (!map) {
-                    var containers = document.querySelectorAll('.leaflet-container');
-                    for (var ci = 0; ci < containers.length; ci++) {
-                        for (var k2 in window) {
-                            try {
-                                if (window[k2] instanceof L.Map &&
-                                    window[k2].getContainer() === containers[ci]) {
-                                    map = window[k2]; break;
-                                }
-                            } catch(e2){}
-                        }
-                        if (map) break;
-                    }
-                }
-
-                function setLayerOpacity(layer, v) {
-                    /* ImageOverlay (PNG probabilité) */
-                    if (layer instanceof L.ImageOverlay) {
-                        layer.setOpacity(v);
-                        return;
-                    }
-                    /* GeoJSON feature (grille) */
-                    if (layer.setStyle && layer.feature) {
-                        layer.setStyle({fillOpacity: v, opacity: v});
-                        return;
-                    }
-                    /* Rectangle (masques éliminatoires) */
-                    if (layer instanceof L.Rectangle || layer instanceof L.Polygon) {
-                        if (layer.setStyle) {
-                            layer.setStyle({fillOpacity: v * 0.5, opacity: v});
-                        }
-                        return;
-                    }
-                    /* FeatureGroup / LayerGroup récursif */
-                    if (layer.eachLayer) {
-                        layer.eachLayer(function(sub){ setLayerOpacity(sub, v); });
-                    }
-                }
 
                 slider.addEventListener('input', function(e){
                     var v = parseInt(e.target.value) / 100.0;
                     if (opVal) opVal.textContent = e.target.value + '%';
                     if (!map) return;
                     map.eachLayer(function(layer){
-                        /* Ignorer les TileLayers (fonds de carte) */
                         if (layer instanceof L.TileLayer) return;
-                        setLayerOpacity(layer, v);
-                    });
-                });
-            }
-
-            /* ═══════════════════════════════════════════
-               INFO CELLULE — mouseover sur GeoJSON
-               ═══════════════════════════════════════════ */
-            var infoBody = document.getElementById('cartom-info-body');
-            if (map && infoBody) {
-                map.eachLayer(function(layer){
-                    if (!layer.eachLayer) return;
-                    layer.eachLayer(function(sub){
-                        if (!sub.feature || !sub.feature.properties ||
-                            sub.feature.properties.score === undefined) return;
-                        sub.on('mouseover', function(ev){
-                            var p = ev.target.feature.properties;
-                            var ll = ev.latlng;
-                            var h = '<b>🍄 ' + (p.score * 100).toFixed(1) + '%</b>';
-                            if (p.classe) h += ' — <em>' + p.classe + '</em>';
-                            h += '<br>';
-                            if (p.alt_m !== undefined) h += '⛰️ ' + p.alt_m + ' m<br>';
-                            if (p.pente_deg !== undefined) h += '📐 ' + p.pente_deg + '°<br>';
-                            /* Critères individuels */
-                            var crits = ['tree_species','geology','dist_water',
-                                         'altitude','slope','canopy_openness'];
-                            for (var ci2 = 0; ci2 < crits.length; ci2++){
-                                var c = crits[ci2];
-                                if (p[c] !== undefined){
-                                    h += '<span style="color:#666;">'
-                                        + c.replace(/_/g,' ') + ': '
-                                        + p[c].toFixed(2) + '</span><br>';
-                                }
-                            }
-                            if (ll) h += '<span style="font-size:9px;color:#aaa;">'
-                                + ll.lat.toFixed(5) + ', ' + ll.lng.toFixed(5) + '</span>';
-                            infoBody.innerHTML = h;
-                        });
-                        sub.on('mouseout', function(){
-                            infoBody.innerHTML = 'Survolez la grille…';
-                        });
+                        if (layer instanceof L.ImageOverlay) {
+                            layer.setOpacity(v);
+                            return;
+                        }
+                        if (layer.eachLayer) {
+                            layer.eachLayer(function(sub){
+                                if (sub instanceof L.ImageOverlay) sub.setOpacity(v);
+                            });
+                        }
                     });
                 });
             }
@@ -452,16 +490,16 @@ class MorilleVisualizer:
         </script>
         """
 
-        import json
         labels_json = json.dumps(list(config.PROBABILITY_LABELS))
         thresholds_json = json.dumps(list(config.PROBABILITY_THRESHOLDS))
-        colors_json = json.dumps(list(_CLASS_COLORS[:len(config.PROBABILITY_LABELS)]))
+        colors_json = json.dumps(
+            list(_CLASS_COLORS[: len(config.PROBABILITY_LABELS)])
+        )
         cell_size_str = str(config.CELL_SIZE)
         cmap_stops_json = json.dumps([[pos, col] for pos, col in _CMAP_STOPS])
 
         js_final = (
-            js_block
-            .replace("%LABELS_JSON%", labels_json)
+            js_block.replace("%LABELS_JSON%", labels_json)
             .replace("%THRESHOLDS_JSON%", thresholds_json)
             .replace("%COLORS_JSON%", colors_json)
             .replace("%CELL_SIZE%", cell_size_str)
@@ -479,14 +517,11 @@ class MorilleVisualizer:
         self,
         output: str | Path = "output/carte_morilles.html",
         *,
-        grid_threshold: float | None = None,
+        grid_threshold: float | None = None,  # conservé pour compat API
         show_elimination: bool = True,
     ) -> Path:
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
-
-        if grid_threshold is None:
-            grid_threshold = 0.15
 
         m = folium.Map(
             location=[config.MAP_CENTER["lat"], config.MAP_CENTER["lon"]],
@@ -496,8 +531,7 @@ class MorilleVisualizer:
         )
 
         self._add_basemaps(m)
-        self._add_probability_overlay(m, output.parent)
-        self._add_detailed_grid(m, threshold=grid_threshold)
+        self._add_probability_overlay(m)
 
         if show_elimination:
             self._add_elimination_layers(m)
@@ -507,7 +541,9 @@ class MorilleVisualizer:
 
         MiniMap(toggle_display=True).add_to(m)
         MousePosition(
-            position="bottomright", separator=" | ", prefix="Curseur :",
+            position="bottomright",
+            separator=" | ",
+            prefix="Curseur :",
         ).add_to(m)
         MeasureControl(
             position="topleft",
@@ -524,7 +560,10 @@ class MorilleVisualizer:
 
         try:
             m.save(str(output))
-            logger.info("🗺️  Carte sauvegardée : %s", output)
+            size_mb = output.stat().st_size / (1024 * 1024)
+            logger.info(
+                "🗺️  Carte sauvegardée : %s (%.1f MB)", output, size_mb
+            )
         except OSError:
             logger.exception("Impossible de sauvegarder la carte HTML")
             raise
@@ -538,9 +577,15 @@ class MorilleVisualizer:
         for name, cfg in config.BASEMAPS.items():
             is_default = name == config.DEFAULT_BASEMAP
             tiles = cfg["tiles"]
-            if tiles in {"OpenStreetMap", "CartoDB positron", "CartoDB dark_matter"}:
+            if tiles in {
+                "OpenStreetMap",
+                "CartoDB positron",
+                "CartoDB dark_matter",
+            }:
                 folium.TileLayer(
-                    tiles=tiles, name=name, show=is_default,
+                    tiles=tiles,
+                    name=name,
+                    show=is_default,
                 ).add_to(folium_map)
             else:
                 folium.TileLayer(
@@ -552,262 +597,72 @@ class MorilleVisualizer:
                 ).add_to(folium_map)
 
     # ──────────────────────────────────────────────────────
-    # Overlay PNG
+    # Overlay PNG probabilité — data-URI (pas de fichier)
     # ──────────────────────────────────────────────────────
-    def _add_probability_overlay(
-        self, folium_map: folium.Map, output_dir: Path,
-    ) -> None:
-        score: np.ndarray = self._final_score.copy()
+    def _add_probability_overlay(self, folium_map: folium.Map) -> None:
+        """Ajoute la couche probabilité en ImageOverlay raster inline."""
+        score: np.ndarray = self._final_score
         valid: np.ndarray = np.asarray(np.isfinite(score))
 
         if not np.any(valid):
             logger.warning("Score entièrement NaN — overlay ignoré")
             return
 
-        score_safe: np.ndarray = np.where(valid, score, 0.0)
-        colored: np.ndarray = np.asarray(_CMAP(score_safe))
-
         thresholds = list(config.PROBABILITY_THRESHOLDS)
-        alpha = np.zeros_like(score_safe, dtype=np.float32)
-        alpha_steps = np.linspace(0.15, 0.65, len(thresholds) + 1)[1:]
-        for i, th in enumerate(thresholds):
-            alpha[score_safe >= th] = float(alpha_steps[i])
-        alpha[score_safe >= thresholds[-1]] = 0.70
-        alpha[~valid] = 0.0
-        colored[:, :, 3] = alpha
-
-        img_path = output_dir / "probability_overlay.png"
-        try:
-            plt.imsave(str(img_path), colored)
-        except OSError:
-            logger.exception("Impossible d'écrire le PNG overlay")
-            return
+        png_bytes = self._render_score_png(score, _CMAP, thresholds)
+        uri = self._png_to_data_uri(png_bytes)
 
         ImageOverlay(
-            image=str(img_path),
+            image=uri,
             bounds=[[self._south, self._west], [self._north, self._east]],
-            opacity=0.7,
+            opacity=1.0,
             name="🍄 Probabilité morilles",
-            interactive=True,
+            interactive=False,
             zindex=1,
         ).add_to(folium_map)
 
+        size_kb = len(png_bytes) / 1024
+        logger.info(
+            "✅ Couche probabilité raster : %dx%d px (%.0f KB PNG)",
+            score.shape[1],
+            score.shape[0],
+            size_kb,
+        )
+
     # ──────────────────────────────────────────────────────
-    # Masques éliminatoires
+    # Masques éliminatoires — ImageOverlay raster
     # ──────────────────────────────────────────────────────
     def _add_elimination_layers(self, folium_map: folium.Map) -> None:
+        """Ajoute une couche ImageOverlay par masque éliminatoire."""
         if not self._elim_detail:
             return
 
-        label_map: dict[str, tuple[str, str]] = {
-            "urban":    ("🏠 Zones urbaines", "gray"),
-            "water":    ("💧 Cours d'eau", "blue"),
-            "nodata":   ("❓ NoData", "black"),
-            "species":  ("🌳 Espèces éliminatoires", "darkred"),
-            "geology":  ("🪨 Géologie éliminatoire", "purple"),
-            "slope":    ("⛰️ Pente éliminatoire", "orange"),
-            "altitude": ("📏 Altitude éliminatoire", "brown"),
-        }
-
-        half = config.CELL_SIZE / 2.0
+        bounds = [[self._south, self._west], [self._north, self._east]]
+        n_layers = 0
 
         for key, mask_arr in self._elim_detail.items():
             if not isinstance(mask_arr, np.ndarray):
                 continue
-            label, color = label_map.get(key, (f"❌ {key}", "red"))
-            indices: np.ndarray = np.argwhere(mask_arr)
-            if indices.size == 0:
+            mask = np.asarray(mask_arr, dtype=bool)
+            if not np.any(mask):
                 continue
 
-            fg = folium.FeatureGroup(name=label, show=False)
-            step = max(1, len(indices) // 5000)
+            label, color = _ELIM_LABEL_MAP.get(key, (f"❌ {key}", "#ff0000"))
+            png_bytes = self._render_mask_png(mask, color, alpha=0.45)
+            uri = self._png_to_data_uri(png_bytes)
 
-            for idx in indices[::step]:
-                iy, ix = int(idx[0]), int(idx[1])
-                cx = float(self.grid.x_coords[ix])
-                cy = float(self.grid.y_coords[iy])
-                sw_lon, sw_lat = self._l93_to_wgs84(cx - half, cy - half)
-                ne_lon, ne_lat = self._l93_to_wgs84(cx + half, cy + half)
-                folium.Rectangle(
-                    bounds=[[sw_lat, sw_lon], [ne_lat, ne_lon]],
-                    color=color, fill=True,
-                    fill_color=color, fill_opacity=0.35,
-                    weight=0,
-                ).add_to(fg)
+            ImageOverlay(
+                image=uri,
+                bounds=bounds,
+                opacity=1.0,
+                name=label,
+                show=False,
+                interactive=False,
+                zindex=2,
+            ).add_to(folium_map)
+            n_layers += 1
 
-            fg.add_to(folium_map)
-
-    # ──────────────────────────────────────────────────────
-    # Grille GeoJSON
-    # ──────────────────────────────────────────────────────
-    def _add_detailed_grid(
-        self,
-        folium_map: folium.Map,
-        threshold: float = 0.15,
-    ) -> None:
-        score: np.ndarray = self._final_score
-        prob_classes: np.ndarray = self._prob_classes
-
-        valid_mask = np.isfinite(score) & (score >= threshold)
-        ys, xs = np.nonzero(valid_mask)
-        if ys.size == 0:
-            logger.warning("Aucune cellule ≥ %.2f — grille ignorée", threshold)
-            return
-
-        scores_flat = score[ys, xs]
-        order = np.argsort(scores_flat)[::-1]
-        if order.size > self.max_grid_cells:
-            logger.warning(
-                "Grille tronquée : %s → %s cellules",
-                f"{order.size:,}", f"{self.max_grid_cells:,}",
-            )
-            order = order[:self.max_grid_cells]
-
-        ys = ys[order]
-        xs = xs[order]
-        scores_flat = scores_flat[order]
-        count = ys.size
-
-        score_min = threshold
-        score_max = max(float(scores_flat[0]), threshold + 0.01)
-        half = config.CELL_SIZE / 2.0
-
-        cx_all = self.grid.x_coords[xs]
-        cy_all = self.grid.y_coords[ys]
-        _to_wgs = self.grid.to_wgs84
-        sw_lon_all, sw_lat_all = _to_wgs.transform(cx_all - half, cy_all - half)
-        ne_lon_all, ne_lat_all = _to_wgs.transform(cx_all + half, cy_all + half)
-
-        alt_grid = getattr(self.grid, "altitude", None)
-        slp_grid = getattr(self.grid, "slope", None)
-        scores_dict: dict[str, Any] = getattr(self.grid, "scores", {})
-
-        known_criteria: tuple[str, ...] = (
-            "tree_species", "geology", "dist_water", "altitude",
-            "slope", "aspect", "terrain_roughness", "canopy_openness",
-            "ground_cover", "disturbance",
-        )
-
-        features: list[dict[str, Any]] = []
-
-        for k in range(count):
-            iy = int(ys[k])
-            ix = int(xs[k])
-            s = float(scores_flat[k])
-
-            s_norm = float(
-                np.clip((s - score_min) / (score_max - score_min), 0.0, 1.0)
-            )
-            hex_color = mcolors.rgb2hex(_CMAP(s_norm)[:3])
-
-            cls_idx = int(prob_classes[iy, ix])
-            cls_label = (
-                config.PROBABILITY_LABELS[cls_idx]
-                if 0 <= cls_idx < len(config.PROBABILITY_LABELS)
-                else "?"
-            )
-
-            props: dict[str, Any] = {
-                "score": round(s, 3),
-                "classe": cls_label,
-                "_color": hex_color,
-            }
-
-            if isinstance(alt_grid, np.ndarray) and alt_grid.shape == score.shape:
-                av = float(alt_grid[iy, ix])
-                if math.isfinite(av):
-                    props["alt_m"] = int(av)
-
-            if isinstance(slp_grid, np.ndarray) and slp_grid.shape == score.shape:
-                sv = float(slp_grid[iy, ix])
-                if math.isfinite(sv):
-                    props["pente_deg"] = round(sv, 1)
-
-            for crit in known_criteria:
-                arr = scores_dict.get(crit)
-                if isinstance(arr, np.ndarray) and arr.shape == score.shape:
-                    v = float(arr[iy, ix])
-                    if math.isfinite(v):
-                        props[crit] = round(v, 2)
-
-            coords = [[
-                [float(sw_lon_all[k]), float(sw_lat_all[k])],
-                [float(ne_lon_all[k]), float(sw_lat_all[k])],
-                [float(ne_lon_all[k]), float(ne_lat_all[k])],
-                [float(sw_lon_all[k]), float(ne_lat_all[k])],
-                [float(sw_lon_all[k]), float(sw_lat_all[k])],
-            ]]
-
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "Polygon", "coordinates": coords},
-                "properties": props,
-            })
-
-        geojson_data: dict[str, Any] = {
-            "type": "FeatureCollection",
-            "features": features,
-        }
-
-        grid_group = folium.FeatureGroup(
-            name=f"📐 Grille détaillée (≥{threshold:.2f})",
-            show=True,
-        )
-
-        def style_fn(feature: dict[str, Any]) -> dict[str, Any]:
-            c: str = feature.get("properties", {}).get("_color", "#ff7f00")
-            return {
-                "fillColor": c,
-                "color": c,
-                "weight": 0.3,
-                "fillOpacity": 0.6,
-                "opacity": 0.6,
-            }
-
-        # Tooltip sticky — suit le curseur
-        tooltip = folium.GeoJsonTooltip(
-            fields=["score", "classe"],
-            aliases=["🍄 Score :", "Classe :"],
-            localize=True,
-            sticky=True,
-            style=(
-                "background-color:rgba(255,255,255,0.92); color:#333; "
-                "font-family:'Segoe UI',Arial,sans-serif; font-size:12px; "
-                "padding:5px 8px; border-radius:4px; "
-                "box-shadow:0 1px 4px rgba(0,0,0,.3); pointer-events:none;"
-            ),
-        )
-
-        # Popup au clic
-        popup_fields = ["score", "classe"]
-        popup_aliases = ["🍄 Score", "Classe"]
-        for crit in known_criteria:
-            if any(crit in f.get("properties", {}) for f in features[:20]):
-                popup_fields.append(crit)
-                popup_aliases.append(crit.replace("_", " ").title())
-        if any("alt_m" in f.get("properties", {}) for f in features[:20]):
-            popup_fields.append("alt_m")
-            popup_aliases.append("Altitude (m)")
-        if any("pente_deg" in f.get("properties", {}) for f in features[:20]):
-            popup_fields.append("pente_deg")
-            popup_aliases.append("Pente (°)")
-
-        folium.GeoJson(
-            geojson_data,
-            style_function=style_fn,
-            tooltip=tooltip,
-            popup=folium.GeoJsonPopup(
-                fields=popup_fields,
-                aliases=popup_aliases,
-                max_width=280,
-            ),
-        ).add_to(grid_group)
-
-        grid_group.add_to(folium_map)
-        logger.info(
-            "Grille détaillée : %s cellules (seuil=%.2f)",
-            f"{count:,}", threshold,
-        )
+        logger.info("✅ %d couches éliminatoires raster ajoutées", n_layers)
 
     # ──────────────────────────────────────────────────────
     # Hotspots
@@ -818,16 +673,18 @@ class MorilleVisualizer:
 
         hg = folium.FeatureGroup(name="🎯 Hotspots à prospecter")
 
-        for h in self.hotspots[:self.max_hotspot_markers]:
+        for h in self.hotspots[: self.max_hotspot_markers]:
             lon, lat = self._l93_to_wgs84(h["x_l93"], h["y_l93"])
             ms: float = float(h.get("mean_score", 0.0))
 
             color = (
-                "darkgreen" if ms >= 0.75
+                "darkgreen"
+                if ms >= 0.75
                 else ("green" if ms >= 0.60 else "orange")
             )
             icon_name = (
-                "star" if ms >= 0.75
+                "star"
+                if ms >= 0.75
                 else ("ok-sign" if ms >= 0.60 else "question-sign")
             )
 
@@ -839,9 +696,13 @@ class MorilleVisualizer:
             if h.get("altitude") is not None:
                 popup_lines.append(f"Altitude : {h['altitude']:.0f} m<br>")
             if h.get("mean_slope") is not None:
-                popup_lines.append(f"Pente moy. : {h['mean_slope']:.1f}°<br>")
+                popup_lines.append(
+                    f"Pente moy. : {h['mean_slope']:.1f}°<br>"
+                )
             if h.get("dominant_tree"):
-                popup_lines.append(f"Essence dom. : {h['dominant_tree']}<br>")
+                popup_lines.append(
+                    f"Essence dom. : {h['dominant_tree']}<br>"
+                )
             if h.get("geology"):
                 popup_lines.append(f"Géologie : {h['geology']}<br>")
 
@@ -894,14 +755,18 @@ class MorilleVisualizer:
         score[nodata_mask] = _NODATA
 
         transform = from_bounds(
-            self._xmin_l93, self._ymin_l93,
-            self._xmax_l93, self._ymax_l93,
-            self.grid.nx, self.grid.ny,
+            self._xmin_l93,
+            self._ymin_l93,
+            self._xmax_l93,
+            self._ymax_l93,
+            self.grid.nx,
+            self.grid.ny,
         )
 
         try:
             with rasterio.open(
-                str(output), "w",
+                str(output),
+                "w",
                 driver="GTiff",
                 height=self.grid.ny,
                 width=self.grid.nx,
@@ -934,7 +799,7 @@ class MorilleVisualizer:
         output: str | Path = "output/morilles_grid.gpkg",
         threshold: float = 0.15,
     ) -> Path:
-        """Export GeoPackage vectorisé (numpy batch au lieu de double boucle)."""
+        """Export GeoPackage vectorisé (numpy batch)."""
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
         logger.info("Export GeoPackage (seuil=%.2f)…", threshold)
@@ -945,7 +810,6 @@ class MorilleVisualizer:
         half = config.CELL_SIZE / 2.0
         labels = list(config.PROBABILITY_LABELS)
 
-        # ── Indices vectorisés des cellules au-dessus du seuil ──
         above = np.isfinite(score) & (score >= threshold)
         iy_arr, ix_arr = np.where(above)
 
@@ -956,17 +820,14 @@ class MorilleVisualizer:
         n = iy_arr.size
         logger.info("  %d cellules à exporter", n)
 
-        # Coordonnées centres (vectorisé)
         cx_arr = np.asarray(self.grid.x_coords)[ix_arr]
         cy_arr = np.asarray(self.grid.y_coords)[iy_arr]
 
-        # Géométries batch (list comp sur arrays, pas double boucle)
         geometries = [
             shapely_box(cx - half, cy - half, cx + half, cy + half)
             for cx, cy in zip(cx_arr.tolist(), cy_arr.tolist())
         ]
 
-        # ── Colonnes principales ──
         score_vals = score[iy_arr, ix_arr]
         cls_vals = prob_classes[iy_arr, ix_arr].astype(int)
 
@@ -980,7 +841,6 @@ class MorilleVisualizer:
             "eliminated": elim_mask[iy_arr, ix_arr].astype(bool),
         }
 
-        # ── Altitude / pente (vectorisé) ──
         alt_grid = getattr(self.grid, "altitude", None)
         if isinstance(alt_grid, np.ndarray) and alt_grid.shape == score.shape:
             av = alt_grid[iy_arr, ix_arr].astype(np.float64)
@@ -993,14 +853,12 @@ class MorilleVisualizer:
             sv[~np.isfinite(sv)] = np.nan
             data["slope"] = np.round(sv, 2)
 
-        # ── Confiance (scalaires → broadcast pandas) ──
         conf_dict: dict[str, Any] = getattr(self.grid, "score_confidence", {})
         if isinstance(conf_dict, dict):
             for crit, conf_val in conf_dict.items():
                 if isinstance(conf_val, (int, float)):
                     data[f"conf_{crit}"] = round(float(conf_val), 2)
 
-        # ── Scores par critère (vectorisé) ──
         scores_dict: dict[str, Any] = getattr(self.grid, "scores", {})
         if isinstance(scores_dict, dict):
             for crit_name, crit_arr in scores_dict.items():
@@ -1027,72 +885,114 @@ class MorilleVisualizer:
 
         return output
 
+
 # ═══════════════════════════════════════════════════════════
 # Landmarks par défaut
 # ═══════════════════════════════════════════════════════════
 def _default_landmarks() -> list[dict[str, Any]]:
     return [
         {
-            "name": "Pont de l'Oulle", "lat": 45.24713, "lon": 5.69889,
+            "name": "Pont de l'Oulle",
+            "lat": 45.24713,
+            "lon": 5.69889,
             "info": "Entrée gorges Vence, ~265m",
-            "icon_color": "red", "icon": "flag",
+            "icon_color": "red",
+            "icon": "flag",
         },
         {
-            "name": "Cascade des Prises", "lat": 45.2454, "lon": 5.69631,
+            "name": "Cascade des Prises",
+            "lat": 45.2454,
+            "lon": 5.69631,
             "info": "Cascade gorges Vence, ~350m",
-            "icon_color": "red", "icon": "tint",
+            "icon_color": "red",
+            "icon": "tint",
         },
         {
-            "name": "Champy", "lat": 45.24036, "lon": 5.69272,
+            "name": "Champy",
+            "lat": 45.24036,
+            "lon": 5.69272,
             "info": "Hameau, ~250m",
-            "icon_color": "blue", "icon": "home",
+            "icon_color": "blue",
+            "icon": "home",
         },
         {
-            "name": "Saint-Égrève centre", "lat": 45.2325, "lon": 5.6790,
+            "name": "Saint-Égrève centre",
+            "lat": 45.2325,
+            "lon": 5.6790,
             "info": "Mairie, ~210m",
-            "icon_color": "blue", "icon": "info-sign",
+            "icon_color": "blue",
+            "icon": "info-sign",
         },
         {
             "name": "🍄 Ripisylve Vence (bas)",
-            "lat": 45.2442, "lon": 5.69375,
+            "lat": 45.2442,
+            "lon": 5.69375,
             "info": "Frênes/aulnes, sol alluvial",
-            "icon_color": "green", "icon": "leaf",
+            "icon_color": "green",
+            "icon": "leaf",
         },
         {
-            "name": "Le Néron", "lat": 45.23731, "lon": 5.71002,
+            "name": "Le Néron",
+            "lat": 45.23731,
+            "lon": 5.71002,
             "info": "Sommet 1299m",
-            "icon_color": "gray", "icon": "triangle-top",
-        },    
-        # ── Contrôles positifs (morilles attendues) ──────────────────
-    {"name": "Champy – châtaigneraie",
-     "lat": 45.24308, "lon": 5.69736, "expected": 0.55,
-     "obs": "châtaignier favorable (M. elata), sol frais versant"},
-
-    {"name": "Terrasse plan d'eau + conifères",
-     "lat": 45.24087, "lon": 5.69484, "expected": 0.50,
-     "obs": "meilleur spot trouvé, M. elata possible"},
-
-    # ── Contrôles négatifs locaux (même zone, micro-habitat) ────
-    {"name": "Berge Vence – trop humide",
-     "lat": 45.24588, "lon": 5.69744, "expected": 0.05,
-     "obs": "lierre dense, scolopendres — LIMITATION micro-habitat",
-     "tolerance": 0.50},                      # ← tolérance élargie
-    {"name": "Ravine au-dessus Vence",
-     "lat": 45.24651, "lon": 5.70052, "expected": 0.05,
-     "obs": "encaissé humide — LIMITATION micro-habitat",
-     "tolerance": 0.50},
-    {"name": "Mi-pente Néron chênaie+buis",
-     "lat": 45.24418, "lon": 5.69886, "expected": 0.10,
-     "obs": "trop sec thermophile — LIMITATION espèces indicatrices",
-     "tolerance": 0.50},
-    {"name": "Robiniers + hêtres secteur Champy",
-     "lat": 45.24212, "lon": 5.69681, "expected": 0.15,
-     "obs": "sol perturbé — LIMITATION sans détection invasives",
-     "tolerance": 0.45},
-
-    # ── Contrôle positif éloigné (diversité géo) ────────────────
-    {"name": "Vouillants forêt calcaire 350m",
-     "lat": 45.18824, "lon": 5.66543, "expected": 0.70,
-     "obs": "forêt calcaire optimale, altitude idéale"},
-
+            "icon_color": "gray",
+            "icon": "triangle-top",
+        },
+        # ── Contrôles positifs (morilles attendues) ──
+        {
+            "name": "Champy – châtaigneraie",
+            "lat": 45.24308,
+            "lon": 5.69736,
+            "expected": 0.55,
+            "obs": "châtaignier favorable (M. elata), sol frais versant",
+        },
+        {
+            "name": "Terrasse plan d'eau + conifères",
+            "lat": 45.24087,
+            "lon": 5.69484,
+            "expected": 0.50,
+            "obs": "meilleur spot trouvé, M. elata possible",
+        },
+        # ── Contrôles négatifs locaux ──
+        {
+            "name": "Berge Vence – trop humide",
+            "lat": 45.24588,
+            "lon": 5.69744,
+            "expected": 0.05,
+            "obs": "lierre dense, scolopendres — LIMITATION micro-habitat",
+            "tolerance": 0.50,
+        },
+        {
+            "name": "Ravine au-dessus Vence",
+            "lat": 45.24651,
+            "lon": 5.70052,
+            "expected": 0.05,
+            "obs": "encaissé humide — LIMITATION micro-habitat",
+            "tolerance": 0.50,
+        },
+        {
+            "name": "Mi-pente Néron chênaie+buis",
+            "lat": 45.24418,
+            "lon": 5.69886,
+            "expected": 0.10,
+            "obs": "trop sec thermophile — LIMITATION espèces indicatrices",
+            "tolerance": 0.50,
+        },
+        {
+            "name": "Robiniers + hêtres secteur Champy",
+            "lat": 45.24212,
+            "lon": 5.69681,
+            "expected": 0.15,
+            "obs": "sol perturbé — LIMITATION sans détection invasives",
+            "tolerance": 0.45,
+        },
+        # ── Contrôle positif éloigné ──
+        {
+            "name": "Vouillants forêt calcaire 350m",
+            "lat": 45.18824,
+            "lon": 5.66543,
+            "expected": 0.70,
+            "obs": "forêt calcaire optimale, altitude idéale",
+        },
     ]
