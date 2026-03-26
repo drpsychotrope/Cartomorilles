@@ -19,7 +19,17 @@
   "read_only_files": [
     "config.py"
   ],
-  "changes": [],
+  "changes": [
+    {
+      "filename": "species_enricher.py",
+      "hash_before": "b4b8c8a3ed",
+      "hash_after": "b4b8c8a3ed",
+      "lines_added": 0,
+      "lines_removed": 0,
+      "timestamp": "2026-03-26T13:44:59.159529+00:00",
+      "description": ""
+    }
+  ],
   "description": "Refactor species_enricher",
   "git_branch": "session/enricher",
   "context_file": "AI_CONTEXT_enricher.md",
