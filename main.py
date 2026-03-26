@@ -871,6 +871,10 @@ def main(args: argparse.Namespace) -> int:
     urban_buffer: int = args.urban_buffer if not args.no_urban else 0
     grid.apply_urban_mask(urban_gdf, buffer_m=urban_buffer)
 
+    # ── 2d'. Score proximité urbaine (EDT sur masque urbain) ──
+    logger.info("   ▸ Score proximité urbaine...")
+    grid.score_urban_proximity()
+
     # ── 2e. Scores micro-habitat ──────────────────────────────
     #    APRÈS apply_urban_mask (urban_mask prêt pour disturbance)
     #    AVANT apply_landcover_mask (pour être modulés par green_score)

@@ -362,6 +362,25 @@ class MorilleScoring:
                 int(twi_elim.sum()),
             )
             
+        # ── Proximité urbaine éliminatoire ──
+        dist_urban = getattr(self.grid, "dist_urban_grid", None)
+        if isinstance(dist_urban, np.ndarray) and dist_urban.shape == (ny, nx):
+            _existing_urban = detail.get(
+                "urban", np.zeros((ny, nx), dtype=bool)
+            )
+            urban_prox_elim = (
+                np.isfinite(dist_urban)
+                & (dist_urban < config.URBAN_DIST_ELIMINATORY)
+                & ~_existing_urban
+            )
+            detail["urban_proximity"] = urban_prox_elim
+            combined |= urban_prox_elim
+            logger.info(
+                "  Proximité urb. (<%.0fm) : %8d cellules",
+                config.URBAN_DIST_ELIMINATORY,
+                int(urban_prox_elim.sum()),
+            )
+
         # ── Résumé ──
         total_elim = int(combined.sum())
         total_cells = self.final_score.size

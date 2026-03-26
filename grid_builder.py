@@ -63,7 +63,11 @@ from config import (
     get_geology_score,
     get_tree_score,
     LANDCOVER_FOREST_FLOOR,
-    DIST_WATER_FOREST_FLOOR
+    DIST_WATER_FOREST_FLOOR,
+    URBAN_DIST_ELIMINATORY,
+    URBAN_DIST_PENALTY,
+    URBAN_DIST_FULL,
+    URBAN_PROXIMITY_FLOOR,
 )
 
 logger = logging.getLogger("cartomorilles.grid_builder")
@@ -1845,6 +1849,72 @@ class GridBuilder:
             urban_pct,
             urban_ha,
         )
+        return self
+
+    # TODO: main.py — appeler grid.score_urban_proximity() après apply_urban_mask()
+
+    def score_urban_proximity(self) -> GridBuilder:
+        """Score de proximité urbaine — pénalise les zones proches de l'urbanisation."""
+        _um = getattr(self, "urban_mask", None)
+        if not isinstance(_um, np.ndarray) or not np.any(_um):
+            logger.info("⚠️ Pas de masque urbain → score neutre 1.0")
+            self.scores["urban_proximity"] = np.ones(
+                (self.ny, self.nx), dtype=np.float32
+            )
+            self.dist_urban_grid = np.full(
+                (self.ny, self.nx), 9999.0, dtype=np.float32
+            )
+            self.score_confidence["urban_proximity"] = 0.0
+            return self
+
+        # Distance euclidienne en mètres depuis le bord du masque urbain
+        dist_grid: np.ndarray = (
+            np.asarray(distance_transform_edt(~_um)).astype(np.float32)
+            * self.cell_size
+        )
+        self.dist_urban_grid = dist_grid
+
+        d_elim = URBAN_DIST_ELIMINATORY
+        d_pen = URBAN_DIST_PENALTY
+        d_full = URBAN_DIST_FULL
+        floor = URBAN_PROXIMITY_FLOOR
+
+        score = np.zeros_like(dist_grid, dtype=np.float32)
+
+        # < d_elim (dans masque ou très proche) → 0.0 (déjà zeros_like)
+
+        # d_elim..d_pen → rampe [FLOOR..0.6]
+        mask = (dist_grid >= d_elim) & (dist_grid < d_pen)
+        if np.any(mask):
+            t = (dist_grid[mask] - d_elim) / (d_pen - d_elim)
+            score[mask] = floor + (0.6 - floor) * t
+
+        # d_pen..d_full → rampe [0.6..1.0]
+        mask = (dist_grid >= d_pen) & (dist_grid < d_full)
+        if np.any(mask):
+            t = (dist_grid[mask] - d_pen) / (d_full - d_pen)
+            score[mask] = 0.6 + 0.4 * t
+
+        # > d_full → 1.0
+        score[dist_grid >= d_full] = 1.0
+
+        score = self._apply_nodata(np.clip(score, 0, 1))
+        self.scores["urban_proximity"] = score
+        self.score_confidence["urban_proximity"] = 0.8
+
+        _not_um = ~_um
+        _dist_min: float = (
+            float(np.min(dist_grid[_not_um]))
+            if np.any(_not_um)
+            else 0.0
+        )
+        logger.info(
+            "   Distance urbain : %.0f–%.0fm, %d cellules en zone urbaine",
+            _dist_min,
+            float(np.max(dist_grid)),
+            int(_um.sum()),
+        )
+        self._log_score_stats("urban_proximity", score)
         return self
 
     def apply_water_mask(self) -> GridBuilder:

@@ -2570,6 +2570,74 @@ class SessionManager:
             f"{released} verrou(s) libéré(s)."
         )
 
+    def extend(
+        self,
+        session_name: str,
+        new_files: list[str],
+    ) -> Session:
+        """Étend le scope d'une session à de nouveaux fichiers."""
+        session = self._load_session(session_name)
+        if not session:
+            raise ValueError(f"Session '{session_name}' introuvable")
+        if session.state != SessionState.ACTIVE:
+            raise RuntimeError(
+                f"Session '{session_name}' n'est pas active "
+                f"(état: {session.state.value})"
+            )
+
+        # Filtrer les fichiers déjà dans le scope
+        to_add = [
+            f for f in new_files
+            if f not in session.focus_files
+        ]
+        if not to_add:
+            logger.info("Tous les fichiers sont déjà dans le scope.")
+            return session
+
+        # Vérifier que les fichiers existent
+        for f in to_add:
+            if not (PROJECT_ROOT / f).exists():
+                raise FileNotFoundError(f"Fichier non trouvé : {f}")
+
+        # Acquérir les verrous
+        success, errors = self.locks.acquire_locks(
+            session_name, to_add
+        )
+        if not success:
+            raise RuntimeError(
+                "Impossible d'acquérir les verrous :\n"
+                + "\n".join(errors)
+            )
+
+        # Mettre à jour la session
+        session.focus_files.extend(to_add)
+        session.exclude_files = [
+            f for f in session.exclude_files
+            if f not in to_add
+        ]
+        session.read_only_files = [
+            f for f in session.read_only_files
+            if f not in to_add
+        ]
+        self._save_session(session)
+
+        self._append_history({
+            "action": "extend",
+            "session": session_name,
+            "files": to_add,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        logger.info(
+            f"✅ Session '{session_name}' étendue : "
+            f"{', '.join(to_add)}"
+        )
+        logger.info(
+            f"   Scope complet : {', '.join(session.focus_files)}"
+        )
+
+        return session
+
     def status(self, session_name: str) -> dict[str, Any]:
         """Retourne le statut détaillé d'une session."""
         session = self._load_session(session_name)
@@ -2915,6 +2983,16 @@ def cli_session_abort(args: argparse.Namespace) -> None:
         logger.error(str(e))
         sys.exit(1)
 
+def cli_session_extend(args: argparse.Namespace) -> None:
+    mgr = SessionManager()
+    try:
+        mgr.extend(
+            session_name=args.name,
+            new_files=args.files,
+        )
+    except (ValueError, RuntimeError, FileNotFoundError) as e:
+        logger.error(str(e))
+        sys.exit(1)
 
 def cli_session_history(args: argparse.Namespace) -> None:
     mgr = SessionManager()
@@ -3128,6 +3206,17 @@ def _build_session_parser(
         help="Pas de confirmation",
     )
     p_abort.set_defaults(func=cli_session_abort)
+
+    # ── extend ────────────────────────────────
+    p_extend = session_sub.add_parser(
+        "extend", help="Étendre le scope d'une session"
+    )
+    p_extend.add_argument("name", help="Nom de la session")
+    p_extend.add_argument(
+        "--files", "-f", nargs="+", required=True,
+        help="Fichiers à ajouter au scope",
+    )
+    p_extend.set_defaults(func=cli_session_extend)    
 
     # ── history ───────────────────────────────
     p_history = session_sub.add_parser(
