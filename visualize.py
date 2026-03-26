@@ -45,7 +45,7 @@ from rasterio.warp import (  # noqa: E402
 from shapely.geometry import box as shapely_box  # noqa: E402
 
 import config  # noqa: E402
-
+from config import TWI_OPTIMAL, TWI_WATERLOG
 if TYPE_CHECKING:
     from scoring import MorilleScoring
 
@@ -784,7 +784,7 @@ class MorilleVisualizer:
 
         if show_elimination:
             self._add_elimination_layers(m)
-
+        self._add_twi_layers(m)
         self._add_hotspot_markers(m)
         self._add_landmarks(m)
 
@@ -1137,7 +1137,143 @@ class MorilleVisualizer:
 
         return output
 
+    def _render_twi_raw_png(self, twi_raw: np.ndarray) -> bytes:
+        """Rend le TWI brut en PNG RGBA avec colormap hydrologique."""
+        arr = np.asarray(twi_raw, dtype=np.float32)
+        oriented = self._orient_for_overlay(arr)
 
+        vmin = 0.0
+        vmax = float(TWI_WATERLOG) + 2.0
+        valid = np.isfinite(oriented)
+
+        norm = np.zeros_like(oriented, dtype=np.float32)
+        norm[valid] = np.clip(
+            (oriented[valid] - vmin) / (vmax - vmin), 0.0, 1.0
+        )
+
+        cmap = matplotlib.colormaps["RdYlBu"]
+        rgba = np.zeros((*oriented.shape, 4), dtype=np.uint8)
+        colored = cmap(norm)
+        rgba[..., :3] = (colored[..., :3] * 255).astype(np.uint8)
+        rgba[..., 3] = np.where(valid, 200, 0).astype(np.uint8)
+
+        img = Image.fromarray(rgba, "RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _render_twi_score_png(self, twi_score: np.ndarray) -> bytes:
+        """Rend le score TWI [0,1] en PNG RGBA avec colormap RdYlGn."""
+        arr = np.asarray(twi_score, dtype=np.float32)
+        oriented = self._orient_for_overlay(arr)
+
+        valid = np.isfinite(oriented) & (oriented > 0)
+
+        cmap = matplotlib.colormaps["RdYlGn"]
+        norm = np.clip(oriented, 0.0, 1.0)
+        rgba = np.zeros((*oriented.shape, 4), dtype=np.uint8)
+        colored = cmap(norm)
+        rgba[..., :3] = (colored[..., :3] * 255).astype(np.uint8)
+        rgba[..., 3] = np.where(valid, 180, 0).astype(np.uint8)
+
+        img = Image.fromarray(rgba, "RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _render_waterlog_png(self, waterlog_mask: np.ndarray) -> bytes:
+        """Rend le masque d'engorgement TWI en PNG RGBA rouge."""
+        mask = np.asarray(waterlog_mask, dtype=bool)
+        oriented = self._orient_for_overlay(mask.astype(np.float32)) > 0.5
+
+        rgba = np.zeros((*oriented.shape, 4), dtype=np.uint8)
+        rgba[oriented, 0] = 220
+        rgba[oriented, 1] = 40
+        rgba[oriented, 2] = 40
+        rgba[oriented, 3] = 180
+
+        img = Image.fromarray(rgba, "RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _add_twi_layers(self, folium_map: folium.Map) -> None:
+        """Ajoute les couches TWI (brut, score, engorgement) à la carte."""
+        twi_data = self.model.get_twi_display_data()
+
+        if not twi_data["has_data"]:
+            logger.debug("   Pas de données TWI à afficher")
+            return
+
+        bounds = [[self._south, self._west], [self._north, self._east]]
+
+        # --- Couche TWI brut ---
+        twi_raw = twi_data["raw"]
+        if twi_raw is not None:
+            raw_png = self._render_twi_raw_png(twi_raw)
+            raw_uri = self._png_to_data_uri(raw_png)
+            ImageOverlay(
+                image=raw_uri,
+                bounds=bounds,
+                opacity=0.65,
+                name="🌊 TWI brut (valeurs hydrologiques)",
+                interactive=False,
+                zindex=1,
+                show=False,
+            ).add_to(folium_map)
+            logger.info(
+                "✅ Couche TWI brut ajoutée — range [%.1f, %.1f]",
+                float(np.nanmin(twi_raw)),
+                float(np.nanmax(twi_raw)),
+            )
+
+        # --- Couche TWI score ---
+        twi_score = twi_data["score"]
+        if twi_score is not None and isinstance(twi_score, np.ndarray):
+            score_png = self._render_twi_score_png(twi_score)
+            score_uri = self._png_to_data_uri(score_png)
+            ImageOverlay(
+                image=score_uri,
+                bounds=bounds,
+                opacity=0.65,
+                name="📊 TWI score [0–1]",
+                interactive=False,
+                zindex=1,
+                show=False,
+            ).add_to(folium_map)
+            valid_score = twi_score[np.isfinite(twi_score)]
+            if valid_score.size > 0:
+                logger.info(
+                    "✅ Couche TWI score ajoutée — mean=%.3f  median=%.3f",
+                    float(np.mean(valid_score)),
+                    float(np.median(valid_score)),
+                )
+
+        # --- Couche engorgement ---
+        waterlog_mask = twi_data["waterlog_mask"]
+        if waterlog_mask is not None and np.any(waterlog_mask):
+            wl_png = self._render_waterlog_png(waterlog_mask)
+            wl_uri = self._png_to_data_uri(wl_png)
+            n_wl = int(np.sum(waterlog_mask))
+            ImageOverlay(
+                image=wl_uri,
+                bounds=bounds,
+                opacity=0.70,
+                name=f"⚠️ TWI engorgement (>{TWI_WATERLOG}) — {n_wl} cellules",
+                interactive=False,
+                zindex=2,
+                show=False,
+            ).add_to(folium_map)
+            logger.info(
+                "✅ Couche engorgement TWI ajoutée — %d cellules (>%.0f)",
+                n_wl,
+                TWI_WATERLOG,
+            )
+        else:
+            logger.info(
+                "   Aucune cellule engorgée (TWI > %.0f) dans l'emprise",
+                TWI_WATERLOG,
+            )
 # ═══════════════════════════════════════════════════════════
 # Landmarks par défaut
 # ═══════════════════════════════════════════════════════════

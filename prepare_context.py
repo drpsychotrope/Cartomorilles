@@ -2340,7 +2340,13 @@ class SessionManager:
             if l.startswith("-") and not l.startswith("---")
         )
 
+        # Auto-commit avant switch de branche (évite le conflit git)
         original_branch = self.git.current_branch()
+        if self.git.has_uncommitted_changes():
+            self.git.commit_all(
+                f"Auto-save before apply '{session_name}/{filename}'"
+            )
+
         self.git.switch_branch(session.git_branch)
 
         filepath.write_text(new_content, encoding="utf-8")
