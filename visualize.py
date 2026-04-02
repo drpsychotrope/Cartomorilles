@@ -1515,7 +1515,7 @@ class MorilleVisualizer:
           {best_html}
         </div>
         """
-        folium_map.get_root().html.add_child(Element(html))
+        folium_map.get_root().add_child(Element(html))
         logger.info("✅ Panneau météo : %d jours affichés", len(self._weather_days))
 
     # ──────────────────────────────────────────────────────
