@@ -202,6 +202,8 @@ class MorilleVisualizer:
         max_hotspot_markers: int = _MAX_HOTSPOT_MARKERS,
         hydro_gdf: gpd.GeoDataFrame | None = None,
         urban_gdf: gpd.GeoDataFrame | None = None,
+        inat_observations: list[dict[str, Any]] | None = None,
+        weather_days: list[Any] | None = None,
     ) -> None:
         self._validate_model(scoring_model)
         self.model: MorilleScoring = scoring_model
@@ -211,6 +213,8 @@ class MorilleVisualizer:
         self.max_hotspot_markers = max_hotspot_markers
         self._hydro_gdf = hydro_gdf
         self._urban_gdf = urban_gdf
+        self._inat_observations: list[dict[str, Any]] = inat_observations or []
+        self._weather_days: list[Any] = weather_days or []
 
         _fs = scoring_model.final_score
         _pc = scoring_model.probability_classes
@@ -258,6 +262,16 @@ class MorilleVisualizer:
         render_nx = min(int(self.grid.nx * render_scale), _RENDER_MAX_PX)
         render_ny = min(int(self.grid.ny * render_scale), _RENDER_MAX_PX)
 
+        # Emprise WGS84 exacte depuis pyproj (même transformation que les
+        # vecteurs → plus de décalage TWI ↔ cours d'eau).
+        _corners_x = [self._xmin_l93, self._xmax_l93, self._xmin_l93, self._xmax_l93]
+        _corners_y = [self._ymin_l93, self._ymin_l93, self._ymax_l93, self._ymax_l93]
+        _cx, _cy = self._transformer.transform(_corners_x, _corners_y)
+        self._west = float(min(_cx))
+        self._east = float(max(_cx))
+        self._south = float(min(_cy))
+        self._north = float(max(_cy))
+
         dst_transform, dst_width, dst_height = calculate_default_transform(
             self._src_crs,
             self._dst_crs,
@@ -270,15 +284,16 @@ class MorilleVisualizer:
         )
         assert dst_width is not None
         assert dst_height is not None
-        self._dst_transform = dst_transform
+
+        # Recalculer le dst_transform depuis les bounds WGS84 exactes pour
+        # garantir l'alignement pixel-parfait avec les vecteurs reprojetés.
         self._dst_width: int = dst_width
         self._dst_height: int = dst_height
-
-        # Emprise WGS84 exacte depuis le transform reprojeté
-        self._west = self._dst_transform.c
-        self._north = self._dst_transform.f
-        self._east = self._west + self._dst_transform.a * self._dst_width
-        self._south = self._north + self._dst_transform.e * self._dst_height
+        self._dst_transform = from_bounds(
+            self._west, self._south,
+            self._east, self._north,
+            dst_width, dst_height,
+        )
 
         # Bounds Folium (réutilisé partout)
         self._bounds: list[list[float]] = [
@@ -1385,6 +1400,125 @@ class MorilleVisualizer:
         logger.info("✅ Cours d'eau vectoriels : %d entités", len(gdf))
 
     # ──────────────────────────────────────────────────────
+    # Couche iNaturalist Morchella
+    # ──────────────────────────────────────────────────────
+    def _add_inaturalist_layer(self, folium_map: folium.Map) -> None:
+        if not self._inat_observations:
+            return
+
+        fg = folium.FeatureGroup(name="🍄 iNaturalist Morchella", show=True)
+        for obs in self._inat_observations:
+            lat = obs.get("lat")
+            lng = obs.get("lng")
+            if lat is None or lng is None:
+                continue
+            quality = str(obs.get("quality_grade", "needs_id"))
+            date_str = str(obs.get("observed_on", "?"))
+            taxon = str(obs.get("taxon_name", "Morchella"))
+            obs_id = obs.get("id", "?")
+
+            color = "#e67300" if quality == "research" else "#cc9900"
+            popup_html = (
+                f"<b>iNaturalist #{obs_id}</b><br>"
+                f"Taxon : {taxon}<br>"
+                f"Date : {date_str}<br>"
+                f"Qualité : {quality}"
+            )
+            folium.CircleMarker(
+                location=[float(lat), float(lng)],
+                radius=6,
+                color=color,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.8,
+                popup=folium.Popup(popup_html, max_width=200),
+            ).add_to(fg)
+
+        fg.add_to(folium_map)
+        logger.info(
+            "✅ iNaturalist : %d observations affichées",
+            len(self._inat_observations),
+        )
+
+    # ──────────────────────────────────────────────────────
+    # Panneau météo
+    # ──────────────────────────────────────────────────────
+    def _add_weather_panel(self, folium_map: folium.Map) -> None:
+        if not self._weather_days:
+            return
+
+        rows = ""
+        best_day = None
+        best_score = -1.0
+        for d in self._weather_days:
+            score = float(d.score)
+            label = str(d.label)
+            date_str = str(d.date_fr)
+            # Icône selon le niveau
+            if score >= 0.7:
+                icon = "&#9733;"  # star
+                cls = "wx-good"
+            elif score >= 0.4:
+                icon = "&#9679;"  # circle
+                cls = "wx-ok"
+            else:
+                icon = "&#9675;"  # empty circle
+                cls = "wx-bad"
+            rows += (
+                f'<tr class="{cls}">'
+                f"<td>{date_str}</td>"
+                f"<td>{icon} {label}</td>"
+                f"<td>{score:.0%}</td>"
+                f"</tr>"
+            )
+            if score > best_score:
+                best_score = score
+                best_day = date_str
+
+        burst_html = ""
+        for d in self._weather_days:
+            if getattr(d, "burst", None) is not None:
+                burst_html = (
+                    '<div class="wx-burst">'
+                    "&#x1F4A7; Signal fructification détecté"
+                    "</div>"
+                )
+                break
+
+        best_html = ""
+        if best_day:
+            best_html = (
+                f'<div class="wx-best">'
+                f"Meilleur jour : <b>{best_day}</b>"
+                f"</div>"
+            )
+
+        html = f"""
+        <div id="wx-panel" style="
+            position:fixed; bottom:30px; right:10px; z-index:1000;
+            background:rgba(255,255,255,0.92); border-radius:8px;
+            padding:10px 14px; font-size:12px; font-family:sans-serif;
+            box-shadow:0 2px 8px rgba(0,0,0,0.3); max-width:260px;
+            border:1px solid #ccc;">
+          <style>
+            #wx-panel table {{ border-collapse:collapse; width:100%; }}
+            #wx-panel td {{ padding:2px 6px; }}
+            #wx-panel .wx-good {{ color:#2d8a4e; font-weight:bold; }}
+            #wx-panel .wx-ok {{ color:#b8860b; }}
+            #wx-panel .wx-bad {{ color:#999; }}
+            #wx-panel .wx-burst {{ color:#0066cc; margin-top:4px; font-weight:bold; }}
+            #wx-panel .wx-best {{ margin-top:4px; color:#333; }}
+          </style>
+          <b>&#127780; Météo prospection</b>
+          <table>{rows}</table>
+          {burst_html}
+          {best_html}
+        </div>
+        """
+        folium_map.get_root().html.add_child(Element(html))
+        logger.info("✅ Panneau météo : %d jours affichés", len(self._weather_days))
+
+    # ──────────────────────────────────────────────────────
     # Hotspots
     # ──────────────────────────────────────────────────────
     def _add_hotspot_markers(self, folium_map: folium.Map) -> None:
@@ -1569,8 +1703,12 @@ class MorilleVisualizer:
 
         # ── Couches vectorielles + marqueurs ──
         self._add_hydro_vector_layer(m)
+        self._add_inaturalist_layer(m)
         self._add_hotspot_markers(m)
         self._add_landmarks(m)
+
+        # ── Panneau météo (HTML overlay) ──
+        self._add_weather_panel(m)
 
         # ── Plugins Folium ──
         MiniMap(toggle_display=True).add_to(m)
