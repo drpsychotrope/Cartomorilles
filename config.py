@@ -195,14 +195,6 @@ WEIGHTS: MappingProxyType[str, float] = MappingProxyType(_WEIGHTS_DICT)
 # ═══════════════════════════════════════════════════════════════
 #  PROXIMITÉ URBAINE
 # ═══════════════════════════════════════════════════════════════
-# TODO: grid_builder.py — implémenter score_urban_proximity()
-#       EDT sur urban_mask inversé → distance en mètres × CELL_SIZE
-#       < URBAN_DIST_ELIMINATORY  → 0.0
-#       ELIMINATORY..PENALTY      → rampe linéaire [FLOOR..0.6]
-#       PENALTY..FULL             → rampe linéaire [0.6..1.0]
-#       > URBAN_DIST_FULL         → 1.0
-# TODO: scoring.py — ajouter urban_proximity < URBAN_DIST_ELIMINATORY
-#       comme facteur éliminatoire (score → 0)
 
 URBAN_DIST_ELIMINATORY: Final[float] = 15.0    # m — score dur → 0
 URBAN_DIST_PENALTY: Final[float] = 100.0       # m — fin de pénalité forte

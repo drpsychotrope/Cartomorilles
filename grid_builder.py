@@ -2213,8 +2213,6 @@ class GridBuilder:
         )
         return self
 
-    # TODO: main.py — appeler grid.score_urban_proximity() après apply_urban_mask()
-
     def score_urban_proximity(self) -> GridBuilder:
         """Score de proximité urbaine — pénalise les zones proches de l'urbanisation."""
         if self._skip_zero_weight("urban_proximity"):
