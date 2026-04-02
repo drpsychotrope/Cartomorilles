@@ -101,10 +101,11 @@ DATA_BUFFER: float = 500.0
 _WEIGHTS_DICT: dict[str, float] = {
     "geology":            0.18,
     "tree_species":       0.14,
-    "canopy_openness":    0.13,
+    "canopy_openness":    0.09,   # réduit : dégradé sans landcover (→ forest_edge)
     "twi":                0.11,
     "urban_proximity":    0.10,
     "altitude":           0.08,
+    "forest_edge":        0.04,   # lisière forestière (BD Forêt + EDT)
     "slope":              0.06,
     "dist_water":         0.05,
     "terrain_roughness":  0.05,

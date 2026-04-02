@@ -878,7 +878,8 @@ def main(args: argparse.Namespace) -> int:
     # ── 2e. Scores micro-habitat ──────────────────────────────
     #    APRÈS apply_urban_mask (urban_mask prêt pour disturbance)
     #    AVANT apply_landcover_mask (pour être modulés par green_score)
-    logger.info("   ▸ Ouverture canopée, couvert sol, perturbation...")
+    logger.info("   ▸ Lisière forestière, ouverture canopée, couvert sol, perturbation...")
+    grid.score_forest_edge_distance()
     grid.score_canopy_openness()
     grid.score_ground_cover()
     grid.score_disturbance()

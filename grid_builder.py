@@ -1667,10 +1667,9 @@ class GridBuilder:
         """
         Score de distance aux lisières forestières.
 
-        NON INCLUS dans WEIGHTS — redondant avec canopy_openness + disturbance.
-        Disponible pour analyse exploratoire : grid.score_forest_edge_distance()
-        Le score sera dans grid.scores["forest_edge"] mais ignoré par
-        compute_weighted_score() sauf ajout explicite à config.WEIGHTS.
+        Favorise les zones en lisière (≤5m) et pénalise l'intérieur profond (>50m).
+        Basé sur BD Forêt v2 + EDT — actif même sans landcover OSM.
+        Clé dans scores : "forest_edge" (poids 0.04 dans config.WEIGHTS).
         """
         self._require_terrain()
 
