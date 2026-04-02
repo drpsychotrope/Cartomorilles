@@ -21,16 +21,13 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from scipy.ndimage import (
-    binary_closing,
     binary_dilation,
     binary_erosion,
     distance_transform_edt,
-    gaussian_filter,
     generate_binary_structure,
-    label,
     zoom,
 )
-
+import _accel
 import config
 from config import TWI_WATERLOG
 
@@ -68,6 +65,14 @@ _COVERAGE_PENALTY_FLOOR: float = 0.5
 # Structure 8-connexité réutilisée
 _STRUCT_8CONN: np.ndarray = np.asarray(generate_binary_structure(2, 2))
 
+# ── Malus monotonie terrain (v2.3.6) ────────────────────────────
+# Pénalise les zones où altitude, pente et TWI sont simultanément
+# dans leur zone optimale sur de grandes surfaces — typiquement
+# plaine alluviale péri-urbaine, pas micro-habitat forestier.
+_MONOTONY_RADIUS: int = 50          # cellules (~250m à 5m/cell)
+_MONOTONY_FLOOR: float = 0.85       # plancher du malus (15% max)
+_MONOTONY_SLOPE_THRESHOLD: float = 8.0   # pente < seuil = "plat"
+_MONOTONY_ALT_STD_THRESHOLD: float = 15.0  # écart-type altitude < seuil = "homogène"
 
 # ═══════════════════════════════════════════════════════════════════
 class MorilleScoring:
@@ -121,30 +126,31 @@ class MorilleScoring:
         """
         Calcule le score pondéré multicritère.
 
-        Fix #23 : pénalité de couverture appliquée aux cellules dont
-        certains critères sont NaN. Empêche les scores artificiellement
-        élevés en bordure de couverture de données.
+        v2.4.0 : float32 strict — évite promotion float64 sur 73.6M cells.
+        Fix #23 : pénalité de couverture NaN-safe floor=0.5 (D10).
         """
         self.grid.validate_scores()
 
         shape: tuple[int, int] = next(iter(self.scores.values())).shape
         ny, nx = shape
-        total = np.zeros(shape, dtype=np.float64)
-        weight_sum = np.zeros(shape, dtype=np.float64)
-        theoretical_weight = 0.0
+
+        # ⑤ Float32 strict — 4 bytes/cell au lieu de 8
+        total = np.zeros(shape, dtype=np.float32)
+        weight_sum = np.zeros(shape, dtype=np.float32)
+        theoretical_weight = np.float32(0.0)
 
         logger.info("Calcul du score pondéré [%s]", self.species)
         logger.info("-" * 62)
 
         for factor, weight in config.WEIGHTS.items():
-            theoretical_weight += weight
+            w32 = np.float32(weight)
+            theoretical_weight += w32
 
             if factor not in self.scores:
                 self._criteria_missing.append(factor)
                 logger.warning(
                     "  %-22s | MANQUANT (w=%.2f ignoré)",
-                    factor,
-                    weight,
+                    factor, weight,
                 )
                 continue
 
@@ -154,30 +160,34 @@ class MorilleScoring:
             if arr.shape != shape:
                 logger.warning(
                     "  %-22s | shape %s ≠ %s — zoom bilinéaire",
-                    factor,
-                    arr.shape,
-                    shape,
+                    factor, arr.shape, shape,
                 )
                 arr = np.clip(
                     np.asarray(
-                        zoom(arr, (ny / arr.shape[0], nx / arr.shape[1]), order=1)
+                        zoom(
+                            arr,
+                            (ny / arr.shape[0], nx / arr.shape[1]),
+                            order=1,
+                        ),
                     ),
-                    0.0,
-                    1.0,
-                )
+                    0.0, 1.0,
+                ).astype(np.float32)
 
-            # Accumulation NaN-safe
+            # Assurer float32
+            if arr.dtype != np.float32:
+                arr = arr.astype(np.float32)
+
+            # Accumulation NaN-safe (float32)
             valid = np.isfinite(arr)
-            total = np.where(valid, total + arr * weight, total)
-            weight_sum = np.where(valid, weight_sum + weight, weight_sum)
+            total = np.where(valid, total + arr * w32, total)
+            weight_sum = np.where(valid, weight_sum + w32, weight_sum)
 
             self._criteria_used.append(factor)
 
             v = arr[valid]
             logger.info(
                 "  %-22s | w=%.2f | moy=%.3f | max=%.3f | NaN=%d",
-                factor,
-                weight,
+                factor, weight,
                 float(v.mean()) if v.size else 0.0,
                 float(v.max()) if v.size else 0.0,
                 int((~valid).sum()),
@@ -185,31 +195,28 @@ class MorilleScoring:
 
         # Division par le cumul de poids effectif par cellule
         with np.errstate(invalid="ignore", divide="ignore"):
-            self.final_score = np.where(
+            final = np.where(
                 weight_sum > 0,
                 total / weight_sum,
-                0.0,
-            ).astype(np.float64)
-        self.final_score = np.clip(self.final_score, 0.0, 1.0)
+                np.float32(0.0),
+            ).astype(np.float32)
+        np.clip(final, 0.0, 1.0, out=final)
 
-        # ── Fix #23 : Pénalité de couverture ──────────────────
-        # Cellules avec critères NaN → score pénalisé
-        # proportionnellement au ratio de poids manquants.
+        # ── Fix #23 / D10 : Pénalité de couverture (floor=0.5) ──
         if theoretical_weight > 0:
             coverage_ratio = np.where(
                 weight_sum > 0,
                 weight_sum / theoretical_weight,
-                0.0,
-            )
-            # Pénalité douce : score × (floor + (1-floor) × coverage)
-            # Cellule 10/10 → ×1.0 | Cellule 5/10 → ×0.75
-            penalty = (
-                _COVERAGE_PENALTY_FLOOR
-                + (1.0 - _COVERAGE_PENALTY_FLOOR) * coverage_ratio
-            )
-            self.final_score *= penalty
+                np.float32(0.0),
+            ).astype(np.float32)
 
-            n_penalized = int((coverage_ratio < 0.999).sum())
+            penalty = (
+                np.float32(_COVERAGE_PENALTY_FLOOR)
+                + np.float32(1.0 - _COVERAGE_PENALTY_FLOOR) * coverage_ratio
+            )
+            final *= penalty
+
+            n_penalized = int(np.sum(coverage_ratio < 0.999))
             if n_penalized > 0:
                 logger.info(
                     "  Pénalité couverture  | %d cellules pénalisées "
@@ -217,27 +224,29 @@ class MorilleScoring:
                     n_penalized,
                 )
 
-        self.final_score = np.clip(self.final_score, 0.0, 1.0)
+        np.clip(final, 0.0, 1.0, out=final)
 
         # NoData → NaN
         nodata = getattr(self.grid, "nodata_mask", None)
-        if isinstance(nodata, np.ndarray):
-            self.final_score[nodata] = np.nan
+        if isinstance(nodata, np.ndarray) and np.any(nodata):
+            final[nodata] = np.nan
             logger.info(
                 "  NoData (DEM)          | %d cellules → NaN",
                 int(nodata.sum()),
             )
 
+        self.final_score = final
+
         # Poids effectif moyen
         self._effective_weight = float(
-            np.nanmean(weight_sum) if weight_sum.size else 0.0
+            np.nanmean(weight_sum) if weight_sum.size else 0.0,
         )
 
         logger.info("-" * 62)
         logger.info(
             "  SCORE FINAL           | moy=%.3f | max=%.3f | critères=%d/%d",
-            float(np.nanmean(self.final_score)),
-            float(np.nanmax(self.final_score)),
+            float(np.nanmean(final)),
+            float(np.nanmax(final)),
             len(self._criteria_used),
             len(self._criteria_used) + len(self._criteria_missing),
         )
@@ -245,9 +254,9 @@ class MorilleScoring:
             logger.warning(
                 "  Poids effectif moyen : %.3f / %.3f théorique (%.0f%%)",
                 self._effective_weight,
-                theoretical_weight,
+                float(theoretical_weight),
                 (
-                    self._effective_weight / theoretical_weight * 100
+                    self._effective_weight / float(theoretical_weight) * 100
                     if theoretical_weight > 0
                     else 0
                 ),
@@ -313,7 +322,7 @@ class MorilleScoring:
             logger.info("  NoData (DEM)     : %8d cellules", int(nodata.sum()))
 
         # ── Géologie éliminatoire ──
-        geo_mask = self._build_eliminatory_geology_mask(ny, nx)
+        geo_mask = self._build_eliminatory_geology_mask()
         if geo_mask is not None:
             detail["geology"] = geo_mask
             combined |= geo_mask
@@ -351,7 +360,7 @@ class MorilleScoring:
             )
 
         # ── TWI engorgement → éliminatoire ──
-        twi_arr: np.ndarray | None = getattr(self.grid, "_twi", None)  # P4
+        twi_arr: np.ndarray | None = getattr(self.grid, "twi", None)  # P4
         if isinstance(twi_arr, np.ndarray) and twi_arr.shape == (ny, nx):
             twi_elim = twi_arr > TWI_WATERLOG
             detail["twi"] = twi_elim
@@ -404,77 +413,105 @@ class MorilleScoring:
         self._step_eliminated = True
         return self
 
-    # ── Helpers élimination ───────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Masques éliminatoires — int rasters vectorisés (D6)
+    # ------------------------------------------------------------------
 
-    def _build_eliminatory_species_mask(
-        self,
-        ny: int,
-        nx: int,
-    ) -> np.ndarray | None:
+    def _build_eliminatory_species_mask(self) -> np.ndarray:
         """
-        Construit un masque booléen des cellules occupées par une
-        essence éliminatoire (châtaignier, etc.).
+        Masque éliminatoire essences — vectorisé via int raster (D6).
 
-        Fix #13 v2.3.0 : utilise _raw_tree_species (score PRÉ-modulation
-        landcover) pour éviter les faux positifs sur les cellules farmland
-        dont le score modulé (0.05 × 0.10 = 0.005) passe sous le seuil.
-
-        Ordre de priorité :
-          1. Masque rasterisé explicite (grid_builder.eliminatory_species_mask)
-          2. Score brut pré-landcover (_raw_tree_species) → score = 0.0
-          3. Fallback : score modulé actuel < seuil (legacy)
+        Élimine les cellules couvertes par une essence à score 0.0.
+        Cellules sans couverture forêt (code 0 = nodata) → non éliminées.
+        Châtaignier score 0.80 → PAS éliminatoire (D3).
         """
-        # ── Priorité 1 : masque explicite rasterisé (Fix #17) ──
-        mask = getattr(self.grid, "eliminatory_species_mask", None)
-        if isinstance(mask, np.ndarray) and mask.shape == (ny, nx):
-            return mask
+        grid = self.grid
+        int_raster = getattr(grid, "_tree_species_int_raster", None)
+        lookup = getattr(grid, "_tree_score_lookup", None)
 
-        # ── Priorité 2 : score brut pré-landcover (Fix #13) ──
-        raw = getattr(self.grid, "_raw_tree_species", None)
-        if isinstance(raw, np.ndarray) and raw.shape == (ny, nx):
-            # Éliminatoire = score brut exactement 0.0            
-            # (châtaignier, etc. — score 0.0 dans config.TREE_SCORES)
-            result = np.isfinite(raw) & (raw <= 0.0)
-            if result.any():
-                return result
+        if int_raster is None or lookup is None:
+            logger.debug(
+                "   eliminatory_species : pas d'int raster → skip",
+            )
+            return np.zeros((grid.ny, grid.nx), dtype=bool)
 
-        # ── Priorité 3 : fallback legacy sur score modulé ──
-        if "tree_species" in self.scores:
-            arr = self.scores["tree_species"]
-            if arr.shape == (ny, nx):
-                fill = float(getattr(config, "FILL_NO_FOREST", 0.05))
-                result = arr < (fill * 0.5)
-                if result.any():
-                    return result
+        int_raster = np.asarray(int_raster, dtype=np.int16)
+        lookup = np.asarray(lookup, dtype=np.float32)
 
-        return None
+        # Codes éliminatoires = couverts (code > 0) avec score == 0.0
+        elim_codes = np.where(lookup == 0.0)[0]
+        elim_codes = elim_codes[elim_codes > 0]
 
-    def _build_eliminatory_geology_mask(
-        self,
-        ny: int,
-        nx: int,
-    ) -> np.ndarray | None:
+        if len(elim_codes) == 0:
+            logger.debug(
+                "   eliminatory_species : aucun code éliminatoire",
+            )
+            return np.zeros((grid.ny, grid.nx), dtype=bool)
+
+        mask = np.isin(int_raster, elim_codes)
+        n = int(np.count_nonzero(mask))
+
+        if n > 0:
+            code_to_name = getattr(grid, "_tree_code_to_name", {})
+            names = [
+                code_to_name.get(int(c), f"code_{c}")
+                for c in elim_codes
+            ]
+            logger.info(
+                "🚫 Masque éliminatoire essences : %d cellules (%s)",
+                n, ", ".join(names),
+            )
+        else:
+            logger.debug("   eliminatory_species : 0 cellules éliminées")
+
+        return mask
+
+    def _build_eliminatory_geology_mask(self) -> np.ndarray:
         """
-        Construit un masque booléen des cellules sur géologie éliminatoire.
+        Masque éliminatoire géologie — vectorisé via int raster (D6).
 
-        Ordre de priorité :
-          1. Masque rasterisé explicite (grid_builder.eliminatory_geology_mask)
-          2. Score géologie = 0.0 dans self.scores
+        Utilise _geology_eliminatory_codes (frozenset[int]) pré-calculés
+        dans grid_builder.score_geology(). Catégories : granite, gneiss,
+        siliceux (config.ELIMINATORY_GEOLOGY).
         """
-        # ── Priorité 1 : masque explicite rasterisé (Fix #17) ──
-        mask = getattr(self.grid, "eliminatory_geology_mask", None)
-        if isinstance(mask, np.ndarray) and mask.shape == (ny, nx):
-            return mask
+        grid = self.grid
+        int_raster = getattr(grid, "_geology_int_raster", None)
+        elim_codes = getattr(
+            grid, "_geology_eliminatory_codes", frozenset(),
+        )
 
-        # ── Priorité 2 : fallback score ──
-        if "geology" in self.scores:
-            arr = self.scores["geology"]
-            if arr.shape == (ny, nx):
-                result = np.isfinite(arr) & (arr <= 0.0)
-                if result.any():
-                    return result
+        if int_raster is None:
+            logger.debug(
+                "   eliminatory_geology : pas d'int raster → skip",
+            )
+            return np.zeros((grid.ny, grid.nx), dtype=bool)
 
-        return None
+        int_raster = np.asarray(int_raster, dtype=np.int16)
+
+        if not elim_codes:
+            logger.debug(
+                "   eliminatory_geology : aucun code éliminatoire",
+            )
+            return np.zeros((grid.ny, grid.nx), dtype=bool)
+
+        elim_arr = np.array(sorted(elim_codes), dtype=np.int16)
+        mask = np.isin(int_raster, elim_arr)
+        n = int(np.count_nonzero(mask))
+
+        if n > 0:
+            code_to_name = getattr(grid, "_geology_code_to_name", {})
+            names = [
+                code_to_name.get(int(c), f"code_{c}")
+                for c in sorted(elim_codes)
+            ]
+            logger.info(
+                "🚫 Masque éliminatoire géologie : %d cellules (%s)",
+                n, ", ".join(names),
+            )
+        else:
+            logger.debug("   eliminatory_geology : 0 cellules éliminées")
+
+        return mask
 
     def _apply_soft_transition(self, hard_mask: np.ndarray) -> None:
         """
@@ -504,6 +541,211 @@ class MorilleScoring:
             int(in_buffer.sum()),
             _SOFT_ELIM_BUFFER_M,
         )
+
+    def apply_monotony_penalty(self) -> MorilleScoring:
+        """
+        Malus monotonie terrain — v2.3.6.
+
+        Détecte les zones où pente, altitude et TWI sont uniformément
+        optimaux sur un grand voisinage (~250m), signe de plaine
+        alluviale plutôt que de micro-habitat forestier différencié.
+
+        Le malus est multiplicatif : score × [_MONOTONY_FLOOR .. 1.0].
+        Les zones éliminées et NaN sont préservées.
+        """
+        self._require_step("_step_eliminated", "apply_monotony_penalty")
+        assert self.final_score is not None
+
+        _slope = getattr(self.grid, "slope", None)
+        _alt = getattr(self.grid, "altitude", None)
+        if _slope is None or _alt is None:
+            logger.debug("   Monotonie : slope/altitude indisponible, skip")
+            self._step_monotony = True
+            return self
+
+        slope: np.ndarray = np.asarray(_slope)
+        alt: np.ndarray = np.asarray(_alt)
+
+        # ── Masque "plat" : pente < seuil ──
+        flat_mask = (slope < _MONOTONY_SLOPE_THRESHOLD).astype(np.float32)
+
+        # ── Fraction de cellules plates dans le voisinage ──
+        flat_frac: np.ndarray = _accel.gaussian_filter(
+            flat_mask, sigma=_MONOTONY_RADIUS / 2.0, mode="nearest",
+        )
+
+        # ── Écart-type local de l'altitude (proxy homogénéité) ──
+        alt_f32 = np.where(np.isfinite(alt), alt, 0.0).astype(np.float32)
+        alt_mean: np.ndarray = _accel.gaussian_filter(
+            alt_f32, sigma=_MONOTONY_RADIUS / 2.0, mode="nearest",
+        )
+        alt_sq_mean: np.ndarray = _accel.gaussian_filter(
+            alt_f32 ** 2, sigma=_MONOTONY_RADIUS / 2.0, mode="nearest",
+        )
+
+        alt_var = np.maximum(alt_sq_mean - alt_mean ** 2, 0.0)
+        alt_std = np.sqrt(alt_var)
+
+        # ── Score de monotonie [0, 1] ──
+        # 1.0 = zone parfaitement plate et homogène
+        # flat_frac élevée ET alt_std faible → monotone
+        homogeneous = (
+            alt_std < _MONOTONY_ALT_STD_THRESHOLD
+        ).astype(np.float32)
+
+        monotony = flat_frac * homogeneous
+        monotony = np.clip(monotony, 0.0, 1.0)
+
+        # ── Malus multiplicatif ──
+        # monotony=1.0 → penalty = _MONOTONY_FLOOR (0.85)
+        # monotony=0.0 → penalty = 1.0 (pas de pénalité)
+        penalty = 1.0 - (1.0 - _MONOTONY_FLOOR) * monotony
+
+        # Préserver élimination et NaN
+        elim = (
+            self.elimination_mask
+            if self.elimination_mask is not None
+            else np.zeros_like(self.final_score, dtype=bool)
+        )
+        nan_mask = ~np.isfinite(self.final_score)
+        preserve = elim | nan_mask
+
+        self.final_score = np.where(
+            preserve,
+            self.final_score,
+            self.final_score * penalty,
+        )
+
+        n_penalized = int((penalty < 0.999).sum())
+        mean_penalty = float(penalty[penalty < 0.999].mean()) if n_penalized > 0 else 1.0
+        logger.info(
+            "Malus monotonie terrain : %d cellules pénalisées"
+            " (malus moyen=%.2f, floor=%.2f)",
+            n_penalized,
+            mean_penalty,
+            _MONOTONY_FLOOR,
+        )
+
+        self._step_monotony = True
+        return self
+
+    def apply_calcdry_penalty(self) -> MorilleScoring:
+        """
+        Malus multiplicatif pour versants calcaires secs à feuillus collinéens.
+
+        Cible les chênaies-buis sur calcaire en pente (>10°, <700m)
+        qui scorent artificiellement haut grâce au terrain seul.
+        Le malus est gradué par rugosité et TWI :
+          - rugosité forte + TWI sec → ravine rocheuse → malus fort
+          - rugosité faible + TWI normal → forêt dense → malus léger
+        Les zones éliminées et NaN sont préservées.
+        """
+        self._require_step("_step_monotony", "apply_calcdry_penalty")
+
+        grid = self.grid
+        score = self.final_score
+        assert score is not None
+
+        # ── Accès aux grilles requises ──
+        substrate = getattr(grid, "substrate_grid", None)
+        if substrate is None or not isinstance(substrate, np.ndarray):
+            logger.info("Malus calc_dry : pas de grille substrat — ignoré")
+            return self
+
+        altitude = getattr(grid, "altitude", None)
+        slope = getattr(grid, "slope", None)
+        roughness = getattr(grid, "roughness", None)
+        twi_raw = grid.get_twi_raw()
+        ft_grid = getattr(grid, "_forest_type_grid", None)
+
+        if altitude is None or slope is None:
+            logger.info("Malus calc_dry : altitude/pente indisponible — ignoré")
+            return self
+
+        _alt = np.asarray(altitude)
+        _slope = np.asarray(slope)
+        _sub = np.asarray(substrate)
+
+        # ── Masque de base : calcaire sec + feuillus collinéens en pente ──
+        # substrate==1 = calc_dry (défini dans species_enricher)
+        # altitude < 700m = étage collinéen élargi (inclut chênaie pubescente)
+        # slope > 10° = versant (le plat est déjà reclassé marly)
+        target = (
+            (_sub == 1)
+            & (_alt < 700.0)
+            & (_slope > 10.0)
+        )
+
+        # Restreindre aux feuillus si forest_type_grid disponible
+        if ft_grid is not None and isinstance(ft_grid, np.ndarray):
+            _ft = np.asarray(ft_grid)
+            # 1=feuillus, 0=unknown (souvent feuillus dans ce contexte)
+            target = target & ((_ft == 1) | (_ft == 0))
+
+        # Exclure les cellules déjà éliminées
+        if self.elimination_mask is not None:
+            target = target & ~self.elimination_mask
+
+        # Exclure NaN
+        target = target & np.isfinite(score)
+
+        n_target = int(target.sum())
+        if n_target == 0:
+            logger.info("Malus calc_dry : aucune cellule ciblée")
+            return self
+
+        # ── Calcul du malus gradué ──
+        # Composante rugosité : rugosité élevée = ravine → malus fort
+        roughness_factor = np.ones_like(score, dtype=np.float32)
+        if roughness is not None and isinstance(roughness, np.ndarray):
+            _rough = np.asarray(roughness)
+            # Normaliser : 0°→0, 5°→0.5, 10°+→1.0
+            roughness_factor = np.clip(_rough / 10.0, 0.0, 1.0)
+
+        # Composante TWI : TWI sec = drainage excessif → malus fort
+        twi_factor = np.ones_like(score, dtype=np.float32)
+        if twi_raw is not None and isinstance(twi_raw, np.ndarray):
+            _twi = np.asarray(twi_raw)
+            # TWI < 4 = sec, TWI 4-8 = transition, TWI > 8 = humide
+            # Normaliser inversé : sec (TWI=2)→1.0, optimal (TWI=8)→0.0
+            twi_factor = np.clip((8.0 - _twi) / 6.0, 0.0, 1.0)
+
+        # Combiner : moyenne pondérée (rugosité 40%, TWI 60%)
+        # TWI plus important car l'humidité du sol est plus déterminante
+        severity = 0.4 * roughness_factor + 0.6 * twi_factor
+
+        # Malus : score × multiplier
+        # severity=0 → multiplier=1.0 (pas de malus)
+        # severity=0.5 → multiplier=0.75
+        # severity=1.0 → multiplier=0.50
+        _CALCDRY_FLOOR = 0.50
+        _CALCDRY_MAX_PENALTY = 0.50  # multiplier min = 1.0 - 0.50 = 0.50
+
+        multiplier = np.ones_like(score, dtype=np.float32)
+        multiplier[target] = 1.0 - _CALCDRY_MAX_PENALTY * severity[target]
+        multiplier = np.clip(multiplier, _CALCDRY_FLOOR, 1.0)
+
+        # Appliquer
+        score[target] *= multiplier[target]
+
+        # ── Stats ──
+        mean_mult = float(multiplier[target].mean())
+        mean_sev = float(severity[target].mean())
+        n_strong = int((multiplier[target] < 0.70).sum())
+        n_moderate = int(((multiplier[target] >= 0.70) & (multiplier[target] < 0.90)).sum())
+        n_light = int((multiplier[target] >= 0.90).sum())
+
+        logger.info(
+            "Malus calc_dry : %d cellules (sévérité moy=%.2f, mult moy=%.2f)",
+            n_target, mean_sev, mean_mult,
+        )
+        logger.info(
+            "  Fort (<0.70)=%d | Modéré (0.70-0.90)=%d | Léger (>0.90)=%d",
+            n_strong, n_moderate, n_light,
+        )
+
+        self._step_calcdry = True
+        return self
 
     # ═══════════════════════════════════════════════════════════════
     # 3. LISSAGE SPATIAL
@@ -535,11 +777,11 @@ class MorilleScoring:
         score_valid = np.where(valid, self.final_score, 0.0)
         weights = valid.astype(np.float64)
 
-        num: np.ndarray = np.asarray(
-            gaussian_filter(score_valid, sigma=sigma, mode="nearest")
+        num: np.ndarray = _accel.gaussian_filter(
+            score_valid, sigma=sigma, mode="nearest",
         )
-        den: np.ndarray = np.asarray(
-            gaussian_filter(weights, sigma=sigma, mode="nearest")
+        den: np.ndarray = _accel.gaussian_filter(
+            weights, sigma=sigma, mode="nearest",
         )
 
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -616,9 +858,7 @@ class MorilleScoring:
         min_cluster_size: int | None = None,
         max_hotspots: int | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Identifie les clusters de forte probabilité.
-        """
+        """Identifie les clusters de forte probabilité."""
         self._require_step("_step_weighted", "get_hotspots")
         assert self.final_score is not None, "final_score is None for hotspots"
 
@@ -630,141 +870,105 @@ class MorilleScoring:
 
         # Masque des cellules chaudes
         safe = np.where(
-            np.isfinite(self.final_score), self.final_score, 0.0
+            np.isfinite(self.final_score), self.final_score, 0.0,
         )
         hot_mask = safe >= threshold
 
-        # Closing morphologique pour fusionner clusters proches
-        if _HOTSPOT_CLOSING_RADIUS >= 1:
-            hot_mask = np.asarray(
-                binary_closing(
-                    hot_mask,
-                    structure=_STRUCT_8CONN,
-                    iterations=_HOTSPOT_CLOSING_RADIUS,
-                )
-            )
+        # ── Connected components GPU/CPU ──
+        labeled, n_clusters = _accel.connected_components(
+            hot_mask,
+            structure=_STRUCT_8CONN,
+            closing_iterations=_HOTSPOT_CLOSING_RADIUS,
+        )
 
-        # Labellisation 8-connexité
-        _label_result = label(hot_mask, structure=_STRUCT_8CONN)
-        labeled: np.ndarray = np.asarray(_label_result[0])  # type: ignore[index]
-        n_clusters: int = int(_label_result[1])  # type: ignore[index]
+        if n_clusters == 0:
+            logger.info("0 hotspots détectés (seuil=%.2f)", threshold)
+            return []
+
+        # ── Stats vectorisées ──
+        transform = getattr(self.grid, "transform", None)
+        if transform is not None:
+            transform_params = (
+                transform.a, transform.b, transform.c,
+                transform.d, transform.e, transform.f,
+            )
+        else:
+            transform_params = (cell_size, 0.0, 0.0, 0.0, -cell_size, 0.0)
+
+        alt = getattr(self.grid, "altitude", None)
+        slp = getattr(self.grid, "slope", None)
+
+        stats = _accel.vectorized_cluster_stats(
+            labeled=labeled,
+            n_clusters=n_clusters,
+            final_score=self.final_score,
+            transform_params=transform_params,
+            cell_size=cell_size,
+            min_cluster_size=min_cluster_size,
+            altitude=alt if isinstance(alt, np.ndarray) else None,
+            slope=slp if isinstance(slp, np.ndarray) else None,
+        )
+
+        n_valid = stats["n_valid"]
+        if n_valid == 0:
+            logger.info("0 hotspots après filtrage taille (seuil=%d)", min_cluster_size)
+            return []
+
+        valid_ids = stats["valid_ids"]
+        stat_labeled = stats["labeled"]
+
+        # ── Confiance globale ──
+        conf_dict = getattr(self.grid, "score_confidence", None)
+        confidence: float | None = None
+        if isinstance(conf_dict, dict):
+            conf_vals = [
+                float(conf_dict[k])
+                for k in self._criteria_used
+                if k in conf_dict
+            ]
+            confidence = float(np.mean(conf_vals)) if conf_vals else None
+        conf_rounded = round(confidence, 2) if confidence is not None else None
+
+        # ── Dominant species/geology par cluster (boucle légère) ──
+        # Réutilise un masque pré-alloué pour éviter 1312× np.zeros
+        reuse_mask = np.empty(stat_labeled.shape, dtype=bool)
 
         hotspots: list[dict[str, Any]] = []
-        for cid in range(1, n_clusters + 1):
-            cm = labeled == cid
-            n_cells = int(cm.sum())
-            if n_cells < min_cluster_size:
-                continue
+        for i in range(n_valid):
+            cid = int(valid_ids[i])
 
-            ys, xs = np.where(cm)
+            # Masque cluster réutilisé (O(cluster) vs O(N))
+            np.equal(stat_labeled, cid, out=reuse_mask)
 
-            # Centroïde en coordonnées L93 continues
-            transform = getattr(self.grid, "transform", None)
-            if transform is not None:
-                x_l93 = float(
-                    transform[2] + (xs.mean() + 0.5) * transform[0]
-                )
-                y_l93 = float(
-                    transform[5] + (ys.mean() + 0.5) * transform[4]
-                )
-            else:
-                x_coords = getattr(self.grid, "x_coords", None)
-                y_coords = getattr(self.grid, "y_coords", None)
-                x_l93 = (
-                    float(x_coords[int(xs.mean())])
-                    if isinstance(x_coords, np.ndarray)
-                    else 0.0
-                )
-                y_l93 = (
-                    float(y_coords[int(ys.mean())])
-                    if isinstance(y_coords, np.ndarray)
-                    else 0.0
-                )
-
-            # Score
-            cluster_scores = self.final_score[cm]
-            mean_score = float(np.nanmean(cluster_scores))
-            max_score = float(np.nanmax(cluster_scores))
-
-            # Altitude
-            alt = getattr(self.grid, "altitude", None)
-            mean_alt: float | None = (
-                float(np.nanmean(alt[cm]))
-                if isinstance(alt, np.ndarray) and alt.shape == cm.shape
-                else None
-            )
-
-            # Pente
-            slope = getattr(self.grid, "slope", None)
-            mean_slope: float | None = (
-                float(np.nanmean(slope[cm]))
-                if isinstance(slope, np.ndarray) and slope.shape == cm.shape
-                else None
-            )
-
-            # Essence dominante
             dominant_species = self._get_dominant_value_in_cluster(
-                cm,
-                "tree_species",
-                "essence_canonical",
+                reuse_mask, "tree_species", "essence_canonical",
             )
-
-            # Géologie dominante
             dominant_geology = self._get_dominant_value_in_cluster(
-                cm,
-                "geology",
-                "geology_canonical",
+                reuse_mask, "geology", "geology_canonical",
             )
 
-            # Compacité
-            area = n_cells * cell_area
-            perimeter = self._estimate_perimeter(cm, cell_size)
-            compactness = (
-                (4.0 * np.pi * area / (perimeter**2))
-                if perimeter > 0
-                else 0.0
-            )
+            h_alt = stats["altitude"]
+            h_slp = stats["slope"]
 
-            # Confiance
-            conf_dict = getattr(self.grid, "score_confidence", None)
-            confidence: float | None = None
-            if isinstance(conf_dict, dict):
-                conf_vals = [
-                    float(conf_dict[k])
-                    for k in self._criteria_used
-                    if k in conf_dict
-                ]
-                confidence = (
-                    float(np.mean(conf_vals)) if conf_vals else None
-                )
-
-            hotspots.append(
-                {
-                    "id": cid,
-                    "x_l93": float(x_l93),
-                    "y_l93": float(y_l93),
-                    "n_cells": n_cells,
-                    "size_m2": area,
-                    "mean_score": round(mean_score, 4),
-                    "max_score": round(max_score, 4),
-                    "altitude": (
-                        round(mean_alt, 1) if mean_alt is not None else None
-                    ),
-                    "mean_slope": (
-                        round(mean_slope, 1)
-                        if mean_slope is not None
-                        else None
-                    ),
-                    "dominant_species": dominant_species,
-                    "dominant_geology": dominant_geology,
-                    "compactness": round(float(compactness), 3),
-                    "confidence": (
-                        round(confidence, 2)
-                        if confidence is not None
-                        else None
-                    ),
-                }
-            )
+            hotspots.append({
+                "id": cid,
+                "x_l93": float(stats["x_l93"][i]),
+                "y_l93": float(stats["y_l93"][i]),
+                "n_cells": int(stats["counts"][i]),
+                "size_m2": float(stats["area"][i]),
+                "mean_score": round(float(stats["mean_score"][i]), 4),
+                "max_score": round(float(stats["max_score"][i]), 4),
+                "altitude": (
+                    round(float(h_alt[i]), 1) if h_alt is not None else None
+                ),
+                "mean_slope": (
+                    round(float(h_slp[i]), 1) if h_slp is not None else None
+                ),
+                "dominant_species": dominant_species,
+                "dominant_geology": dominant_geology,
+                "compactness": round(float(stats["compactness"][i]), 3),
+                "confidence": conf_rounded,
+            })
 
         hotspots.sort(key=lambda h: h["mean_score"], reverse=True)
 
@@ -796,75 +1000,93 @@ class MorilleScoring:
 
         return hotspots
 
-    # ── Helpers hotspots ──────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Hotspots — catégorie dominante via bincount sur int raster
+    # ------------------------------------------------------------------
 
     def _get_dominant_value_in_cluster(
         self,
         cluster_mask: np.ndarray,
-        score_key: str,
-        label_attr: str,
+        field: str,
+        _column_unused: str | None = None,
     ) -> str | None:
         """
-        Retrouve la valeur dominante (essence ou géologie) dans un cluster.
+        Catégorie dominante dans un cluster via bincount sur int raster (D6).
 
-        Fix #26 : utilise un raster int-codé + lookup dict.
-        L'ancien code cherchait _raster_essence_canonical comme raster
-        de strings qui n'existait jamais → fallback systématique.
+        Parameters
+        ----------
+        cluster_mask : bool array (ny, nx), True pour les cellules du cluster
+        field : "tree_species" | "geology"
+        _column_unused : ignoré — conservé pour compatibilité call sites
+
+        Returns
+        -------
+        Nom canonique de la catégorie dominante, ou None si pas de données.
         """
-        # ── Méthode 1 : raster int-codé + lookup (Fix #26) ──
-        raster_attr = f"_raster_{label_attr}"
-        lookup_attr = f"_int_to_{label_attr}"
+        grid = self.grid
 
-        raster = getattr(self.grid, raster_attr, None)
-        lookup = getattr(self.grid, lookup_attr, None)
+        if field == "tree_species":
+            int_raster = getattr(grid, "_tree_species_int_raster", None)
+            code_to_name = getattr(grid, "_tree_code_to_name", None)
+        elif field == "geology":
+            int_raster = getattr(grid, "_geology_int_raster", None)
+            code_to_name = getattr(grid, "_geology_code_to_name", None)
+        else:
+            return None
 
-        if (
-            isinstance(raster, np.ndarray)
-            and raster.shape == cluster_mask.shape
-            and isinstance(lookup, dict)
-        ):
-            values = raster[cluster_mask]
-            values = values[values > 0]  # 0 = fill / hors couverture
-            if values.size > 0:
-                unique, counts = np.unique(values, return_counts=True)
-                dominant_int = int(unique[counts.argmax()])
-                result = lookup.get(dominant_int)
-                if result is not None:
-                    return str(result)
+        if int_raster is None or code_to_name is None:
+            return None
 
-        # ── Méthode 2 : reverse lookup approximatif (fallback) ──
-        if score_key in self.scores:
-            arr = self.scores[score_key]
-            if arr.shape == cluster_mask.shape:
-                mean_val = float(np.nanmean(arr[cluster_mask]))
-                return self._reverse_lookup_score(score_key, mean_val)
+        cluster_mask = np.asarray(cluster_mask, dtype=bool)
+        int_raster = np.asarray(int_raster, dtype=np.int16)
 
-        return None
+        values = int_raster[cluster_mask]
+        values = values[values > 0]  # exclure nodata
 
-    @staticmethod
-    def _reverse_lookup_score(score_key: str, value: float) -> str | None:
-        """Correspondance inverse approximative score → label."""
-        if score_key == "tree_species":
-            best_name: str | None = None
-            best_diff = 999.0
-            for name, sc in config.TREE_SCORES.items():
-                diff = abs(float(sc) - value)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_name = str(name)
-            return best_name if best_diff < 0.05 else f"score~{value:.2f}"
+        if len(values) == 0:
+            return None
 
-        if score_key == "geology":
-            best_name_g: str | None = None
-            best_diff_g = 999.0
-            for name, sc in config.GEOLOGY_SCORES.items():
-                diff = abs(float(sc) - value)
-                if diff < best_diff_g:
-                    best_diff_g = diff
-                    best_name_g = str(name)
-            return best_name_g if best_diff_g < 0.05 else f"score~{value:.2f}"
+        counts = np.bincount(values)
+        dominant_code = int(counts.argmax())
+        return code_to_name.get(dominant_code)
 
-        return None
+    def _reverse_lookup_score(
+        self,
+        score_name: str,
+        score_value: float,
+    ) -> str | None:
+        """
+        Retrouve le nom de catégorie à partir d'un score float.
+
+        Utilise les lookup tables int-codées pour un matching exact
+        plutôt que la recherche inverse dans les dicts config.
+        """
+        grid = self.grid
+
+        if score_name == "tree_species":
+            code_to_name = getattr(grid, "_tree_code_to_name", None)
+            lookup = getattr(grid, "_tree_score_lookup", None)
+        elif score_name == "geology":
+            code_to_name = getattr(grid, "_geology_code_to_name", None)
+            lookup = getattr(grid, "_geology_score_lookup", None)
+        else:
+            return None
+
+        if code_to_name is None or lookup is None:
+            return None
+
+        lookup = np.asarray(lookup, dtype=np.float32)
+
+        # Matching exact d'abord (tolérance float32)
+        matches = np.where(np.abs(lookup - score_value) < 1e-6)[0]
+        matches = matches[matches > 0]  # exclure nodata (code 0)
+
+        if len(matches) == 0:
+            return None
+
+        # Si plusieurs codes ont le même score, retourne le premier
+        best_code = int(matches[0])
+        return code_to_name.get(best_code)
 
     @staticmethod
     def _estimate_perimeter(mask: np.ndarray, cell_size: float) -> float:
@@ -947,19 +1169,9 @@ class MorilleScoring:
         return meta
     
     def get_twi_display_data(self) -> dict[str, Any]:
-        """Données TWI pour affichage cartographique.
-
-        Returns
-        -------
-        dict avec clés :
-            - ``raw``: np.ndarray | None — valeurs TWI brutes
-            - ``score``: np.ndarray | None — score TWI [0,1]
-            - ``waterlog_mask``: np.ndarray | None — masque engorgement (bool)
-            - ``has_data``: bool
-        """
-        builder = self.grid
-        twi_raw = builder.get_twi_raw() if hasattr(builder, "get_twi_raw") else None
-        twi_score = builder.scores.get("twi")
+        """Données TWI pour affichage cartographique."""
+        twi_raw: np.ndarray | None = getattr(self.grid, "twi", None)  # P4
+        twi_score: np.ndarray | None = self.grid.scores.get("twi")
 
         waterlog_mask: np.ndarray | None = None
         if twi_raw is not None:

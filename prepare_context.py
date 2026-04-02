@@ -1025,6 +1025,16 @@ class ClaudeContextGenerator:
             "inutiles"
         )
         self._add(
+            "- Si deux approches se valent → choisis-en une, "
+            "justifie en 1 ligne, exécute. "
+            "Jamais de boucle d'hésitation."
+        )
+        self._add(
+            "- Scope large → découpe toi-même en étapes "
+            "numérotées, livre la première, demande si "
+            "on continue"
+        )
+        self._add(
             "- Si doute technique réel → ⚠️ DOUTE: [raison], "
             "pas de noyade dans les caveats"
         )
@@ -1192,12 +1202,13 @@ class ClaudeContextGenerator:
             "| Objectif | Cartographie probabiliste multicritère "
             "des zones favorables aux morilles |"
         )
-        self._add("| Emprise | 20×20 km centrée Grenoble |")
+        self._add("| Emprise | Isère 38 — 75×99 km (7363 km²) |")
         self._add("| CRS | EPSG:2154 (Lambert-93) |")
         self._add(
-            "| Centre L93 | (913_100, 6_458_800), rayon 10 km |"
+            "| Centre L93 | (894_842, 6_484_820) |"
         )
-        self._add("| DEM | BD ALTI 25 m, 6000×6000 px |")
+        self._add("| DEM | Copernicus DSM 30 m, 3600×3600 px |")
+        self._add("| Résolution | Auto-scale (10–100 m selon emprise) |")
         self._add(
             f"| Version | {self.project.project_version} |"
         )
@@ -1748,6 +1759,13 @@ class ClaudeContextGenerator:
         self._add("FICHIER: ___")
         self._add("DÉPEND DE: ___")
         self._add("INTERDIT: ___")
+        self._add(
+            "APPROCHE CHOISIE: ___ (1 ligne, pas d'alternatives)"
+        )
+        self._add(
+            "ÉTAPES: 1.___ 2.___ 3.___ "
+            "(si scope large → livrer étape 1 uniquement)"
+        )
 
         if self.session:
             self._add(f"SESSION: {self.session.name}")
@@ -3017,6 +3035,220 @@ def cli_session_history(args: argparse.Namespace) -> None:
             f"{entry.get('session', '?'):<15s} {files}"
         )
 
+# ─────────────────────────────────────────────
+# CLI — Wizard interactif
+# ─────────────────────────────────────────────
+
+def _wizard_write(text: str) -> None:
+    """Écrit du texte interactif sur stdout."""
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def _wizard_choose(prompt: str, valid: list[str]) -> str:
+    """Demande un choix parmi une liste de valeurs valides."""
+    while True:
+        choice = input(prompt).strip()
+        if choice in valid:
+            return choice
+        _wizard_write(
+            f"  Choix invalide. Options : {', '.join(valid)}\n"
+        )
+
+
+def _wizard_simple_session() -> None:
+    """Mode session simple — génération directe du contexte."""
+    _wizard_write("\n── Session simple ──\n\n")
+
+    compact = (
+        input("  Mode compact ? [o/N] : ").strip().lower() == "o"
+    )
+    focus = (
+        input(
+            "  Focus (fichier, tâche, ou Entrée = aucun) : "
+        ).strip() or None
+    )
+
+    exclude_raw = input(
+        "  Exclure des fichiers (noms séparés par espaces, "
+        "Entrée = aucun) : "
+    ).strip()
+    exclude = exclude_raw.split() if exclude_raw else None
+
+    _wizard_write("\n")
+
+    ctx_args = argparse.Namespace(
+        output=DEFAULT_OUTPUT,
+        compact=compact,
+        focus=focus,
+        exclude=exclude,
+        dry_run=False,
+        json=False,
+        max_style_samples=3,
+        budget=1750,
+        verbose=False,
+    )
+    _run_context(ctx_args)
+
+
+def _wizard_parallel_session() -> None:
+    """Mode sessions parallèles — création interactive."""
+    mgr = SessionManager()
+
+    # Sessions actives
+    active = mgr.list_sessions(state=SessionState.ACTIVE)
+    if active:
+        _wizard_write("\n── Sessions actives ──\n\n")
+        for s in active:
+            files_str = ", ".join(s.focus_files)
+            _wizard_write(
+                f"  🟢 {s.name:<20s} → {files_str}\n"
+            )
+        _wizard_write("\n")
+
+    creating = True
+    while creating:
+        _wizard_write("── Nouvelle session ──\n\n")
+
+        # Lister les fichiers
+        py_files = sorted([
+            f.name for f in PROJECT_ROOT.glob("*.py")
+            if f.name not in AUTO_GENERATED
+        ])
+
+        locks = mgr.locks.get_all_locks()
+
+        for i, filename in enumerate(py_files, 1):
+            filepath = PROJECT_ROOT / filename
+            lines = (
+                len(
+                    filepath.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                )
+                if filepath.exists() else 0
+            )
+
+            if filename in locks:
+                lock = locks[filename]
+                icon = "🔒"
+                status = f"verrouillé par '{lock.session_name}'"
+            else:
+                icon = "✅"
+                status = "disponible"
+
+            _wizard_write(
+                f"  {i:2d}. {icon} {filename:<28s} "
+                f"({lines:>4d}L)  {status}\n"
+            )
+
+        _wizard_write("\n")
+
+        # Sélection fichiers focus
+        selection = input(
+            "  Fichiers à modifier (numéros séparés par "
+            "espaces) : "
+        ).strip()
+        if not selection:
+            logger.error("Aucun fichier sélectionné.")
+            return
+
+        focus_files: list[str] = []
+        for x in selection.split():
+            if x.isdigit():
+                idx = int(x) - 1
+                if 0 <= idx < len(py_files):
+                    focus_files.append(py_files[idx])
+
+        if not focus_files:
+            logger.error("Aucun fichier valide sélectionné.")
+            return
+
+        # Sélection lecture seule
+        ro_input = input(
+            "  Lecture seule (numéros, Entrée = aucun) : "
+        ).strip()
+        read_only: list[str] = []
+        if ro_input:
+            for x in ro_input.split():
+                if x.isdigit():
+                    idx = int(x) - 1
+                    if 0 <= idx < len(py_files):
+                        candidate = py_files[idx]
+                        if candidate not in focus_files:
+                            read_only.append(candidate)
+
+        # Nom et description
+        name = input("  Nom de la session : ").strip()
+        if not name:
+            logger.error("Nom requis.")
+            return
+
+        description = input(
+            "  Description (optionnel) : "
+        ).strip()
+
+        # Récap
+        _wizard_write("\n  Récap :\n")
+        _wizard_write(f"    Nom          : {name}\n")
+        _wizard_write(
+            f"    Modifier     : {', '.join(focus_files)}\n"
+        )
+        if read_only:
+            _wizard_write(
+                f"    Lecture seule : {', '.join(read_only)}\n"
+            )
+        if description:
+            _wizard_write(
+                f"    Description  : {description}\n"
+            )
+        _wizard_write("\n")
+
+        confirm = input("  Confirmer ? [O/n] : ").strip().lower()
+        if confirm == "n":
+            _wizard_write("  Annulé.\n\n")
+        else:
+            try:
+                session = mgr.create(
+                    name=name,
+                    focus_files=focus_files,
+                    description=description,
+                    read_only=read_only or None,
+                )
+                _wizard_write(
+                    f"\n  ✅ Session '{session.name}' créée\n"
+                )
+                _wizard_write(
+                    f"     Contexte → {session.context_file}\n"
+                )
+            except (
+                ValueError, RuntimeError, FileNotFoundError
+            ) as e:
+                logger.error(str(e))
+
+        _wizard_write("\n")
+        another = input(
+            "  Créer une autre session ? [o/N] : "
+        ).strip().lower()
+        creating = another == "o"
+
+    _wizard_write("\n")
+
+
+def cli_session_wizard(args: argparse.Namespace) -> None:
+    """Assistant interactif de création de session."""
+    _wizard_write(
+        "\n═══ 🍄 CARTOMORILLES — Assistant de session ═══\n\n"
+    )
+    _wizard_write("  1. Session simple (contexte direct)\n")
+    _wizard_write("  2. Sessions parallèles\n\n")
+
+    choice = _wizard_choose("  Choix [1/2] : ", ["1", "2"])
+
+    if choice == "1":
+        _wizard_simple_session()
+    else:
+        _wizard_parallel_session()
 
 # ─────────────────────────────────────────────
 # Point d'entrée
@@ -3114,8 +3346,9 @@ def _build_session_parser(
     )
 
     session_sub = p_session.add_subparsers(
-        dest="session_command", required=True
+        dest="session_command", required=False  # ← changé
     )
+    p_session.set_defaults(func=cli_session_wizard)  # ← ajouté
 
     # ── create ────────────────────────────────
     p_create = session_sub.add_parser(
@@ -3224,6 +3457,11 @@ def _build_session_parser(
     )
     p_history.set_defaults(func=cli_session_history)
 
+    # ── wizard ────────────────────────────────
+    p_wizard = session_sub.add_parser(
+        "wizard", help="Assistant interactif de création"
+    )
+    p_wizard.set_defaults(func=cli_session_wizard)
 
 def _run_context(args: argparse.Namespace) -> None:
     """Exécute la génération de contexte."""

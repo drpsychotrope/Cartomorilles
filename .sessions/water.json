@@ -1,6 +1,6 @@
 {
   "name": "water",
-  "state": "active",
+  "state": "merged",
   "created_at": "2026-03-26T17:19:08.051070+00:00",
   "focus_files": [
     "landcover_detector.py"
@@ -30,5 +30,5 @@
   "description": "water detector",
   "git_branch": "session/water",
   "context_file": "AI_CONTEXT_water.md",
-  "merged_at": null
+  "merged_at": "2026-03-26T18:57:01.958840+00:00"
 }

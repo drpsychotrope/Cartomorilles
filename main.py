@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 🍄 CARTOMORILLES — Modèle de probabilité de présence de morilles
-   Zone : Grenoble 20×20km (Isère, 38)
+   Zone : Isère (38) — emprise limitée par données disponibles
+   DEM Copernicus N45_E005 ∩ BD Forêt v2 ∩ Géologie BDCharm-50
 
    Analyse multicritère spatialisée avec maillage configurable (défaut 10×10m).
    Sources : IGN BD Forêt v2, BD Topo, BRGM BDCharm-50, MNT, OSM landcover.
@@ -11,8 +12,11 @@ Usage :
     python main.py                              # Mode auto
     python main.py --dem mnt.tif                # Avec MNT local
     python main.py --dry-run                    # Vérif données seulement
-    python main.py --cell-size 10 --verbose     # Test rapide, logs détaillés
+    python main.py --cell-size 25 --verbose     # Test rapide, logs détaillés
 
+v2.4.0 — Extension emprise Isère 38 (74.5×98.8 km, ×18.4 vs v2.3)
+         DEM Copernicus 30m, CELL_SIZE 10m, géologie geologie_38/
+         Fix RÉSUMÉ FINAL dead code, _resolve_data_path rglob
 v2.3.2 — Intégration géologie BDCharm-50 (1086 polygones, 99.9% résolus)
          Fix #26 : rasters catégoriels pour hotspot enrichment
          Default paths BD Forêt + BDCharm-50 + régions IFN
@@ -26,6 +30,7 @@ v2.3.0 — Pipeline réordonné (Option 2), 7 fixes (#15, A-F)
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import signal
@@ -40,88 +45,122 @@ import numpy as np
 from pyproj import Transformer
 
 from config import (
+    ALTITUDE_OPTIMAL,
+    ALTITUDE_RANGE,
     BBOX,
     BBOX_WGS84,
     CELL_SIZE,
-    WEIGHTS,
-    TREE_SCORES,
     GEOLOGY_SCORES,
-    ALTITUDE_OPTIMAL,
-    ALTITUDE_RANGE,
-    SLOPE_OPTIMAL,
     SLOPE_MAX,
+    SLOPE_OPTIMAL,
+    TREE_SCORES,
+    WEIGHTS,
+    LANDCOVER_AUTO_MAX_KM2,
+    CELL_SIZE_AUTO_THRESHOLDS,
+    CELL_SIZE_AUTO_FALLBACK,
 )
 from data_loader import DataLoader
 from grid_builder import GridBuilder
 from scoring import MorilleScoring
-from visualize import MorilleVisualizer
 from species_enricher import SpeciesEnricher
+from visualize import MorilleVisualizer
 
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTES MODULE
 # ═══════════════════════════════════════════════════════════════
 
-VERSION = "2.3.5"
+VERSION = "2.4.0"
 
 # Transformer réutilisable (L93 → WGS84, always_xy pour lon/lat)
 _TO_WGS84 = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
 _TO_L93 = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
 
 # ── Chemins par défaut des données locales ─────────────────────
-_DEFAULT_BD_FORET = "data/FORMATION_VEGETALE.shp"
-_DEFAULT_REGIONS = "data/rfifn250_l93.shp"
-_DEFAULT_GEOLOGY = "data/geologie_38/GEO050K_HARM_038_S_FGEOL_2154.shp"
-_DEFAULT_DEM = "grenoble_bdalti25.tif"
+_DATA_DIR = Path(__file__).resolve().parent / "data"
+_DEFAULT_DEM = str(
+    _DATA_DIR / "Copernicus_DSM_COG_10_N45_00_E005_00_DEM.tif",
+)
+_DEFAULT_BD_FORET = str(_DATA_DIR / "FORMATION_VEGETALE.shp")
+_DEFAULT_GEOLOGY = str(
+    _DATA_DIR / "geologie_38" / "GEO050K_HARM_038_S_FGEOL_2154.shp",
+)
+_DEFAULT_REGIONS = str(_DATA_DIR / "rfifn250_l93.shp")
 
-# Points de contrôle terrain (prospection réelle mai 2025)
+# ── Zone (calculée depuis BBOX pour bannières/rapports) ────────
+_ZONE_DX_KM = (BBOX["xmax"] - BBOX["xmin"]) / 1000
+_ZONE_DY_KM = (BBOX["ymax"] - BBOX["ymin"]) / 1000
+_ZONE_LABEL = f"Isère 38 — {_ZONE_DX_KM:.0f}×{_ZONE_DY_KM:.0f} km"
+
+# ── Garde mémoire (cellules max sans --force) ─────────────────
+_MAX_CELLS = 200_000_000  # 200M — protège contre cell_size=5m accidentel
+_WARN_CELLS = 50_000_000  # 50M — avertit sur temps de calcul TWI D8
+
+# Points de contrôle terrain (prospection réelle mars 2026)
 # v2.3.1 : châtaignier corrigé — plus éliminatoire
 TERRAIN_CHECKPOINTS: tuple[dict[str, Any], ...] = (
-
-        # ── Contrôles positifs (morilles attendues) ──────────────────
-    {"name": "Champy – châtaigneraie",
-     "lat": 45.24308, "lon": 5.69736, "expected": 0.55,
-     "obs": "châtaignier favorable (M. elata), sol frais versant"},
-
-    {"name": "Terrasse plan d'eau + conifères",
-     "lat": 45.24087, "lon": 5.69484, "expected": 0.50,
-     "obs": "meilleur spot trouvé, M. elata possible"},
-
+    # ── Contrôles positifs (morilles attendues) ──────────────────
+    {
+        "name": "Champy – châtaigneraie",
+        "lat": 45.24308, "lon": 5.69736, "expected": 0.55,
+        "obs": "châtaignier favorable (M. elata), sol frais versant",
+    },
+    {
+        "name": "Terrasse plan d'eau + conifères",
+        "lat": 45.24087, "lon": 5.69484, "expected": 0.50,
+        "obs": "meilleur spot trouvé, M. elata possible",
+    },
     # ── Contrôles négatifs locaux (même zone, micro-habitat) ────
-    {"name": "Berge Vence – trop humide",
-     "lat": 45.24588, "lon": 5.69744, "expected": 0.05,
-     "obs": "lierre dense, scolopendres — LIMITATION micro-habitat",
-     "tolerance": 0.50},                      # ← tolérance élargie
-    {"name": "Ravine au-dessus Vence",
-     "lat": 45.24651, "lon": 5.70052, "expected": 0.05,
-     "obs": "encaissé humide — LIMITATION micro-habitat",
-     "tolerance": 0.50},
-    {"name": "Mi-pente Néron chênaie+buis",
-     "lat": 45.24418, "lon": 5.69886, "expected": 0.10,
-     "obs": "trop sec thermophile — LIMITATION espèces indicatrices",
-     "tolerance": 0.50},
-    {"name": "Robiniers + hêtres secteur Champy",
-     "lat": 45.24212, "lon": 5.69681, "expected": 0.15,
-     "obs": "sol perturbé — LIMITATION sans détection invasives",
-     "tolerance": 0.45},
-
+    {
+        "name": "Berge Vence – trop humide",
+        "lat": 45.24588, "lon": 5.69744, "expected": 0.05,
+        "obs": "lierre dense, scolopendres — LIMITATION micro-habitat",
+        "tolerance": 0.50,
+    },
+    {
+        "name": "Ravine au-dessus Vence",
+        "lat": 45.24637, "lon": 5.70049, "expected": 0.05,
+        "obs": "Trop humide",
+        "tolerance": 0.50,
+    },
+    {
+        "name": "Mi-pente Néron chênaie+buis",
+        "lat": 45.24467, "lon": 5.69871, "expected": 0.10,
+        "obs": "Trop sec, chênaie buissonnante",
+        "tolerance": 0.50,
+    },
+    {
+        "name": "Robinier + hêtres secteur Champy",
+        "lat": 45.24242, "lon": 5.69658, "expected": 0.15,
+        "obs": "Espèce eliminatoire (robinier), hêtres peu favorables",
+        "tolerance": 0.50,
+    },
     # ── Contrôles négatifs forts (vrai négatif attendu=0) ───────
-    {"name": "Centre-ville Grenoble",
-     "lat": 45.1885, "lon": 5.7245, "expected": 0.00,
-     "obs": "urbain dense — doit être éliminé"},
-    {"name": "Belledonne granite 1200m",
-     "lat": 45.14893, "lon": 5.88069, "expected": 0.00,
-     "obs": "granite éliminatoire — substrat acide"},
-    {"name": "Sommet Néron 1299m",
-     "lat": 45.23732, "lon": 5.70991, "expected": 0.00,
-     "obs": "altitude > 1400m ou roche nue"},
-    {"name": "Isère lit majeur",
-     "lat": 45.20003, "lon": 5.74186, "expected": 0.00,
-     "obs": "plan d'eau — masque eau"},
-
+    {
+        "name": "Centre-ville Grenoble",
+        "lat": 45.1885, "lon": 5.7245, "expected": 0.00,
+        "obs": "urbain dense — doit être éliminé",
+    },
+    {
+        "name": "Belledonne granite 1880m",
+        "lat": 45.11849, "lon": 5.88389, "expected": 0.00,
+        "obs": "granite éliminatoire — substrat acide",
+    },
+    {
+        "name": "Sommet Néron 1299m",
+        "lat": 45.23732, "lon": 5.70991, "expected": 0.00,
+        "obs": "altitude > 1400m ou roche nue",
+    },
+    {
+        "name": "Isère lit majeur",
+        "lat": 45.20003, "lon": 5.74186, "expected": 0.00,
+        "obs": "plan d'eau — masque eau",
+    },
     # ── Contrôle positif éloigné (diversité géo) ────────────────
-    {"name": "Vouillants forêt calcaire 350m",
-     "lat": 45.18824, "lon": 5.66543, "expected": 0.70,
-     "obs": "forêt calcaire optimale, altitude idéale"},
+    {
+        "name": "Vouillants forêt calcaire 350m",
+        "lat": 45.18824, "lon": 5.66543, "expected": 0.70,
+        "obs": "forêt calcaire optimale, altitude idéale",
+    },
 )
 
 # Fichiers partiels à nettoyer en cas d'interruption
@@ -183,42 +222,45 @@ def setup_logging(output_dir: Path, verbose: bool = False) -> None:
 
 
 def _resolve_data_path(
-    cli_value: str | None,
+    cli_arg: str | None,
     default: str,
     label: str,
-    glob_pattern: str | None = None,
+    glob_pattern: str,
 ) -> str | None:
-    """
-    Résout un chemin de donnée avec cascade :
-      1. Valeur CLI explicite (si fournie et existe)
-      2. Chemin par défaut (si existe)
-      3. Recherche récursive par glob dans data/ (optionnel)
-      4. None
+    """Résout un chemin de données : CLI > défaut > glob récursif.
 
-    Logge le résultat pour traçabilité.
+    Parameters
+    ----------
+    cli_arg : argument CLI explicite (prioritaire).
+    default : chemin par défaut absolu.
+    label : nom humain pour le logging.
+    glob_pattern : pattern glob fallback dans data/ et sous-dossiers.
     """
-    # 1. CLI explicite
-    if cli_value is not None:
-        p = Path(cli_value)
+    # 1. Argument CLI explicite
+    if cli_arg is not None:
+        p = Path(cli_arg)
         if p.exists():
-            logger.info("   %s : %s (CLI)", label, p)
+            logger.info("   ✅ %s (CLI) : %s", label, p)
             return str(p)
-        logger.warning("   %s : %s introuvable (CLI)", label, cli_value)
+        logger.warning("   ❌ %s (CLI) introuvable : %s", label, p)
 
-    # 2. Défaut
-    p = Path(default)
-    if p.exists():
-        logger.info("   %s : %s (défaut)", label, p)
-        return str(p)
+    # 2. Chemin par défaut
+    dp = Path(default)
+    if dp.exists():
+        logger.info("   ✅ %s : %s", label, dp.name)
+        return str(dp)
 
-    # 3. Glob récursif dans data/
-    if glob_pattern:
-        found = list(Path("data").rglob(glob_pattern))
-        if found:
-            logger.info("   %s : %s (découvert)", label, found[0])
-            return str(found[0])
+    # 3. Glob récursif dans data/ (couvre sous-dossiers type geologie_38/)
+    candidates = sorted(_DATA_DIR.rglob(glob_pattern))
+    if candidates:
+        chosen = candidates[0]
+        logger.info("   ✅ %s (glob) : %s", label, chosen.name)
+        return str(chosen)
 
-    logger.info("   %s : non trouvé → fallback WFS/synthétique", label)
+    logger.warning(
+        "   ❌ %s introuvable (défaut=%s, glob=%s)",
+        label, dp.name, glob_pattern,
+    )
     return None
 
 
@@ -226,6 +268,16 @@ def _resolve_data_path(
 #  VALIDATION & DIAGNOSTICS
 # ═══════════════════════════════════════════════════════════════
 
+def _auto_cell_size(area_km2: float) -> float:
+    """Résolution automatique adaptée à l'emprise.
+
+    Évite le suréchantillonnage inutile : le DEM Copernicus est à 25-30m,
+    BD Forêt et géologie sont à l'échelle hectométrique.
+    """
+    for max_area, cell in CELL_SIZE_AUTO_THRESHOLDS:
+        if area_km2 <= max_area:
+            return cell
+    return CELL_SIZE_AUTO_FALLBACK
 
 def validate_weights() -> bool:
     """Vérifie la somme des poids et affiche le détail."""
@@ -252,7 +304,7 @@ def estimate_grid_size(cell_size: float) -> dict[str, Any]:
     nx = int(dx / cell_size)
     ny = int(dy / cell_size)
     n_cells = nx * ny
-    mem_mb = n_cells * 12 * 8 / 1024 / 1024
+    mem_mb = n_cells * 4 * 15 / 1024 / 1024  # 15 grids × float32
 
     return {
         "dx_m": dx, "dy_m": dy,
@@ -394,7 +446,9 @@ def validate_against_terrain(model: MorilleScoring) -> float | None:
             x, y = _TO_L93.transform(pt["lon"], pt["lat"])
 
             if not hasattr(grid, "x_coords") or not hasattr(grid, "y_coords"):
-                logger.debug("   Grille sans coordonnées, validation impossible.")
+                logger.debug(
+                    "   Grille sans coordonnées, validation impossible.",
+                )
                 return None
 
             ix = int(np.argmin(np.abs(grid.x_coords - x)))
@@ -404,7 +458,8 @@ def validate_against_terrain(model: MorilleScoring) -> float | None:
                 predicted = float(scores[iy, ix])
                 expected: float = float(pt["expected"])
                 diff = abs(predicted - expected)
-                ok = diff < 0.25
+                tolerance: float = float(pt.get("tolerance", 0.25))
+                ok = diff < tolerance
 
                 symbol = "✅" if ok else "❌"
                 concordance_list.append(1.0 if ok else 0.0)
@@ -476,6 +531,59 @@ def display_hotspots(
 
 
 # ═══════════════════════════════════════════════════════════════
+#  EXPORT HOTSPOTS CSV
+# ═══════════════════════════════════════════════════════════════
+
+
+def save_hotspots_csv(
+    output_dir: Path,
+    hotspots: list[dict[str, Any]],
+) -> Path:
+    """Exporte tous les hotspots en CSV triés par score décroissant."""
+    csv_path = output_dir / "hotspots.csv"
+
+    fields = [
+        "rank", "id", "mean_score", "max_score",
+        "n_cells", "size_m2", "altitude", "mean_slope",
+        "dominant_species", "dominant_geology", "compactness", "confidence",
+        "lat", "lon", "x_l93", "y_l93", "google_maps",
+    ]
+
+    rows: list[dict[str, Any]] = []
+    for rank, h in enumerate(hotspots, 1):
+        lon, lat = _TO_WGS84.transform(h["x_l93"], h["y_l93"])
+        rows.append({
+            "rank": rank,
+            "id": h.get("id", ""),
+            "mean_score": round(float(h.get("mean_score", 0.0)), 4),
+            "max_score": round(float(h.get("max_score", 0.0)), 4),
+            "n_cells": h.get("n_cells", 0),
+            "size_m2": h.get("size_m2", 0),
+            "altitude": round(float(h.get("altitude", 0.0)), 1),
+            "mean_slope": round(float(h.get("mean_slope", 0.0)), 1),
+            "dominant_species": h.get("dominant_species", "unknown"),
+            "dominant_geology": h.get("dominant_geology", "unknown"),
+            "compactness": round(float(h.get("compactness", 0.0)), 3),
+            "confidence": round(float(h.get("confidence", 0.0)), 2),
+            "lat": round(lat, 5),
+            "lon": round(lon, 5),
+            "x_l93": round(float(h["x_l93"]), 1),
+            "y_l93": round(float(h["y_l93"]), 1),
+            "google_maps": (
+                f"https://www.google.com/maps?q={lat:.5f},{lon:.5f}"
+            ),
+        })
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info("📍 Hotspots CSV : %s (%d lignes)", csv_path, len(rows))
+    return csv_path
+
+
+# ═══════════════════════════════════════════════════════════════
 #  RAPPORT JSON
 # ═══════════════════════════════════════════════════════════════
 
@@ -497,7 +605,9 @@ def save_report(
             **h,
             "lat": round(lat, 5),
             "lon": round(lon, 5),
-            "google_maps": f"https://www.google.com/maps?q={lat:.5f},{lon:.5f}",
+            "google_maps": (
+                f"https://www.google.com/maps?q={lat:.5f},{lon:.5f}"
+            ),
         }
         hotspots_export.append(entry)
 
@@ -507,9 +617,10 @@ def save_report(
         "generated_at": datetime.now().isoformat(),
         "duration_seconds": round(duration, 1),
         "zone": {
-            "name": "Grenoble 20×20km",
+            "name": _ZONE_LABEL,
             "bbox_wgs84": dict(BBOX_WGS84),
             "bbox_lambert93": {k: round(v, 1) for k, v in BBOX.items()},
+            "area_km2": round(_ZONE_DX_KM * _ZONE_DY_KM, 1),
         },
         "config": config_snapshot,
         "statistics": stats,
@@ -542,7 +653,9 @@ def _on_interrupt(signum: int, frame: FrameType | None) -> None:
         if p.exists() and p.stat().st_size == 0:
             try:
                 p.unlink()
-                logger.warning("   Supprimé fichier vide/partiel : %s", p.name)
+                logger.warning(
+                    "   Supprimé fichier vide/partiel : %s", p.name,
+                )
             except OSError:
                 pass
     sys.exit(130)
@@ -560,19 +673,19 @@ def main(args: argparse.Namespace) -> int:
     """
     Pipeline principal Cartomorilles.
 
-    Ordre (v2.3.2) :
+    Ordre (v2.4.0) :
       1. Chargement données
-         a. DEM (BD ALTI 25m)
+         a. DEM (Copernicus 30m)
          b. BD Forêt v2 → SpeciesEnricher (essences + TFV + IFN régional)
          c. Géologie BDCharm-50 (prioritaire) ou WFS/synthétique
          d. Hydrographie, urbain (WFS IGN)
          e. Landcover (analyse couleur OSM)
       2. Grille + scores :
-         a. compute_terrain → score_altitude/slope/roughness/aspect
+         a. compute_terrain → score_altitude/slope/roughness/aspect/twi
          b. score_distance_water
          c. score_tree_species → enricher.enrich_grid_scores (niveaux B+C+D)
          d. score_geology
-         e. apply_urban_mask
+         e. apply_urban_mask + score_urban_proximity
          f. score_canopy_openness / score_ground_cover / score_disturbance
          g. apply_water_mask
          h. apply_landcover_mask
@@ -590,7 +703,7 @@ def main(args: argparse.Namespace) -> int:
 
     logger.info("=" * 60)
     logger.info("🍄 CARTOMORILLES v%s", VERSION)
-    logger.info("   Zone : Grenoble 20×20km (Isère)")
+    logger.info("   Zone : %s", _ZONE_LABEL)
     logger.info("=" * 60)
 
     # ── Purge cache (conditionnel) ────────────────────────────
@@ -602,15 +715,22 @@ def main(args: argparse.Namespace) -> int:
     np.random.seed(seed)  # type: ignore[arg-type]
     logger.info("🎲 Seed : %d", seed)
 
-    # ── Cell size override ────────────────────────────────────
-    cell_size: float = args.cell_size if args.cell_size else CELL_SIZE
+    # ── Résolution auto-scale ─────────────────────────────────
+    bbox = BBOX
+    emprise_km2 = (
+        (bbox["xmax"] - bbox["xmin"]) * (bbox["ymax"] - bbox["ymin"]) / 1e6
+    )
+    if args.cell_size is not None:
+        cell_size = args.cell_size
+    else:
+        cell_size = _auto_cell_size(emprise_km2)
     if cell_size != CELL_SIZE:
         import config as _cfg
-
-        _cfg.CELL_SIZE = cell_size  # type: ignore[attr-defined]
+        _cfg.CELL_SIZE = cell_size  # type: ignore[misc]
         logger.info(
-            "📐 Cell size surchargé : %.0fm (défaut: %.0fm)",
-            cell_size, CELL_SIZE,
+            "📐 Auto-scale : %.0f km² → résolution %.0fm "
+            "(défaut %.0fm, --cell-size pour forcer)",
+            emprise_km2, cell_size, CELL_SIZE,
         )
 
     # ── Validation config ─────────────────────────────────────
@@ -626,18 +746,26 @@ def main(args: argparse.Namespace) -> int:
     est = estimate_grid_size(cell_size)
     logger.info(
         "📐 Grille estimée : %d×%d = %s cellules  "
-        "(%.2f km², ~%.0f Mo RAM)",
+        "(%.1f km², ~%.0f Mo RAM)",
         est["nx"], est["ny"], f"{est['n_cells']:,}",
         est["area_km2"], est["mem_estimate_mb"],
     )
 
-    if est["n_cells"] > 5_000_000 and not args.force:
+    if est["n_cells"] > _MAX_CELLS and not args.force:
         logger.error(
-            "❌ >5M cellules (%s). "
+            "❌ >%s cellules (%s). "
             "Essayez --cell-size %d ou --force.",
-            f"{est['n_cells']:,}", int(cell_size * 2),
+            f"{_MAX_CELLS:,}",
+            f"{est['n_cells']:,}",
+            int(cell_size * 2),
         )
         return 1
+
+    if est["n_cells"] > _WARN_CELLS:
+        logger.warning(
+            "⚠️  %s cellules — TWI D8 peut prendre >5 min",
+            f"{est['n_cells']:,}",
+        )
 
     # ── Discovery WFS (mode spécial) ─────────────────────────
     if args.discover_wfs:
@@ -696,7 +824,7 @@ def main(args: argparse.Namespace) -> int:
 
     if forest_gdf is not None:
         n_known = int(
-            (forest_gdf["essence_canonical"] != "unknown").sum()
+            (forest_gdf["essence_canonical"] != "unknown").sum(),
         )
         enricher_load_stats = {
             "source": "bd_foret_v2",
@@ -706,7 +834,8 @@ def main(args: argparse.Namespace) -> int:
             ),
         }
         logger.info(
-            "   🌳 BD Forêt v2 : %d polygones, %d essences connues (%.1f%%)",
+            "   🌳 BD Forêt v2 : %d polygones, "
+            "%d essences connues (%.1f%%)",
             len(forest_gdf), n_known,
             enricher_load_stats["species_known_pct"],
         )
@@ -728,7 +857,7 @@ def main(args: argparse.Namespace) -> int:
                 and "geology_canonical" in geology_gdf.columns
             ):
                 n_resolved = int(
-                    (geology_gdf["geology_canonical"] != "unknown").sum()
+                    (geology_gdf["geology_canonical"] != "unknown").sum(),
                 )
             logger.info(
                 "   🪨 Géologie BDCharm-50 : %d polygones, "
@@ -764,7 +893,17 @@ def main(args: argparse.Namespace) -> int:
 
     # ── 1f. Détection landcover par couleur OSM ───────────────
     landcover_data: dict[str, Any] | None = None
-    if not args.no_landcover:
+    area_km2 = est["area_km2"]
+
+    if args.no_landcover:
+        logger.info("ℹ️  Landcover désactivé (--no-landcover)")
+    elif not args.landcover and area_km2 > LANDCOVER_AUTO_MAX_KM2:
+        logger.info(
+            "ℹ️  Landcover auto-skip : %.0f km² > %.0f km² "
+            "(utiliser --landcover pour forcer)",
+            area_km2, LANDCOVER_AUTO_MAX_KM2,
+        )
+    else:
         try:
             from landcover_detector import LandcoverDetector
 
@@ -848,23 +987,23 @@ def main(args: argparse.Namespace) -> int:
     logger.info("   ▸ Essences forestières...")
     grid.score_tree_species(forest_gdf)
 
+    logger.info("   ▸ Géologie (%s)...", geology_source)
+    grid.score_geology(geology_gdf)
+
     # ── 2c'. Enrichissement essences (niveaux B+C+D) ─────────
-    #    Remplace les scores 0.25 (unknown) par des scores
-    #    régionaux pondérés par altitude et type de forêt.
-    #    DOIT être APRÈS score_tree_species, AVANT apply_landcover_mask.
     logger.info("   ▸ Enrichissement essences (IFN 1997 × altitude)...")
-    enricher.enrich_grid_scores(grid, forest_gdf=forest_gdf)
+    enricher.enrich_grid_scores(
+        grid, forest_gdf=forest_gdf, geology_gdf=geology_gdf,
+    )
     enrich_stats = enricher.get_stats(grid)
     logger.info(
-        "   ▸ Essences : %d/%d connues (%.1f%%), %d inconnues restantes",
+        "   ▸ Essences : %d/%d connues (%.1f%%), "
+        "%d inconnues restantes",
         enrich_stats.get("species_known", 0),
         enrich_stats.get("forest_cells", 0),
         enrich_stats.get("pct_known", 0.0),
         enrich_stats.get("species_unknown", 0),
     )
-
-    logger.info("   ▸ Géologie (%s)...", geology_source)
-    grid.score_geology(geology_gdf)
 
     # ── 2d. Masque urbain (AVANT micro-habitats) ─────────────
     logger.info("   ▸ Application masque urbain...")
@@ -876,8 +1015,6 @@ def main(args: argparse.Namespace) -> int:
     grid.score_urban_proximity()
 
     # ── 2e. Scores micro-habitat ──────────────────────────────
-    #    APRÈS apply_urban_mask (urban_mask prêt pour disturbance)
-    #    AVANT apply_landcover_mask (pour être modulés par green_score)
     logger.info("   ▸ Ouverture canopée, couvert sol, perturbation...")
     grid.score_canopy_openness()
     grid.score_ground_cover()
@@ -888,14 +1025,12 @@ def main(args: argparse.Namespace) -> int:
     grid.apply_water_mask()
 
     # ── 2g. Modulation landcover (APRÈS tous les scores) ──────
-    #    Multiplie tree_species, canopy_openness, ground_cover,
-    #    disturbance par green_score.
     logger.info("   ▸ Application masque landcover (×green_score)...")
     grid.apply_landcover_mask(landcover_data)
 
     n_cells = grid.scores["altitude"].size
     logger.info(
-        "   ⏱️  Grille : %.1fs — %s cellules (%.2f km²)",
+        "   ⏱️  Grille : %.1fs — %s cellules (%.1f km²)",
         time.time() - t0,
         f"{n_cells:,}",
         n_cells * cell_size**2 / 1e6,
@@ -911,6 +1046,8 @@ def main(args: argparse.Namespace) -> int:
     model = MorilleScoring(grid)
     model.compute_weighted_score()
     model.apply_eliminatory_factors()
+    model.apply_monotony_penalty()
+    model.apply_calcdry_penalty()
     model.apply_spatial_smoothing(sigma=args.smoothing_sigma)
     model.classify_probability()
 
@@ -937,8 +1074,9 @@ def main(args: argparse.Namespace) -> int:
     logger.info("\n🗺️  [4/4] Génération des exports...")
     t0 = time.time()
 
-    viz = MorilleVisualizer(model, hotspots=hotspots)
-
+    viz = MorilleVisualizer(
+        model, hotspots=hotspots, hydro_gdf=hydro_gdf, urban_gdf=urban_gdf,
+    )
     # Carte Folium HTML
     html_path = str(output_dir / "carte_morilles.html")
     _cleanup_files.append(html_path)
@@ -992,7 +1130,6 @@ def main(args: argparse.Namespace) -> int:
         "regions_path": regions_path,
     }
 
-    # Fusionner les stats enrichissement
     full_enrich_stats: dict[str, Any] = {**enricher_load_stats, **enrich_stats}
 
     duration = time.time() - t_start
@@ -1002,6 +1139,8 @@ def main(args: argparse.Namespace) -> int:
         config_snapshot, duration, concordance,
         enrichment_stats=full_enrich_stats,
     )
+
+    save_hotspots_csv(output_dir, hotspots)
 
     # ══════════════════════════════════════════════════════════
     #  RÉSUMÉ FINAL
@@ -1030,7 +1169,8 @@ def main(args: argparse.Namespace) -> int:
     if concordance is not None:
         if concordance >= 0.8:
             logger.info(
-                "\n✅ Bonne concordance terrain : %.0f%%", concordance * 100,
+                "\n✅ Bonne concordance terrain : %.0f%%",
+                concordance * 100,
             )
         elif concordance >= 0.5:
             logger.info(
@@ -1066,15 +1206,17 @@ def build_parser() -> argparse.ArgumentParser:
             "de présence de morilles"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Zone : {_ZONE_LABEL} | Maille : {CELL_SIZE:.0f}m
+
 Exemples d'utilisation :
 
   # Mode auto (BD Forêt v2 + BDCharm-50 + IFN enrichissement)
   python main.py
 
   # Avec MNT local (GeoTIFF)
-  python main.py --dem data/mnt_neron.tif
+  python main.py --dem data/mnt_local.tif
 
   # Mode rapide (maille 25m) avec logs détaillés
   python main.py --cell-size 25 --verbose
@@ -1101,7 +1243,7 @@ Exemples d'utilisation :
     data_group = parser.add_argument_group("📂 Données d'entrée")
     data_group.add_argument(
         "--dem", type=str, default=None,
-        help="Chemin MNT raster (.tif). Défaut : grenoble_bdalti25.tif.",
+        help="Chemin MNT raster (.tif). Défaut : Copernicus N45_E005.",
     )
     data_group.add_argument(
         "--forest", type=str, default=None,
@@ -1111,7 +1253,7 @@ Exemples d'utilisation :
         "--geology", type=str, default=None,
         help=(
             "Chemin couche géologie (.shp/.gpkg). "
-            f"Défaut : {_DEFAULT_GEOLOGY}."
+            "Défaut : geologie_38/GEO050K...S_FGEOL."
         ),
     )
     data_group.add_argument(
@@ -1127,11 +1269,11 @@ Exemples d'utilisation :
     enrich_group = parser.add_argument_group("🌳 Enrichissement essences")
     enrich_group.add_argument(
         "--bd-foret", type=str, default=None,
-        help=f"Chemin BD Forêt v2 SHP (défaut: {_DEFAULT_BD_FORET}).",
+        help="Chemin BD Forêt v2 SHP (défaut: FORMATION_VEGETALE.shp).",
     )
     enrich_group.add_argument(
         "--regions", type=str, default=None,
-        help=f"Chemin régions forestières IFN SHP (défaut: {_DEFAULT_REGIONS}).",
+        help="Chemin régions forestières IFN SHP (défaut: rfifn250_l93.shp).",
     )
     enrich_group.add_argument(
         "--obs", type=str, default=None,
@@ -1155,12 +1297,20 @@ Exemples d'utilisation :
         "--no-landcover", action="store_true",
         help="Désactiver la détection couleur OSM.",
     )
+    mask_group.add_argument(
+        "--landcover", action="store_true",
+        help=(
+            "Forcer la détection couleur OSM même sur grandes emprises "
+            "(auto-skip au-delà de %.0f km²)."
+            % LANDCOVER_AUTO_MAX_KM2
+        ),
+    )
 
     # ── Paramètres modèle ──
     model_group = parser.add_argument_group("🧮 Paramètres du modèle")
     model_group.add_argument(
-        "--cell-size", type=float, default=None, metavar="M",
-        help="Taille de cellule en mètres (défaut: %.0fm)." % CELL_SIZE,
+        "--cell-size", type=float, default=None,
+        help="Taille de cellule en mètres (auto-scale si omis).",
     )
     model_group.add_argument(
         "--hotspot-threshold", type=float, default=0.60, metavar="T",

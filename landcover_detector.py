@@ -104,23 +104,28 @@ _STRUCT_8CONN = generate_binary_structure(2, 2)
 # Priorité = ordre dans la liste : premier match gagne.
 #
 # Classes (i+1 car result[match]=i+1) :
-#   0 = other (indéterminé)            6 = road_major
-#   1 = green_dark (forêt)             7 = road_major2 (hue wrap)
-#   2 = green_light (prairie, parc)    8 = road_yellow
-#   3 = green_pale (jardin pâle)       9 = farmland
-#   4 = water_stream (cours d'eau)    10 = background
-#   5 = water_body (plan d'eau)
+#   0 = other (indéterminé)            7 = road_major
+#   1 = green_dark (forêt)             8 = road_major2 (hue wrap)
+#   2 = green_light (prairie, parc)    9 = road_yellow
+#   3 = green_pale (jardin pâle)      10 = farmland
+#   4 = water_thin (cours d'eau fin)  11 = background
+#   5 = water_stream (cours d'eau)
+#   6 = water_body (plan d'eau)
 #  -1 = nodata (alpha invalide)
 #
 # Fix #25 : water splitté en water_stream (H:185-220, tight OSM #aad3df)
 #           et water_body (H:180-260, large). Premier match gagne,
 #           donc water_stream capture le bleu clair OSM avant water_body.
+# Fix #25b: water_thin (H:170-195) ajouté AVANT green_light pour capter
+#           les pixels anti-aliasés cyan des cours d'eau fins.
+#           Dilatation water_mask augmentée à 2 itérations.
 
 _COLOR_RULES: tuple[tuple[str, float, float, float, float, float, float], ...] = (
     # (nom,            H_min, H_max, S_min, S_max, V_min, V_max)
     ("green_dark",        70, 170, 0.10, 1.00, 0.15, 0.70),   # forêt
     ("green_light",       60, 160, 0.08, 0.60, 0.70, 0.95),   # prairie, parc
     ("green_pale",        60, 150, 0.03, 0.15, 0.85, 1.00),   # jardin pâle OSM
+    ("water_thin",       170, 195, 0.05, 0.40, 0.65, 1.00),   # cyan anti-aliasé cours d'eau fins
     ("water_stream",     185, 220, 0.08, 0.50, 0.70, 1.00),   # cours d'eau OSM #aad3df
     ("water_body",       180, 260, 0.10, 1.00, 0.30, 1.00),   # plans d'eau larges
     ("road_major",       330, 360, 0.05, 0.50, 0.70, 1.00),   # route rose/rouge
@@ -130,19 +135,20 @@ _COLOR_RULES: tuple[tuple[str, float, float, float, float, float, float], ...] =
     ("background",         0, 360, 0.00, 0.05, 0.80, 1.00),   # fond blanc/gris clair
 )
 
-# ── Mapping unique classe_id → nom (10 classes + other) ───────────
+# ── Mapping unique classe_id → nom (11 classes + other) ───────────
 _CLASS_NAMES: dict[int, str] = {
     0: "other",
     1: "green_dark",
     2: "green_light",
     3: "green_pale",
-    4: "water_stream",
-    5: "water_body",
-    6: "road_major",
-    7: "road_major2",
-    8: "road_yellow",
-    9: "farmland",
-    10: "background",
+    4: "water_thin",
+    5: "water_stream",
+    6: "water_body",
+    7: "road_major",
+    8: "road_major2",
+    9: "road_yellow",
+    10: "farmland",
+    11: "background",
 }
 
 # ── Scores de verdure par classe — Fix #11 v2.2.0 ────────────────
@@ -151,20 +157,21 @@ _GREEN_SCORES: dict[int, float] = {
     1: 1.00,   # forêt certaine
     2: 0.80,   # prairie
     3: 0.50,   # jardin, parc
-    4: 0.10,   # eau (cours d'eau)
-    5: 0.10,   # eau (plan d'eau)
-    6: 0.00,   # route
+    4: 0.10,   # eau (cours d'eau fin)
+    5: 0.10,   # eau (cours d'eau)
+    6: 0.10,   # eau (plan d'eau)
     7: 0.00,   # route
     8: 0.00,   # route
-    9: 0.10,   # champs — Fix #11 (était 0.55)
-    10: 0.05,  # fond de carte — Fix #11 (était 0.20)
+    9: 0.00,   # route
+    10: 0.10,  # champs — Fix #11 (était 0.55)
+    11: 0.05,  # fond de carte — Fix #11 (était 0.20)
 }
 
 # Classes considérées comme routes pour le masque urbain
-_ROAD_CLASSES: frozenset[int] = frozenset({6, 7, 8})
+_ROAD_CLASSES: frozenset[int] = frozenset({7, 8, 9})
 
-# Classes considérées comme eau pour le masque water — Fix #25
-_WATER_CLASSES: frozenset[int] = frozenset({4, 5})
+# Classes considérées comme eau pour le masque water — Fix #25/25b
+_WATER_CLASSES: frozenset[int] = frozenset({4, 5, 6})
 
 # ── Couleurs pour l'image de debug ────────────────────────────────
 _DEBUG_COLORS: dict[int, tuple[int, int, int]] = {
@@ -172,15 +179,15 @@ _DEBUG_COLORS: dict[int, tuple[int, int, int]] = {
     1: (0, 100, 0),        # green_dark
     2: (100, 200, 100),    # green_light
     3: (180, 230, 180),    # green_pale
-    4: (100, 150, 255),    # water_stream — bleu clair
-    5: (50, 50, 200),      # water_body — bleu foncé
-    6: (255, 100, 100),    # road_major
-    7: (255, 100, 100),    # road_major2
-    8: (255, 200, 50),     # road_yellow
-    9: (230, 220, 180),    # farmland
-    10: (240, 240, 240),   # background
+    4: (150, 200, 255),    # water_thin — cyan clair
+    5: (100, 150, 255),    # water_stream — bleu clair
+    6: (50, 50, 200),      # water_body — bleu foncé
+    7: (255, 100, 100),    # road_major
+    8: (255, 100, 100),    # road_major2
+    9: (255, 200, 50),     # road_yellow
+    10: (230, 220, 180),   # farmland
+    11: (240, 240, 240),   # background
 }
-
 
 # ═══════════════════════════════════════════════════════════════════
 class LandcoverDetector:
@@ -975,14 +982,15 @@ class LandcoverDetector:
         water_mask = np.zeros((ny, nx), dtype=bool)
         for water_cls in _WATER_CLASSES:
             water_mask[class_resized == water_cls] = True
-
-        # Dilatation 1px pour couvrir les berges immédiates
+            
+        # Dilatation 2px — Fix #25b : compense la dilution des cours d'eau
+        # fins au rééchantillonnage (1px tuile → perdu en nearest neighbor)
         if water_mask.any():
             water_mask = np.asarray(
                 binary_dilation(
                     water_mask,
                     structure=_STRUCT_8CONN,
-                    iterations=1,
+                    iterations=2,
                 ),
                 dtype=bool,
             )

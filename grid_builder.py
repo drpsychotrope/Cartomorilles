@@ -36,11 +36,10 @@ from rasterio.transform import from_bounds
 from scipy.ndimage import (
     binary_dilation,
     binary_erosion,
-    distance_transform_edt,
     uniform_filter,
     zoom,
 )
-
+import _accel
 import config
 from config import (
     ALTITUDE_OPTIMAL,
@@ -69,6 +68,12 @@ from config import (
     URBAN_DIST_FULL,
     URBAN_PROXIMITY_FLOOR,
 )
+
+try:
+    from _twi_numba import _accumulate_d8
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
 
 logger = logging.getLogger("cartomorilles.grid_builder")
 
@@ -106,6 +111,12 @@ _CANOPY_FOREST_INTERIOR: float = 0.55
 _VEGETATION_CRITERIA: frozenset[str] = frozenset({
  "canopy_openness", "ground_cover", "disturbance",
 })
+
+# ── Canopy terrain correlation (v2.3.6) ─────────────────────────
+_CANOPY_BASE_INTERIOR: float = 0.45       # was 0.55 — marge pour bonus
+_CANOPY_SLOPE_BONUS: float = 0.10         # trouées naturelles 10-30°
+_CANOPY_ALT_BONUS: float = 0.05           # structure montagnarde 300-800m
+_CANOPY_SPECIES_BONUS: float = 0.05       # essences favorables (score > 0.40)
 
 __all__ = ("GridBuilder",)
 
@@ -263,9 +274,10 @@ class GridBuilder:
         nan_mask = np.isnan(dem)
         if not nan_mask.any():
             return dem
+        from scipy.ndimage import distance_transform_edt as _scipy_edt
         indices: np.ndarray = np.asarray(
-            distance_transform_edt(
-                nan_mask, return_distances=False, return_indices=True
+            _scipy_edt(
+                nan_mask, return_distances=False, return_indices=True,
             )
         )
         filled = dem.copy()
@@ -293,6 +305,24 @@ class GridBuilder:
             float(np.sum(valid >= 0.7)) / valid.size * 100,
             float(np.sum(valid == 0)) / valid.size * 100,
         )
+
+    def _skip_zero_weight(self, name: str) -> bool:
+        """Retourne True si le critère a un poids nul → skip le calcul.
+
+        Enregistre quand même un score neutre (0.5) pour que le pipeline
+        ne casse pas en aval (validate_scores, scoring, visualize).
+        """
+        weight = config.WEIGHTS.get(name, 0.0)
+        if weight <= 0.0:
+            logger.info(
+                "⏭️  Score %-20s : poids=0 → skip (neutre 0.5)", name,
+            )
+            self.scores[name] = np.full(
+                (self.ny, self.nx), 0.5, dtype=np.float32,
+            )
+            self.score_confidence[name] = 0.0
+            return True
+        return False
 
     def _rasterize_max(
         self,
@@ -338,109 +368,261 @@ class GridBuilder:
     def compute_terrain(self, dem_data: dict[str, Any]) -> GridBuilder:
         """
         Calcule altitude, pente, exposition, rugosité et TWI depuis le MNT.
-        Gère les NaN proprement (NoData du DEM).
+
+        Optimisation v2.4.0 : calcul à résolution native du DEM, puis
+        resample vers la grille cible. Évite le zoom ×N du DEM brut
+        qui multiplie le coût du TWI D8 par N² et crée des artefacts
+        de micro-drainage fictifs sur le DEM interpolé.
         """
-        dem = dem_data["data"].astype(np.float32)
+        # Warmup accélérateurs au premier appel
+        if not hasattr(GridBuilder, "_accel_warmed"):
+            _accel.warmup()
+            GridBuilder._accel_warmed = True
 
-        # ── Redimensionner si nécessaire ──
-        if dem.shape != (self.ny, self.nx):
-            logger.debug(
-                "   Redimensionnement MNT : %s → (%d, %d)",
-                dem.shape,
-                self.ny,
-                self.nx,
+        dem_raw = np.asarray(dem_data["data"]).astype(np.float32)
+        dem_ny, dem_nx = dem_raw.shape
+
+        # ── Résolution native du DEM ──
+        dem_res_x: float | None = dem_data.get("res_x")
+        dem_res_y: float | None = dem_data.get("res_y")
+        if dem_res_x is not None and dem_res_y is not None:
+            dem_cell_size = float((abs(dem_res_x) + abs(dem_res_y)) / 2)
+        else:
+            # Estimation depuis emprise / shape
+            bbox_dx = self.bbox["xmax"] - self.bbox["xmin"]
+            bbox_dy = self.bbox["ymax"] - self.bbox["ymin"]
+            dem_cell_size = float(
+                (bbox_dx / dem_nx + bbox_dy / dem_ny) / 2,
             )
-            dem = self._zoom_dem(dem)
 
-        self.altitude = dem.copy()
+        needs_resample = (dem_ny != self.ny) or (dem_nx != self.nx)
+        ratio = self.cell_size / dem_cell_size if dem_cell_size > 0 else 1.0
 
-        # ── Masque NoData ──
-        self.nodata_mask = np.isnan(dem)
-        n_nodata = int(self.nodata_mask.sum())
+        if needs_resample:
+            logger.info(
+                "   DEM natif : %d×%d @ %.1fm → grille %d×%d @ %.1fm "
+                "(ratio ×%.1f)",
+                dem_nx, dem_ny, dem_cell_size,
+                self.nx, self.ny, self.cell_size,
+                ratio,
+            )
+            logger.info(
+                "   ⚡ Terrain calculé à résolution native "
+                "(%s cells au lieu de %s)",
+                f"{dem_ny * dem_nx:,}",
+                f"{self.ny * self.nx:,}",
+            )
+        # ── Altitude : resample vers grille cible (interpolation) ──
+        if needs_resample:
+            nan_mask_raw = np.isnan(dem_raw)
+            altitude = self._zoom_grid(dem_raw, nan_mask_raw, order=1)
+        else:
+            altitude = dem_raw.copy()
+        self.altitude = altitude
+
+        # ── Masque NoData (sur grille cible) ──
+        nodata_mask: np.ndarray = np.isnan(altitude)
+        self.nodata_mask = nodata_mask
+        n_nodata = int(nodata_mask.sum())
         if n_nodata > 0:
             logger.debug(
                 "   %d cellules NoData (%.1f%%)",
                 n_nodata,
-                n_nodata / dem.size * 100,
+                n_nodata / altitude.size * 100,
             )
 
-        # ── Pente et aspect (sur DEM sans NaN) ──
-        dem_filled = self._fill_nan_dem(dem)
-        self._compute_slope_aspect(dem_filled)
+        # ── Calcul terrain à résolution NATIVE du DEM ──
+        nan_mask_native = np.isnan(dem_raw)
+        dem_filled_native = (
+            self._fill_nan_dem(dem_raw)
+            if np.any(nan_mask_native)
+            else dem_raw
+        )
+
+        # Pente + aspect à résolution native
+        native_slope, native_aspect = self._compute_slope_aspect_from(
+            dem_filled_native, dem_cell_size,
+        )
+
+        # Rugosité à résolution native
+        native_roughness = self._compute_roughness_from(native_slope)
+
+        # TWI à résolution native (le gros gain de perf)
+        native_twi = self._compute_twi(dem_filled_native, dem_cell_size)
+
+        # ── Restaurer NaN dans les dérivées natives ──
+        if np.any(nan_mask_native):
+            native_slope[nan_mask_native] = np.nan
+            native_aspect[nan_mask_native] = np.nan
+            native_roughness[nan_mask_native] = np.nan
+            native_twi[nan_mask_native] = np.nan
+
+        # ── Resample vers grille cible ──
+        if needs_resample:
+            self.slope = self._zoom_grid(
+                native_slope, nan_mask_native, order=1,
+            )
+            self.aspect = self._zoom_grid(
+                native_aspect, nan_mask_native, order=0,
+            )
+            self.roughness = self._zoom_grid(
+                native_roughness, nan_mask_native, order=1,
+            )
+            self.twi = self._zoom_grid(
+                native_twi, nan_mask_native, order=1,
+            )
+        else:
+            self.slope = native_slope
+            self.aspect = native_aspect
+            self.roughness = native_roughness
+            self.twi = native_twi
 
         # P3 : narrowing pour Pylance
-        _slope = self.slope
-        assert _slope is not None, "slope not set after _compute_slope_aspect"
-        _aspect = self.aspect
-        assert _aspect is not None, "aspect not set after _compute_slope_aspect"
+        assert self.slope is not None
+        assert self.aspect is not None
+        assert self.roughness is not None
+        assert self.twi is not None
 
-        # ── Rugosité ──
-        self._compute_roughness()
-        _roughness = self.roughness
-        assert _roughness is not None, "roughness not set after _compute_roughness"
-
-        # ── Restaurer NaN dans les dérivées ──
-        if self.nodata_mask.any():
-            _slope[self.nodata_mask] = np.nan
-            _aspect[self.nodata_mask] = np.nan
-            _roughness[self.nodata_mask] = np.nan
+        # ── Restaurer NaN sur grille cible ──
+        if self.nodata_mask is not None and np.any(self.nodata_mask):
+            self.slope[self.nodata_mask] = np.nan
+            self.aspect[self.nodata_mask] = np.nan
+            self.roughness[self.nodata_mask] = np.nan
+            self.twi[self.nodata_mask] = np.nan
 
         self._terrain_computed = True
         self._log_terrain_stats()
 
-    # ── TWI — Topographic Wetness Index (fix #46 v2.3.5) ──
-        self._twi = self._compute_twi(dem_filled, self.cell_size)
         logger.info(
             "   TWI       : %.1f–%.1f (moy=%.1f)",
-            float(np.nanmin(self._twi)),
-            float(np.nanmax(self._twi)),
-            float(np.nanmean(self._twi)),
+            float(np.nanmin(self.twi)),
+            float(np.nanmax(self.twi)),
+            float(np.nanmean(self.twi)),
         )
 
         return self
 
-    def _zoom_dem(self, dem: np.ndarray) -> np.ndarray:
-        """Redimensionne le DEM en gérant les NaN."""
-        nan_mask = np.isnan(dem)
-        zy = self.ny / dem.shape[0]
-        zx = self.nx / dem.shape[1]
-        if nan_mask.any():
-            dem_filled = self._fill_nan_dem(dem)
-            dem_zoomed: np.ndarray = np.asarray(
-                zoom(dem_filled, (zy, zx), order=1)
+    def _zoom_grid(
+        self,
+        grid: np.ndarray,
+        nan_mask: np.ndarray,
+        order: int = 1,
+    ) -> np.ndarray:
+        """Resample une grille native vers (self.ny, self.nx) en gérant NaN.
+
+        Parameters
+        ----------
+        grid : grille à résolution native du DEM.
+        nan_mask : masque NaN à la même résolution.
+        order : 0=nearest (catégoriel), 1=bilinéaire (continu).
+        """
+        zy = self.ny / grid.shape[0]
+        zx = self.nx / grid.shape[1]
+
+        if np.any(nan_mask):
+            filled = np.where(nan_mask, 0.0, grid)
+            zoomed: np.ndarray = np.asarray(
+                zoom(filled, (zy, zx), order=order),
             ).astype(np.float32)
             nan_zoomed: np.ndarray = (
                 np.asarray(
-                    zoom(nan_mask.astype(np.float32), (zy, zx), order=0)
+                    zoom(nan_mask.astype(np.float32), (zy, zx), order=0),
                 )
                 > 0.5
             )
-            dem_zoomed[nan_zoomed] = np.nan
-            return dem_zoomed
-        return np.asarray(zoom(dem, (zy, zx), order=1)).astype(np.float32)
+            zoomed[nan_zoomed] = np.nan
+            return zoomed
 
-    def _compute_slope_aspect(self, dem_filled: np.ndarray) -> None:
-        """Calcule pente et aspect depuis un DEM sans NaN."""
-        dy, dx = np.gradient(dem_filled, self.cell_size)
-        self.slope = np.degrees(
-            np.arctan(np.sqrt(dx**2 + dy**2))
+        return np.asarray(
+            zoom(grid, (zy, zx), order=order),
         ).astype(np.float32)
-        self.aspect = (np.degrees(np.arctan2(-dx, dy)) % 360).astype(
-            np.float32
-        )
+
+    @staticmethod
+    def _compute_roughness_from(slope: np.ndarray) -> np.ndarray:
+        """Rugosité = écart-type local de la pente.
+
+        Version statique pour calcul à résolution native.
+        """
+        return _accel.compute_roughness(slope, ROUGHNESS_WINDOW)
+
+    @staticmethod
+    def _compute_slope_aspect_from(
+        dem: np.ndarray,
+        dx: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Pente (°) et aspect (°) via Horn — accéléré GPU/CPU."""
+        return _accel.compute_slope_aspect(dem, dx)
 
     def _compute_roughness(self) -> None:
-        """Rugosité = écart-type local de la pente."""
+        """Rugosité — wrapper rétrocompatible."""
         _slope = self.slope
         assert _slope is not None, "slope required for roughness"
-        w = ROUGHNESS_WINDOW
-        slope_mean: np.ndarray = np.asarray(uniform_filter(_slope, size=w))
-        slope_sq_mean: np.ndarray = np.asarray(
-            uniform_filter(_slope**2, size=w)
-        )
-        self.roughness = np.sqrt(
-            np.maximum(slope_sq_mean - slope_mean**2, 0)
+        self.roughness = self._compute_roughness_from(_slope)
+
+    @staticmethod
+    def _compute_twi(
+        dem: np.ndarray,
+        cell_size: float,
+    ) -> np.ndarray:
+        """
+        Calcul du Topographic Wetness Index — TWI = ln(a / tan(β)).
+
+        D1 : algorithme D8 (pas D∞/MFD).
+
+        Optimisation v2.4.0 :
+        - flow_dir parallélisé via Numba (indépendant par pixel)
+        - accumulation séquentielle (dépendance topologique)
+        """
+        ny, nx = dem.shape
+        cell_area = cell_size * cell_size
+
+        # ── 1. Pente locale β (radians), floor pour éviter div/0 ──
+        dy, dx = np.gradient(dem, cell_size)
+        slope_rad: np.ndarray = np.arctan(
+            np.sqrt(dx**2 + dy**2),
         ).astype(np.float32)
+        slope_rad = np.maximum(slope_rad, np.radians(0.1))
+
+        # ── 2. Direction d'écoulement D8 ──
+        flow_dir = _accel.compute_flow_dir_d8(
+            dem.astype(np.float64), cell_size,
+        )
+        logger.debug("   D8 flow_dir via _accel")
+
+        # ── 3. Aire drainée par accumulation D8 ──
+        flat_idx = np.argsort(dem.ravel())[::-1].astype(np.int64)
+
+        if _HAS_NUMBA:
+            from _twi_numba import _accumulate_d8
+
+            acc = _accumulate_d8(flat_idx, flow_dir, cell_area, ny, nx)
+            logger.debug("   D8 accumulation via numba")
+        else:
+            d8_dr = (-1, -1, 0, 1, 1, 1, 0, -1)
+            d8_dc = (0, 1, 1, 1, 0, -1, -1, -1)
+            logger.debug(
+                "   D8 accumulation Python pur (lent sur %d cellules)",
+                ny * nx,
+            )
+            acc = np.ones((ny, nx), dtype=np.float64) * cell_area
+            for pixel in flat_idx:
+                r = pixel // nx
+                c = pixel % nx
+                d = flow_dir[r, c]
+                if d < 0:
+                    continue
+                nr = r + d8_dr[d]
+                nc = c + d8_dc[d]
+                if 0 <= nr < ny and 0 <= nc < nx:
+                    acc[nr, nc] += acc[r, c]
+
+        # ── 4. TWI = ln(a / tan(β)) ──
+        specific_area = acc / cell_size
+        tan_beta = np.tan(slope_rad)
+        ratio = np.maximum(specific_area / tan_beta, 1e-6)
+        twi: np.ndarray = np.log(ratio).astype(np.float32)
+
+        return twi
 
     def _log_terrain_stats(self) -> None:
         """Affiche les statistiques terrain."""
@@ -483,139 +665,6 @@ class GridBuilder:
                 float((valid >= 25).sum()) / n * 100,
             )
 
-    @staticmethod
-    def _compute_twi(
-        dem: np.ndarray,
-        cell_size: float,
-    ) -> np.ndarray:
-        """
-        Calcul du Topographic Wetness Index — TWI = ln(a / tan(β)).
-
-        Utilise un algorithme D8 simplifié pour l'aire drainée.
-        L'aire drainée spécifique a = A_drainée / largeur_pixel.
-
-        Fix #46 v2.3.5.
-        """
-        ny, nx = dem.shape
-        cell_area = cell_size * cell_size
-
-        # ── 1. Pente locale β (radians), floor pour éviter div/0 ──
-        dy, dx = np.gradient(dem, cell_size)
-        slope_rad = np.arctan(np.sqrt(dx**2 + dy**2))
-        # Floor : pente minimale 0.1° pour éviter ln(inf) en terrain plat
-        slope_rad = np.maximum(slope_rad, np.radians(0.1))
-
-        # ── 2. Direction d'écoulement D8 ──
-        # 8 voisins : (drow, dcol) dans l'ordre conventionnel D8
-        d8_offsets: tuple[tuple[int, int], ...] = (
-            (-1, 0), (-1, 1), (0, 1), (1, 1),
-            (1, 0), (1, -1), (0, -1), (-1, -1),
-        )
-        # Distances (1.0 pour cardinal, √2 pour diagonal)
-        d8_dist: np.ndarray = np.array(
-            [1.0, 1.414, 1.0, 1.414, 1.0, 1.414, 1.0, 1.414],
-            dtype=np.float32,
-        ) * cell_size
-
-        # Direction : index du voisin avec la plus forte pente descendante
-        flow_dir = np.full((ny, nx), -1, dtype=np.int8)
-
-        for idx, (dr, dc) in enumerate(d8_offsets):
-            # Coordonnées du voisin
-            r_from = max(0, -dr)
-            r_to = ny - max(0, dr)
-            c_from = max(0, -dc)
-            c_to = nx - max(0, dc)
-
-            r_nb_from = max(0, dr)
-            r_nb_to = ny + min(0, dr) if dr < 0 else ny
-            c_nb_from = max(0, dc)
-            c_nb_to = nx + min(0, dc) if dc < 0 else nx
-
-            # Pente vers ce voisin
-            drop = (
-                dem[r_from:r_to, c_from:c_to]
-                - dem[r_nb_from:r_nb_to, c_nb_from:c_nb_to]
-            )
-            slope_to_nb = drop / d8_dist[idx]
-
-            # Mettre à jour si c'est la pente max
-            current_best = np.full((r_to - r_from, c_to - c_from), -np.inf)
-
-            # Recalculer le meilleur courant
-            for prev_idx, (pdr, pdc) in enumerate(d8_offsets):
-                if prev_idx >= idx:
-                    break
-                pr_from = max(0, -pdr)
-                pr_to = ny - max(0, pdr)
-                pc_from = max(0, -pdc)
-                pc_to = nx - max(0, pdc)
-                pr_nb_from = max(0, pdr)
-                pr_nb_to = ny + min(0, pdr) if pdr < 0 else ny
-                pc_nb_from = max(0, pdc)
-                pc_nb_to = nx + min(0, pdc) if pdc < 0 else nx
-
-                prev_drop = (
-                    dem[pr_from:pr_to, pc_from:pc_to]
-                    - dem[pr_nb_from:pr_nb_to, pc_nb_from:pc_nb_to]
-                )
-                prev_slope = prev_drop / d8_dist[prev_idx]
-
-                # Intersect avec la fenêtre actuelle
-                # Trop complexe avec les fenêtres variables → approche alternative
-
-            # Simplification : boucle pixel serait trop lente.
-            # → Approche vectorisée en 2 passes.
-            pass
-
-        # ── Approche alternative optimisée : D8 vectorisé ──
-        # Réinitialisation
-        flow_dir = np.full((ny, nx), -1, dtype=np.int8)
-        max_slope = np.full((ny, nx), 0.0, dtype=np.float32)
-
-        # Padding du DEM pour accès voisins sans bounds check
-        dem_pad = np.pad(dem, 1, mode="edge")
-
-        for idx, (dr, dc) in enumerate(d8_offsets):
-            # Voisin dans le DEM paddé
-            nb = dem_pad[1 + dr : ny + 1 + dr, 1 + dc : nx + 1 + dc]
-            drop = dem - nb
-            slope_nb = drop / d8_dist[idx]
-
-            # Mise à jour : garder la direction avec la plus forte pente
-            better = slope_nb > max_slope
-            flow_dir[better] = idx
-            max_slope[better] = slope_nb[better]
-
-        # Cellules sans écoulement (puits) : marquer comme -1
-        flow_dir[max_slope <= 0] = -1
-
-        # ── 3. Aire drainée par accumulation D8 ──
-        # Tri topologique par altitude décroissante
-        flat_idx = np.argsort(dem.ravel())[::-1]  # du plus haut au plus bas
-        acc = np.ones((ny, nx), dtype=np.float64) * cell_area
-
-        for pixel in flat_idx:
-            r = pixel // nx
-            c = pixel % nx
-            d = flow_dir[r, c]
-            if d < 0:
-                continue
-            dr, dc = d8_offsets[d]
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < ny and 0 <= nc < nx:
-                acc[nr, nc] += acc[r, c]
-
-        # ── 4. Aire drainée spécifique ──
-        specific_area = acc / cell_size  # m²/m = m
-
-        # ── 5. TWI = ln(a / tan(β)) ──
-        tan_beta = np.tan(slope_rad)
-        # Clip pour éviter log(0) ou log(négatif)
-        ratio = np.maximum(specific_area / tan_beta, 1e-6)
-        twi: np.ndarray = np.log(ratio).astype(np.float32)
-
-        return twi
 
     # ═══════════════════════════════════════════════════════
     #  SCORES TERRAIN
@@ -625,6 +674,8 @@ class GridBuilder:
         """
         Score d'altitude — v2.2.0 : optimal 200-600m, bonus à 350m.
         """
+        if self._skip_zero_weight("altitude"):
+            return self
         self._require_terrain()
         _alt = self.altitude
         assert _alt is not None
@@ -680,6 +731,8 @@ class GridBuilder:
          40–50°  très raide  → 0.15 → 0.0
            >50°  éliminatoire → 0.0
         """
+        if self._skip_zero_weight("slope"):
+            return self        
         self._require_terrain()
         _slope = self.slope
         assert _slope is not None
@@ -720,6 +773,9 @@ class GridBuilder:
     
     def score_terrain_roughness(self) -> GridBuilder:
         """Score de rugosité terrain — pénalise les zones accidentées."""
+
+        if self._skip_zero_weight("terrain_roughness"):
+            return self        
         self._require_terrain()
         _rough = self.roughness
         assert _rough is not None
@@ -744,6 +800,8 @@ class GridBuilder:
 
     def score_aspect(self) -> GridBuilder:
         """Score d'exposition — fonction continue sinusoïdale."""
+        if self._skip_zero_weight("aspect"):
+            return self        
         self._require_terrain()
 
         _aspect_val = self.aspect
@@ -772,6 +830,8 @@ class GridBuilder:
 
     def score_twi(self) -> GridBuilder:
         """Score TWI — courbe contrastée avec plateau optimal marqué."""
+        if self._skip_zero_weight("twi"):
+            return self        
         self._require_terrain()
         _twi = self.twi
         assert _twi is not None
@@ -788,62 +848,70 @@ class GridBuilder:
         score = np.full_like(twi_arr, np.nan, dtype=np.float32)
         valid = np.isfinite(twi_arr)
 
-        # --- Plateau optimal [opt_lo, opt_hi] → 1.0 ---
-        m_opt = valid & (twi_arr >= opt_lo) & (twi_arr <= opt_hi)
-        score[m_opt] = 1.0
+        if not np.any(valid):
+            self.scores["twi"] = score
+            self.score_confidence["twi"] = 0.0
+            return self
 
-        # --- Zone sèche : dry_limit → opt_lo ---
-        # Concave (exposant < 1) : remonte vite depuis dry_floor
-        m_dry_mid = valid & (twi_arr >= dry_limit) & (twi_arr < opt_lo)
+        # ── Early-out : extraire uniquement les valeurs valides ──
+        twi_v = twi_arr[valid]
+        score_v = np.empty(twi_v.shape, dtype=np.float32)
+
+        # Plateau optimal [opt_lo, opt_hi] → 1.0
+        m_opt = (twi_v >= opt_lo) & (twi_v <= opt_hi)
+        score_v[m_opt] = 1.0
+
+        # Zone sèche : dry_limit → opt_lo (concave)
+        m_dry_mid = (twi_v >= dry_limit) & (twi_v < opt_lo)
         if np.any(m_dry_mid):
-            t = (twi_arr[m_dry_mid] - dry_limit) / (opt_lo - dry_limit)
-            score[m_dry_mid] = dry_floor + (1.0 - dry_floor) * t**0.6
+            t = (twi_v[m_dry_mid] - dry_limit) / (opt_lo - dry_limit)
+            score_v[m_dry_mid] = dry_floor + (1.0 - dry_floor) * t**0.6
 
-        # --- Zone très sèche : < dry_limit → dry_floor
-        m_very_dry = valid & (twi_arr < dry_limit)
-        score[m_very_dry] = dry_floor
+        # Très sec : < dry_limit → dry_floor
+        m_very_dry = twi_v < dry_limit
+        score_v[m_very_dry] = dry_floor
 
-        # --- Zone humide : opt_hi → wet_limit ---
-        # Convexe (exposant > 1) : descend doucement puis accélère
-        m_wet_mid = valid & (twi_arr > opt_hi) & (twi_arr <= wet_limit)
+        # Zone humide : opt_hi → wet_limit (convexe)
+        m_wet_mid = (twi_v > opt_hi) & (twi_v <= wet_limit)
         if np.any(m_wet_mid):
-            t = (twi_arr[m_wet_mid] - opt_hi) / (wet_limit - opt_hi)
-            score[m_wet_mid] = 1.0 - (1.0 - wet_floor) * t**1.5
+            t = (twi_v[m_wet_mid] - opt_hi) / (wet_limit - opt_hi)
+            score_v[m_wet_mid] = 1.0 - (1.0 - wet_floor) * t**1.5
 
-        # --- Zone très humide : wet_limit → waterlog ---
-        m_wet_high = valid & (twi_arr > wet_limit) & (twi_arr <= waterlog)
+        # Très humide : wet_limit → waterlog
+        m_wet_high = (twi_v > wet_limit) & (twi_v <= waterlog)
         if np.any(m_wet_high):
-            t = (twi_arr[m_wet_high] - wet_limit) / (waterlog - wet_limit)
-            score[m_wet_high] = wet_floor * (1.0 - t)
+            t = (twi_v[m_wet_high] - wet_limit) / (waterlog - wet_limit)
+            score_v[m_wet_high] = wet_floor * (1.0 - t)
 
-        # --- Engorgement : > waterlog → 0.0 ---
-        m_waterlog = valid & (twi_arr > waterlog)
-        score[m_waterlog] = 0.0
+        # Engorgement : > waterlog → 0.0
+        m_waterlog = twi_v > waterlog
+        score_v[m_waterlog] = 0.0
 
-        score = self._apply_nodata(np.clip(score, 0, 1))
+        np.clip(score_v, 0, 1, out=score_v)
+        score[valid] = score_v
+
+        score = self._apply_nodata(score)
         self.scores["twi"] = score
         self.score_confidence["twi"] = 0.85
         self._log_score_stats("twi", score)
 
-        # --- Stats distribution pour diagnostic ---
-        if valid.any():
-            twi_valid = twi_arr[valid]
-            logger.info(
-                "  TWI distribution — min=%.1f  med=%.1f  max=%.1f  "
-                "dry(<%.0f)=%d  optimal(%s–%s)=%d  wet(>%.0f)=%d  waterlog(>%.0f)=%d",
-                float(np.nanmin(twi_valid)),
-                float(np.nanmedian(twi_valid)),
-                float(np.nanmax(twi_valid)),
-                dry_limit,
-                int(np.sum(m_very_dry)),
-                opt_lo,
-                opt_hi,
-                int(np.sum(m_opt)),
-                wet_limit,
-                int(np.sum(m_wet_mid)) + int(np.sum(m_wet_high)),
-                waterlog,
-                int(np.sum(m_waterlog)),
-            )
+        # Stats distribution
+        logger.info(
+            "  TWI distribution — min=%.1f  med=%.1f  max=%.1f  "
+            "dry(<%.0f)=%d  optimal(%s–%s)=%d  "
+            "wet(>%.0f)=%d  waterlog(>%.0f)=%d",
+            float(np.min(twi_v)),
+            float(np.median(twi_v)),
+            float(np.max(twi_v)),
+            dry_limit,
+            int(np.sum(m_very_dry)),
+            opt_lo, opt_hi,
+            int(np.sum(m_opt)),
+            wet_limit,
+            int(np.sum(m_wet_mid)) + int(np.sum(m_wet_high)),
+            waterlog,
+            int(np.sum(m_waterlog)),
+        )
 
         return self
 
@@ -859,6 +927,8 @@ class GridBuilder:
         self, hydro_gdf: gpd.GeoDataFrame | None
     ) -> GridBuilder:
         """Score de distance aux cours d'eau et plans d'eau."""
+        if self._skip_zero_weight("dist_water"):
+            return self        
         self._require_terrain()
 
         if hydro_gdf is None or hydro_gdf.empty:
@@ -914,9 +984,7 @@ class GridBuilder:
 
         # Distance euclidienne en mètres (EDT)
         dist_grid: np.ndarray = (
-            np.asarray(distance_transform_edt(~self.water_mask)).astype(
-                np.float32
-            )
+            _accel.distance_transform_edt(~self.water_mask)
             * self.cell_size
         )
         self.dist_water_grid = dist_grid
@@ -1038,182 +1106,161 @@ class GridBuilder:
         return result
 
     def score_tree_species(
-        self, forest_gdf: gpd.GeoDataFrame | None
+        self, forest_gdf: gpd.GeoDataFrame | None,
     ) -> GridBuilder:
-        """Score des essences forestières."""
-        self._require_terrain()
+        """
+        Score essences forestières — raster int-codé + lookup vectorisé.
 
-        if forest_gdf is None or forest_gdf.empty:
-            logger.warning(
-                "⚠️ Pas de données forêt → score %.2f", FILL_NO_FOREST
-            )
-            self.scores["tree_species"] = np.full(
-                (self.ny, self.nx), FILL_NO_FOREST, dtype=np.float32
-            )
-            self.forest_mask = np.zeros((self.ny, self.nx), dtype=bool)
-            self.score_confidence["tree_species"] = 0.0
+        Rasterise les polygones forestiers en raster int16 catégoriel via
+        parallel_rasterize_categorical (bandes parallèles + cache disque),
+        puis convertit en scores [0,1] par np.take sur lookup code→score.
+
+        Le tri par score croissant garantit que la meilleure essence
+        prévaut en cas de chevauchement de polygones (last wins).
+        """
+        name = "tree_species"
+        if self._skip_zero_weight(name):
             return self
 
-        forest_gdf = self._ensure_l93(forest_gdf)
+        if forest_gdf is None or forest_gdf.empty:
+            self.scores[name] = np.full(
+                (self.ny, self.nx), 0.5, dtype=np.float32,
+            )
+            self.score_confidence[name] = 0.0
+            logger.info("⏭️  Score %-20s : pas de données forêt", name)
+            return self
 
-        # ── Résoudre les scores si pas pré-calculés ──
-        gdf = forest_gdf.copy()
+        self._require_terrain()
 
-        if "tree_score" not in gdf.columns:
-            if "essence_canonical" in gdf.columns:
-                gdf["tree_score"] = gdf["essence_canonical"].apply(
-                    lambda c: TREE_SCORES.get(c, TREE_SCORES["unknown"])
-                )
-            elif "ESSENCE" in gdf.columns:
-                gdf["tree_score"] = gdf["ESSENCE"].apply(get_tree_score)
-            else:
-                gdf["tree_score"] = self._score_from_any_column(
-                    gdf,
-                    get_tree_score,
-                    [
-                        "ESSENCE",
-                        "TFV",
-                        "TFVF",
-                        "essence",
-                        "tfv",
-                        "NOM_TYPN",
-                        "LIB_TFV",
-                        "libelle",
-                    ],
-                )
+        # ── Identifier la colonne essence ──────────────────────────
+        col: str | None = None
+        for candidate in (
+            "essence", "ESSENCE", "LIBELLE", "lib_frt", "CODE_TFV",
+        ):
+            if candidate in forest_gdf.columns:
+                col = candidate
+                break
 
-        # ── Rasteriser avec max ──
-        shapes_scores: list[tuple[Any, float]] = [
-            (geom, float(sc))
-            for geom, sc in zip(gdf.geometry, gdf["tree_score"])
-            if geom is not None and not geom.is_empty
-        ]
+        if col is None:
+            self.scores[name] = np.full(
+                (self.ny, self.nx), 0.5, dtype=np.float32,
+            )
+            self.score_confidence[name] = 0.0
+            logger.warning(
+                "⚠️  Score %-20s : aucune colonne essence trouvée", name,
+            )
+            return self
 
-        tree_raster: np.ndarray = self._rasterize_max(
-            shapes_scores,
-            fill=FILL_NO_FOREST,
-            all_touched=True,
+        # ── Préparer GDF (CRS + géom valides) ─────────────────────
+        gdf = self._ensure_l93(forest_gdf)
+        valid_mask = (
+            gdf.geometry.notna()
+            & gdf.geometry.is_valid
+            & (~gdf.geometry.is_empty)
         )
-        self.tree_raster = tree_raster
+        gdf = gdf.loc[valid_mask].copy()
 
-        # Masque forêt (P5 : np.asarray autour de rasterize)
-        forest_presence: list[tuple[Any, int]] = [
-            (geom, 1)
-            for geom in gdf.geometry
-            if geom is not None and not geom.is_empty
-        ]
-        if forest_presence:
-            fm: np.ndarray = np.asarray(rasterize(
-                forest_presence,
+        if gdf.empty:
+            self.scores[name] = np.full(
+                (self.ny, self.nx), 0.5, dtype=np.float32,
+            )
+            self.score_confidence[name] = 0.0
+            logger.warning(
+                "⚠️  Score %-20s : 0 géom valides après filtrage", name,
+            )
+            return self
+
+        # ── Résolution essences (vectorisé par unique) ─────────────
+        raw_unique = gdf[col].unique()
+        resolve_map: dict[Any, str] = {
+            r: config.resolve_tree_name(r) for r in raw_unique
+        }
+        gdf["_essence_canon"] = gdf[col].map(resolve_map)
+
+        unique_essences: list[str] = sorted(gdf["_essence_canon"].unique())
+        essence_to_code: dict[str, int] = {
+            e: i + 1 for i, e in enumerate(unique_essences)
+        }
+        code_to_essence: dict[int, str] = {
+            v: k for k, v in essence_to_code.items()
+        }
+
+        # ── Lookup table code → score ─────────────────────────────
+        max_code = max(essence_to_code.values()) + 1
+        lookup = np.full(max_code, 0.5, dtype=np.float32)
+        for ess, code in essence_to_code.items():
+            lookup[code] = config.get_tree_score(ess)
+        lookup[0] = 0.5  # nodata = neutre
+
+        logger.debug(
+            "   tree_species : %d essences uniques, %d géom, col=%s",
+            len(unique_essences), len(gdf), col,
+        )
+
+        # ── Assign codes + tri score croissant (best wins last) ───
+        gdf["_burn_code"] = (
+            gdf["_essence_canon"].map(essence_to_code).astype(np.int16)
+        )
+        gdf["_burn_score"] = np.take(
+            lookup,
+            np.asarray(gdf["_burn_code"].values, dtype=np.int16),
+        )
+        gdf = gdf.sort_values(
+            "_burn_score", ascending=True,
+        ).reset_index(drop=True)
+
+        geometries: list[Any] = gdf.geometry.tolist()
+        codes = np.asarray(gdf["_burn_code"].values, dtype=np.int16)
+
+        # ── Cache (hash du mapping score → invalidation auto) ─────
+        import hashlib
+
+        lookup_hash = hashlib.md5(
+            lookup.tobytes(), usedforsecurity=False,
+        ).hexdigest()[:8]
+        cache_path = _accel.raster_cache_path(
+            "tree_species",
+            f"{col}_{lookup_hash}",
+            len(geometries),
+            self.cell_size,
+            (self.ny, self.nx),
+        )
+        cached = _accel.raster_cache_load(cache_path)
+
+        if cached is not None:
+            int_raster = np.asarray(cached, dtype=np.int16)
+            logger.info(
+                "✅ Score %-20s : cache disque (%s)",
+                name, cache_path.name,
+            )
+        else:
+            int_raster = _accel.parallel_rasterize_categorical(
+                geometries=geometries,
+                category_codes=codes,
                 out_shape=(self.ny, self.nx),
                 transform=self.transform,
-                fill=0,
-                dtype=np.uint8,
                 all_touched=True,
-            ))
-            self.forest_mask = fm.astype(bool)
-        else:
-            self.forest_mask = np.zeros((self.ny, self.nx), dtype=bool)
-
-        score = self._apply_nodata(tree_raster.copy())
-        self.scores["tree_species"] = score
-
-        # ── Fix #17 : Masque éliminatoire explicite (essences) ──────
-        elim_species: set[str] = set(
-            getattr(config, "ELIMINATORY_SPECIES", set())
-        )
-        if elim_species and "essence_canonical" in gdf.columns:
-            elim_shapes: list[tuple[Any, int]] = [
-                (geom, 1)
-                for geom, ess in zip(gdf.geometry, gdf["essence_canonical"])
-                if geom is not None
-                and not geom.is_empty
-                and str(ess) in elim_species
-            ]
-            if elim_shapes:
-                self.eliminatory_species_mask = np.asarray(rasterize(
-                    elim_shapes,
-                    out_shape=(self.ny, self.nx),
-                    transform=self.transform,
-                    fill=0,
-                    dtype=np.uint8,
-                    all_touched=True,
-                )).astype(bool)
-                logger.info(
-                    "   Masque éliminatoire essences : %d cellules (%s)",
-                    int(self.eliminatory_species_mask.sum()),
-                    ", ".join(sorted(elim_species)),
-                )
-        # ── Fix #26 : Raster catégoriel pour hotspot enrichment ──────
-        if "essence_canonical" in gdf.columns:
-            _cats = sorted(
-                c for c in gdf["essence_canonical"].dropna().unique()
-                if isinstance(c, str)
+                nodata=0,
             )
-            _cat_to_int: dict[str, int] = {
-                c: i + 1 for i, c in enumerate(_cats)
-            }
-            self._int_to_essence_canonical: dict[int, str] = {
-                v: k for k, v in _cat_to_int.items()
-            }
-            _cat_shapes: list[tuple[Any, int]] = [
-                (geom, _cat_to_int[str(ess)])
-                for geom, ess in zip(
-                    gdf.geometry, gdf["essence_canonical"], strict=False,
-                )
-                if geom is not None
-                and not geom.is_empty
-                and str(ess) in _cat_to_int
-            ]
-            if _cat_shapes:
-                self._raster_essence_canonical: np.ndarray = np.asarray(
-                    rasterize(
-                        _cat_shapes,
-                        out_shape=(self.ny, self.nx),
-                        transform=self.transform,
-                        fill=0,
-                        dtype=np.int16,
-                        all_touched=True,
-                    )
-                )
-                logger.debug(
-                    "   Raster catégoriel essences : %d catégories",
-                    len(_cats),
-                )
-        # Confiance
-        source = (
-            str(gdf["source"].iloc[0]) if "source" in gdf.columns else "unknown"
+            _accel.raster_cache_save(cache_path, int_raster)
+
+        # ── Code → score vectorisé ────────────────────────────────
+        safe_codes = np.clip(int_raster, 0, max_code - 1)
+        score = np.take(lookup, safe_codes).astype(np.float32)
+        score = np.clip(score, 0.0, 1.0)
+
+        # ── Stocker résultats + métadonnées aval ──────────────────
+        self._tree_species_int_raster = int_raster
+        self._tree_code_to_name = code_to_essence
+        self._tree_score_lookup = lookup
+
+        self.scores[name] = score
+        coverage = float(np.count_nonzero(int_raster > 0)) / max(
+            int_raster.size, 1,
         )
+        self.score_confidence[name] = min(coverage, 1.0)
 
-        if "essence_canonical" in gdf.columns:
-            n_unknown = int((gdf["essence_canonical"] == "unknown").sum())
-        else:
-            n_unknown = len(gdf)
-        pct_unknown = n_unknown / len(gdf) * 100 if len(gdf) > 0 else 100
-
-        self.score_confidence["tree_species"] = {
-            "wfs_ign": 0.9,
-            "osm": 0.5,
-            "synthetic": 0.3,
-            "file": 0.8,
-        }.get(source, 0.5)
-
-        if pct_unknown > 50:
-            self.score_confidence["tree_species"] *= 0.5
-            logger.warning(
-                "⚠️ %.0f%% des polygones forestiers sans essence connue",
-                pct_unknown,
-            )
-
-        _fm_val = self.forest_mask
-        _fm_sum = float(_fm_val.sum()) if _fm_val is not None else 0.0
-        _fm_size = _fm_val.size if _fm_val is not None else 1
-        logger.info(
-            "   Forêt : %d polygones, %.0f%% de couverture",
-            len(gdf),
-            _fm_sum / _fm_size * 100,
-        )
-        self._log_score_stats("tree_species", score)
+        self._log_score_stats(name, score)
         return self
 
     def _score_from_any_column(
@@ -1254,137 +1301,178 @@ class GridBuilder:
         return best
 
     def score_geology(
-        self, geology_gdf: gpd.GeoDataFrame | None
+        self, geology_gdf: gpd.GeoDataFrame | None,
     ) -> GridBuilder:
-        """Score géologique."""
-        self._require_terrain()
+        """
+        Score géologie — raster int-codé + lookup vectorisé.
 
-        if geology_gdf is None or geology_gdf.empty:
-            logger.warning(
-                "⚠️ Pas de données géologie → score %.2f", FILL_NO_GEOLOGY
-            )
-            self.scores["geology"] = np.full(
-                (self.ny, self.nx), FILL_NO_GEOLOGY, dtype=np.float32
-            )
-            self.score_confidence["geology"] = 0.0
+        Rasterise les polygones géologiques en raster int16 catégoriel via
+        parallel_rasterize_categorical (bandes parallèles + cache disque),
+        puis convertit en scores [0,1] par np.take sur lookup code→score.
+
+        Résolution : DESCR prioritaire sur NOTATION (D2).
+        Le tri par score croissant garantit que la meilleure catégorie
+        prévaut en cas de chevauchement (last wins).
+        """
+        name = "geology"
+        if self._skip_zero_weight(name):
             return self
 
-        geology_gdf = self._ensure_l93(geology_gdf)
-        gdf = geology_gdf.copy()
-
-        # ── Résoudre les scores si pas pré-calculés ──
-        if "geology_score" not in gdf.columns:
-            if "geology_canonical" in gdf.columns:
-                gdf["geology_score"] = gdf["geology_canonical"].apply(
-                    lambda c: GEOLOGY_SCORES.get(
-                        c, GEOLOGY_SCORES["unknown"]
-                    )
-                )
-            elif "LITHO" in gdf.columns:
-                gdf["geology_score"] = gdf["LITHO"].apply(get_geology_score)
-            else:
-                gdf["geology_score"] = self._score_geology_from_any_column(gdf)
-
-        # ── Rasteriser avec max ──
-        shapes_scores: list[tuple[Any, float]] = [
-            (geom, float(sc))
-            for geom, sc in zip(gdf.geometry, gdf["geology_score"])
-            if geom is not None and not geom.is_empty
-        ]
-
-        geology_raster: np.ndarray = self._rasterize_max(
-            shapes_scores,
-            fill=FILL_NO_GEOLOGY,
-            all_touched=True,
-        )
-        self.geology_raster = geology_raster
-
-        score = self._apply_nodata(geology_raster.copy())
-        self.scores["geology"] = score
-
-        # ── Fix #17 : Masque éliminatoire explicite (géologie) ──────
-        elim_geology: set[str] = set(
-            getattr(config, "ELIMINATORY_GEOLOGY", set())
-        )
-        if elim_geology and "geology_canonical" in gdf.columns:
-            elim_shapes: list[tuple[Any, int]] = [
-                (geom, 1)
-                for geom, geo in zip(gdf.geometry, gdf["geology_canonical"])
-                if geom is not None
-                and not geom.is_empty
-                and str(geo) in elim_geology
-            ]
-            if elim_shapes:
-                self.eliminatory_geology_mask = np.asarray(rasterize(
-                    elim_shapes,
-                    out_shape=(self.ny, self.nx),
-                    transform=self.transform,
-                    fill=0,
-                    dtype=np.uint8,
-                    all_touched=True,
-                )).astype(bool)
-                logger.info(
-                    "   Masque éliminatoire géologie : %d cellules (%s)",
-                    int(self.eliminatory_geology_mask.sum()),
-                    ", ".join(sorted(elim_geology)),
-                )
-        # ── Fix #26 : Raster catégoriel pour hotspot enrichment ──────
-        if "geology_canonical" in gdf.columns:
-            _gcats = sorted(
-                c for c in gdf["geology_canonical"].dropna().unique()
-                if isinstance(c, str)
+        if geology_gdf is None or geology_gdf.empty:
+            self.scores[name] = np.full(
+                (self.ny, self.nx), 0.5, dtype=np.float32,
             )
-            _gcat_to_int: dict[str, int] = {
-                c: i + 1 for i, c in enumerate(_gcats)
-            }
-            self._int_to_geology_canonical: dict[int, str] = {
-                v: k for k, v in _gcat_to_int.items()
-            }
-            _gcat_shapes: list[tuple[Any, int]] = [
-                (geom, _gcat_to_int[str(geo)])
-                for geom, geo in zip(
-                    gdf.geometry, gdf["geology_canonical"], strict=False,
-                )
-                if geom is not None
-                and not geom.is_empty
-                and str(geo) in _gcat_to_int
-            ]
-            if _gcat_shapes:
-                self._raster_geology_canonical: np.ndarray = np.asarray(
-                    rasterize(
-                        _gcat_shapes,
-                        out_shape=(self.ny, self.nx),
-                        transform=self.transform,
-                        fill=0,
-                        dtype=np.int16,
-                        all_touched=True,
-                    )
-                )
-                logger.debug(
-                    "   Raster catégoriel géologie : %d catégories",
-                    len(_gcats),
-                )
+            self.score_confidence[name] = 0.0
+            logger.info("⏭️  Score %-20s : pas de données géologie", name)
+            return self
 
-        # Confiance
-        source = (
-            str(gdf["source"].iloc[0]) if "source" in gdf.columns else "unknown"
+        self._require_terrain()
+
+        # ── Identifier la colonne — DESCR prioritaire (D2) ────────
+        col: str | None = None
+        for candidate in (
+            "DESCR", "descr", "DESCRIPTION", "description",
+            "NOTATION", "notation", "CODE", "code",
+        ):
+            if candidate in geology_gdf.columns:
+                col = candidate
+                break
+
+        if col is None:
+            self.scores[name] = np.full(
+                (self.ny, self.nx), 0.5, dtype=np.float32,
+            )
+            self.score_confidence[name] = 0.0
+            logger.warning(
+                "⚠️  Score %-20s : aucune colonne géologie trouvée", name,
+            )
+            return self
+
+        # ── Préparer GDF (CRS + géom valides) ─────────────────────
+        gdf = self._ensure_l93(geology_gdf)
+        valid_mask = (
+            gdf.geometry.notna()
+            & gdf.geometry.is_valid
+            & (~gdf.geometry.is_empty)
         )
-        self.score_confidence["geology"] = {
-            "wfs_brgm": 0.9,
-            "osm": 0.4,
-            "synthetic": 0.3,
-            "file": 0.8,
-        }.get(source, 0.5)
+        gdf = gdf.loc[valid_mask].copy()
 
-        logger.info("   Géologie : %d polygones", len(gdf))
-        if "geology_canonical" in gdf.columns:
-            for cat, cnt in (
-                gdf["geology_canonical"].value_counts().head(5).items()
-            ):
-                logger.debug("     • %s: %d", cat, cnt)
-        self._log_score_stats("geology", score)
+        if gdf.empty:
+            self.scores[name] = np.full(
+                (self.ny, self.nx), 0.5, dtype=np.float32,
+            )
+            self.score_confidence[name] = 0.0
+            logger.warning(
+                "⚠️  Score %-20s : 0 géom valides après filtrage", name,
+            )
+            return self
+
+        # ── Résolution catégories géologiques (vectorisé) ──────────
+        raw_unique = gdf[col].unique()
+        resolve_map: dict[Any, str] = {
+            r: config.resolve_geology(r) for r in raw_unique
+        }
+        gdf["_geo_category"] = gdf[col].map(resolve_map)
+
+        unique_cats: list[str] = sorted(gdf["_geo_category"].unique())
+        cat_to_code: dict[str, int] = {
+            c: i + 1 for i, c in enumerate(unique_cats)
+        }
+        code_to_cat: dict[int, str] = {
+            v: k for k, v in cat_to_code.items()
+        }
+
+        # ── Lookup table code → score ─────────────────────────────
+        max_code = max(cat_to_code.values()) + 1
+        lookup = np.full(max_code, 0.5, dtype=np.float32)
+        for cat, code in cat_to_code.items():
+            lookup[code] = config.get_geology_score(cat)
+        lookup[0] = 0.5  # nodata = neutre
+
+        # ── Masque éliminatoire (codes granite/gneiss/siliceux) ────
+        eliminatory_codes: frozenset[int] = frozenset(
+            cat_to_code[cat]
+            for cat in unique_cats
+            if cat in config.ELIMINATORY_GEOLOGY
+        )
+
+        logger.debug(
+            "   geology : %d catégories uniques, %d géom, col=%s, "
+            "%d éliminatoires (%s)",
+            len(unique_cats), len(gdf), col,
+            len(eliminatory_codes),
+            ", ".join(
+                code_to_cat[c] for c in sorted(eliminatory_codes)
+            ) or "aucune",
+        )
+
+        # ── Assign codes + tri score croissant (best wins last) ───
+        gdf["_burn_code"] = (
+            gdf["_geo_category"].map(cat_to_code).astype(np.int16)
+        )
+        gdf["_burn_score"] = np.take(
+            lookup,
+            np.asarray(gdf["_burn_code"].values, dtype=np.int16),
+        )
+        gdf = gdf.sort_values(
+            "_burn_score", ascending=True,
+        ).reset_index(drop=True)
+
+        geometries: list[Any] = gdf.geometry.tolist()
+        codes = np.asarray(gdf["_burn_code"].values, dtype=np.int16)
+
+        # ── Cache (hash du mapping score → invalidation auto) ─────
+        import hashlib
+
+        lookup_hash = hashlib.md5(
+            lookup.tobytes(), usedforsecurity=False,
+        ).hexdigest()[:8]
+        cache_path = _accel.raster_cache_path(
+            "geology_cat",
+            f"{col}_{lookup_hash}",
+            len(geometries),
+            self.cell_size,
+            (self.ny, self.nx),
+        )
+        cached = _accel.raster_cache_load(cache_path)
+
+        if cached is not None:
+            int_raster = np.asarray(cached, dtype=np.int16)
+            logger.info(
+                "✅ Score %-20s : cache disque (%s)",
+                name, cache_path.name,
+            )
+        else:
+            int_raster = _accel.parallel_rasterize_categorical(
+                geometries=geometries,
+                category_codes=codes,
+                out_shape=(self.ny, self.nx),
+                transform=self.transform,
+                all_touched=True,
+                nodata=0,
+            )
+            _accel.raster_cache_save(cache_path, int_raster)
+
+        # ── Code → score vectorisé ────────────────────────────────
+        safe_codes = np.clip(int_raster, 0, max_code - 1)
+        score = np.take(lookup, safe_codes).astype(np.float32)
+        score = np.clip(score, 0.0, 1.0)
+
+        # ── Stocker résultats + métadonnées aval ──────────────────
+        self._geology_int_raster = int_raster
+        self._geology_code_to_name = code_to_cat
+        self._geology_score_lookup = lookup
+        self._geology_eliminatory_codes = eliminatory_codes
+
+        self.scores[name] = score
+        coverage = float(np.count_nonzero(int_raster > 0)) / max(
+            int_raster.size, 1,
+        )
+        self.score_confidence[name] = min(coverage, 1.0)
+
+        self._log_score_stats(name, score)
         return self
-
+        
     def _score_geology_from_any_column(
         self, gdf: gpd.GeoDataFrame
     ) -> np.ndarray:
@@ -1421,7 +1509,9 @@ class GridBuilder:
     def score_canopy_openness(
         self, canopy_data: np.ndarray | None = None
     ) -> GridBuilder:
-        """Score d'ouverture de la canopée."""
+        """Score d'ouverture de la canopée — v2.3.6."""
+        if self._skip_zero_weight("canopy_openness"):
+            return self        
         self._require_terrain()
 
         if canopy_data is not None:
@@ -1438,7 +1528,7 @@ class GridBuilder:
             self.score_confidence["canopy_openness"] = 0.9
         elif self.forest_mask is not None and self.forest_mask.any():
             score = self._estimate_canopy_from_edges()
-            self.score_confidence["canopy_openness"] = 0.4
+            self.score_confidence["canopy_openness"] = 0.5
         else:
             score = np.full(
                 (self.ny, self.nx), _CANOPY_OPEN_FIELD, dtype=np.float32
@@ -1452,15 +1542,16 @@ class GridBuilder:
 
     def _estimate_canopy_from_edges(self) -> np.ndarray:
         """
-        Estime l'ouverture de canopée — v2.3.0.
+        Estime l'ouverture de canopée — v2.3.6.
 
         Fix #7  : terrain ouvert → _CANOPY_OPEN_FIELD (0.10)
         Fix #14 : transition continue 0.70 → 0.10 (plus de saut à 30m)
+        v2.3.6  : corrélation pente/altitude/essences — corrige biais plaine.
 
         Logique :
-          - Intérieur forêt dense (>20m des lisières) : 0.55
-          - Lisière forêt (<30m du bord, côté intérieur) : 0.90→0.55
-          - Juste hors forêt (<30m du bord) : 0.70→0.10 (transition continue)
+          - Intérieur forêt : base 0.45 + bonus pente/altitude/essences
+          - Lisière forêt (<30m du bord, côté intérieur) : 0.90 → base
+          - Juste hors forêt (<30m du bord) : 0.70 → 0.10 (transition)
           - Terrain ouvert (>30m de toute forêt) : 0.10
         """
         _fm_val = self.forest_mask
@@ -1472,7 +1563,39 @@ class GridBuilder:
                 (self.ny, self.nx), _CANOPY_OPEN_FIELD, dtype=np.float32
             )
 
-        # Lisière = bordure intérieure de la forêt
+        # ── Base intérieure dynamique (v2.3.6) ──
+        interior_base = np.full(
+            (self.ny, self.nx), _CANOPY_BASE_INTERIOR, dtype=np.float32
+        )
+
+        # Bonus pente 10-30° : trouées naturelles par la topographie
+        _slope = self.slope
+        if _slope is not None:
+            moderate_slope = (_slope >= 10.0) & (_slope <= 30.0) & _fm
+            if moderate_slope.any():
+                interior_base[moderate_slope] += _CANOPY_SLOPE_BONUS
+
+        # Bonus altitude 300-800m : structure forestière montagnarde
+        _alt = self.altitude
+        if _alt is not None:
+            alt_bonus_mask = (_alt >= 300.0) & (_alt <= 800.0) & _fm
+            if alt_bonus_mask.any():
+                interior_base[alt_bonus_mask] += _CANOPY_ALT_BONUS
+
+        # Bonus essences favorables (score enrichi > 0.40)
+        ts = self.scores.get("tree_species")
+        if (
+            ts is not None
+            and isinstance(ts, np.ndarray)
+            and ts.shape == _fm.shape
+        ):
+            good_species = (ts > 0.40) & _fm
+            if good_species.any():
+                interior_base[good_species] += _CANOPY_SPECIES_BONUS
+
+        interior_base = np.clip(interior_base, 0.0, 0.90)
+
+        # ── Lisière = bordure intérieure de la forêt ──
         eroded: np.ndarray = np.asarray(
             binary_erosion(
                 _fm,
@@ -1483,13 +1606,13 @@ class GridBuilder:
 
         # Distance au pixel forêt le plus proche (pour hors-forêt)
         dist_to_forest: np.ndarray = (
-            np.asarray(distance_transform_edt(~_fm)).astype(np.float32)
+            _accel.distance_transform_edt(~_fm)
             * self.cell_size
         )
 
         # Distance à la lisière (pour intérieur forêt)
         dist_to_edge: np.ndarray = (
-            np.asarray(distance_transform_edt(~edge_mask)).astype(np.float32)
+            _accel.distance_transform_edt(~edge_mask)
             * self.cell_size
         )
 
@@ -1498,14 +1621,16 @@ class GridBuilder:
             (self.ny, self.nx), _CANOPY_OPEN_FIELD, dtype=np.float32
         )
 
-        # ── Intérieur forêt dense ──
-        score[_fm] = _CANOPY_FOREST_INTERIOR
+        # ── Intérieur forêt : base dynamique ──
+        score[_fm] = interior_base[_fm]
 
-        # ── Lisière intérieure (<30m du bord) : 0.90 → 0.55 ──
+        # ── Lisière intérieure (<30m du bord) : 0.90 → interior_base ──
         near_edge_in = _fm & (dist_to_edge < 30)
         if near_edge_in.any():
             t = dist_to_edge[near_edge_in] / 30.0
-            score[near_edge_in] = 0.90 - (0.90 - _CANOPY_FOREST_INTERIOR) * t
+            score[near_edge_in] = (
+                0.90 - (0.90 - interior_base[near_edge_in]) * t
+            )
 
         # ── Fix #14 : transition extérieure continue 0.70 → _CANOPY_OPEN_FIELD ──
         near_forest_out = (~_fm) & (dist_to_forest < 30)
@@ -1515,15 +1640,26 @@ class GridBuilder:
                 0.70 - (0.70 - _CANOPY_OPEN_FIELD) * t
             )
 
+        n_bonus = int(np.sum((interior_base > _CANOPY_BASE_INTERIOR) & _fm))
+        logger.debug(
+            "   Canopy terrain-corr : %d cellules bonifiées"
+            " (pente/alt/essences)",
+            n_bonus,
+        )
+
         return score
 
     def score_ground_cover(self) -> GridBuilder:
         """
-        Score de couverture au sol — v2.3.0.
+        Score de couverture au sol — v2.3.6.
 
         Fix #8  : bonus humidité uniquement en forêt, hors forêt → 0.20.
         Fix #16 : deep_forest ne pénalise plus les zones humides.
+        v2.3.6  : gradient altitudinal + bonus géologie calcaire + essences.
+                   Corrige biais plaine vs montagne.
         """
+        if self._skip_zero_weight("ground_cover"):
+            return self        
         self._require_terrain()
         _alt = self.altitude
         assert _alt is not None
@@ -1531,26 +1667,62 @@ class GridBuilder:
         _fm_val = self.forest_mask
         has_forest = _fm_val is not None and _fm_val.any()
 
-        # ── Défaut selon présence forêt ──
+        # ── Base : gradient altitudinal en forêt (v2.3.6) ──
         if has_forest:
             assert _fm_val is not None
             _fm: np.ndarray = _fm_val
-            # En forêt → 0.50 (litière mixte), hors forêt → 0.20 (herbe)
-            score = np.where(
-                _fm, 0.50, 0.20
-            ).astype(np.float32)
+
+            score = np.full((self.ny, self.nx), 0.20, dtype=np.float32)
+
+            in_f = _fm
+            score[in_f & (_alt < 200)] = 0.35
+            score[in_f & (_alt >= 200) & (_alt < 400)] = 0.50
+            score[in_f & (_alt >= 400) & (_alt < 700)] = 0.65
+            score[in_f & (_alt >= 700) & (_alt < 1000)] = 0.55
+            score[in_f & (_alt >= 1000)] = 0.40
+
+            # ── Bonus géologie calcaire : meilleur pH litière ──
+            geo = self.scores.get("geology")
+            if (
+                geo is not None
+                and isinstance(geo, np.ndarray)
+                and geo.shape == score.shape
+            ):
+                calc_bonus = (geo > 0.70) & _fm
+                if calc_bonus.any():
+                    score[calc_bonus] += 0.15
+                    logger.debug(
+                        "   Ground cover : +0.15 géologie calcaire"
+                        " → %d cellules",
+                        int(calc_bonus.sum()),
+                    )
+
+            # ── Bonus essences favorables ──
+            ts = self.scores.get("tree_species")
+            if (
+                ts is not None
+                and isinstance(ts, np.ndarray)
+                and ts.shape == score.shape
+            ):
+                good_sp = (ts > 0.40) & _fm
+                if good_sp.any():
+                    score[good_sp] += 0.10
+                    logger.debug(
+                        "   Ground cover : +0.10 essences favorables"
+                        " → %d cellules",
+                        int(good_sp.sum()),
+                    )
         else:
             score = np.full((self.ny, self.nx), 0.20, dtype=np.float32)
 
         # ── Bonus humidité : uniquement EN FORÊT près de l'eau ──
-        # On garde un masque des cellules humides pour le fix #16
         ideal_humid = np.zeros((self.ny, self.nx), dtype=bool)
 
         if self.dist_water_grid is not None and has_forest:
             assert _fm_val is not None
             _fm2: np.ndarray = _fm_val
 
-            # Trop humide (inondable)
+            # Trop humide (inondable) — basse altitude uniquement
             too_wet = (self.dist_water_grid < 10) & (_alt < 300) & _fm2
             score[too_wet] = 0.25
 
@@ -1558,12 +1730,11 @@ class GridBuilder:
             ideal_humid = (
                 (self.dist_water_grid >= 15)
                 & (self.dist_water_grid <= 80)
-                & (_alt < 600)
                 & _fm2
             )
-            score[ideal_humid] = 0.85
+            score[ideal_humid] += 0.10
 
-        # ── Fix #16 : Forêt profonde SÈCHE → malus (ne pénalise PAS la zone humide) ──
+        # ── Fix #16 : Forêt profonde SÈCHE → cap adaptatif ──
         if has_forest:
             assert _fm_val is not None
             _fm3: np.ndarray = _fm_val
@@ -1573,11 +1744,22 @@ class GridBuilder:
                     iterations=max(1, int(40.0 / self.cell_size)),
                 )
             )
-            # Seulement les cellules deep forest ET PAS en zone humide idéale
             deep_forest_dry = deep_forest & ~ideal_humid
-            score[deep_forest_dry] = np.minimum(
-                score[deep_forest_dry], 0.40
-            )
+
+            # v2.3.6 : cap plus haut si géologie favorable
+            cap = np.full((self.ny, self.nx), 0.45, dtype=np.float32)
+            geo = self.scores.get("geology")
+            if (
+                geo is not None
+                and isinstance(geo, np.ndarray)
+                and geo.shape == cap.shape
+            ):
+                cap[geo > 0.70] = 0.55
+
+            if deep_forest_dry.any():
+                score[deep_forest_dry] = np.minimum(
+                    score[deep_forest_dry], cap[deep_forest_dry]
+                )
 
         # ── Forte pente = sol instable ──
         _slope_val = self.slope
@@ -1588,7 +1770,7 @@ class GridBuilder:
 
         score = self._apply_nodata(np.clip(score, 0, 1))
         self.scores["ground_cover"] = score
-        self.score_confidence["ground_cover"] = 0.2
+        self.score_confidence["ground_cover"] = 0.3
         self._log_score_stats("ground_cover", score)
         return self
 
@@ -1596,11 +1778,16 @@ class GridBuilder:
         self, disturbance_data: np.ndarray | None = None
     ) -> GridBuilder:
         """
-        Score de perturbation du sol.
+        Score de perturbation du sol — v2.3.6.
+
+        v2.3.6 : bonus pente (chablis/exploitation) + bande altitudinale.
+                  Corrige biais plaine vs montagne.
 
         Note : le bonus proximité urbaine nécessite que apply_urban_mask()
         ait été appelé AVANT cette méthode (Fix #15 — corrigé dans main.py).
         """
+        if self._skip_zero_weight("disturbance"):
+            return self        
         self._require_terrain()
 
         if disturbance_data is not None:
@@ -1614,9 +1801,7 @@ class GridBuilder:
             edge_mask = _fm & ~eroded
 
             dist_to_edge: np.ndarray = (
-                np.asarray(distance_transform_edt(~edge_mask)).astype(
-                    np.float32
-                )
+                _accel.distance_transform_edt(~edge_mask)
                 * self.cell_size
             )
 
@@ -1626,15 +1811,36 @@ class GridBuilder:
                 t = dist_to_edge[near_edge] / 15.0
                 score[near_edge] = 0.7 - 0.4 * t
 
-            # ── Bonus proximité urbaine (Fix #15 : fonctionne si
-            #    apply_urban_mask() a été appelé avant) ──
+            # ── v2.3.6 : bonus pente 15-35° en forêt (chablis naturels) ──
+            _slope = self.slope
+            if _slope is not None:
+                slope_disturb = (_slope >= 15.0) & (_slope <= 35.0) & _fm
+                if slope_disturb.any():
+                    score[slope_disturb] += 0.15
+                    logger.debug(
+                        "   Disturbance : bonus pente 15-35°"
+                        " → %d cellules",
+                        int(slope_disturb.sum()),
+                    )
+
+            # ── v2.3.6 : bonus altitude 300-800m (exploitation forestière) ──
+            _alt = self.altitude
+            if _alt is not None:
+                exploit_band = (_alt >= 300.0) & (_alt <= 800.0) & _fm
+                if exploit_band.any():
+                    score[exploit_band] += 0.10
+                    logger.debug(
+                        "   Disturbance : bonus altitude 300-800m"
+                        " → %d cellules",
+                        int(exploit_band.sum()),
+                    )
+
+            # ── Bonus proximité urbaine (Fix #15) ──
             _um_val = self.urban_mask
             if _um_val is not None and _um_val.any():
                 _um: np.ndarray = _um_val
                 urban_edge: np.ndarray = (
-                    np.asarray(
-                        distance_transform_edt(~_um)
-                    ).astype(np.float32)
+                    _accel.distance_transform_edt(~_um)
                     * self.cell_size
                 )
                 near_urban = (urban_edge < 30) & (~_um)
@@ -1645,11 +1851,11 @@ class GridBuilder:
                 )
             elif _um_val is None:
                 logger.debug(
-                    "   Disturbance : urban_mask=None — bonus urbain ignoré. "
-                    "Appeler apply_urban_mask() AVANT score_disturbance()."
+                    "   Disturbance : urban_mask=None — bonus urbain ignoré."
+                    " Appeler apply_urban_mask() AVANT score_disturbance()."
                 )
 
-            self.score_confidence["disturbance"] = 0.2
+            self.score_confidence["disturbance"] = 0.3
         else:
             score = np.full((self.ny, self.nx), 0.3, dtype=np.float32)
             self.score_confidence["disturbance"] = 0.1
@@ -1672,6 +1878,8 @@ class GridBuilder:
         Le score sera dans grid.scores["forest_edge"] mais ignoré par
         compute_weighted_score() sauf ajout explicite à config.WEIGHTS.
         """
+        if self._skip_zero_weight("edge_distance"):
+            return self        
         self._require_terrain()
 
         if self.forest_mask is None or not self.forest_mask.any():
@@ -1689,7 +1897,7 @@ class GridBuilder:
         edge_mask = _fm & ~eroded
 
         dist: np.ndarray = (
-            np.asarray(distance_transform_edt(~edge_mask)).astype(np.float32)
+            _accel.distance_transform_edt(~edge_mask)
             * self.cell_size
         )
 
@@ -1715,6 +1923,8 @@ class GridBuilder:
 
     def score_favorable_density(self, radius_m: float = 30.0) -> GridBuilder:
         """Score densité locale — NON INCLUS dans WEIGHTS (exploratoire)."""
+        if self._skip_zero_weight("favorable_density"):
+            return self        
         from scipy.ndimage import uniform_filter  # import local car optionnel
 
         if "tree_species" not in self.scores:
@@ -1728,10 +1938,9 @@ class GridBuilder:
         if kernel_size % 2 == 0:
             kernel_size += 1
 
-        density: np.ndarray = np.asarray(
-            uniform_filter(favorable, size=kernel_size)
-        ).astype(np.float32)
-
+        density: np.ndarray = _accel.uniform_filter(
+            favorable, size=kernel_size,
+        )
         score = self._apply_nodata(np.clip(density, 0, 1))
         self.scores["favorable_density"] = score
         self.score_confidence["favorable_density"] = self.score_confidence.get(
@@ -1764,8 +1973,21 @@ class GridBuilder:
         self,
         urban_gdf: gpd.GeoDataFrame | None,
         buffer_m: int = 10,
+        *,
+        min_urban_density: int = 30,
+        density_radius: int = 30,
     ) -> GridBuilder:
-        """Masque des zones urbanisées."""
+        """Masque des zones urbanisées.
+
+        Parameters
+        ----------
+        min_urban_density : int
+            Nombre minimum de pixels urbains dans le voisinage
+            pour qu'un pixel soit considéré comme zone urbaine.
+            Filtre les bâtiments isolés en forêt.
+        density_radius : int
+            Rayon en mètres du voisinage pour le calcul de densité.
+        """
         if urban_gdf is None or urban_gdf.empty:
             self.urban_mask = np.zeros((self.ny, self.nx), dtype=bool)
             logger.info("⚠️ Pas de données urbaines → aucun masque")
@@ -1773,31 +1995,80 @@ class GridBuilder:
 
         urban_gdf = self._ensure_l93(urban_gdf)
 
+        # ── Cache disque ──
+        cache_path = _accel.raster_cache_path(
+            "urban_mask",
+            urban_gdf.attrs.get("source", "unknown"),
+            len(urban_gdf),
+            self.cell_size,
+            (self.ny, self.nx),
+        )
+        cached = _accel.raster_cache_load(cache_path)
+        if cached is not None:
+            self.urban_mask = cached.astype(bool)
+            _um: np.ndarray = self.urban_mask
+            urban_cells = int(_um.sum())
+            urban_pct = urban_cells / _um.size * 100
+            urban_ha = urban_cells * (self.cell_size**2) / 10000
+            logger.info(
+                "✅ Masque urbain (cache) : %s cellules exclues (%.1f%%, %.1f ha)",
+                f"{urban_cells:,}",
+                urban_pct,
+                urban_ha,
+            )
+            return self
+
         # Construire buffer_map depuis constante + surcharge buffer_m
         buffer_map: dict[str, int] = {
             k: (v if k not in ("batiment", "building") else buffer_m)
             for k, v in self._URBAN_BUFFER_DEFAULTS
         }
 
-        shapes: list[tuple[Any, int]] = []
-        for _, row in urban_gdf.iterrows():
-            geom = row.geometry
-            if geom is None or geom.is_empty:
-                continue
-            shapes.append((geom, 1))
+        # ── Rasterisation parallèle (base) ──
+        all_geoms: list[Any] = [
+            g for g in urban_gdf.geometry
+            if g is not None and not g.is_empty
+        ]
 
-        if not shapes:
+        if not all_geoms:
             self.urban_mask = np.zeros((self.ny, self.nx), dtype=bool)
             return self
 
-        base_raster = np.asarray(rasterize(
-            shapes,
+        base_raster = _accel.parallel_rasterize_mask(
+            all_geoms,
             out_shape=(self.ny, self.nx),
             transform=self.transform,
-            fill=0,
-            dtype=np.uint8,
-            all_touched=True,
-        )).astype(bool)
+        )
+
+        # ── Filtre densité : éliminer les bâtiments isolés ──
+        if min_urban_density > 1:
+            density_px = max(2, round(density_radius / self.cell_size))
+            kernel_size = 2 * density_px + 1
+            kernel_area = kernel_size * kernel_size
+            base_fraction = 0.61
+            fraction = base_fraction * min(1.0, 10.0 / self.cell_size)
+            adaptive_threshold = max(1, round(fraction * kernel_area))
+
+            neighbor_count = (
+                _accel.uniform_filter(
+                    base_raster.astype(np.float32), size=kernel_size,
+                )
+                * kernel_area
+            )
+
+            isolated = base_raster & (neighbor_count < adaptive_threshold)
+            base_raster = base_raster & ~isolated
+            n_filtered = int(isolated.sum())
+            if n_filtered > 0:
+                logger.info(
+                    "   🏚️ Filtre densité urbaine : %d pixels isolés supprimés "
+                    "(seuil=%d/%d dans rayon %dm, cell=%dm)",
+                    n_filtered,
+                    adaptive_threshold,
+                    kernel_area,
+                    density_radius,
+                    int(self.cell_size),
+                )
 
         if "urban_type" in urban_gdf.columns:
             combined_mask = np.zeros((self.ny, self.nx), dtype=bool)
@@ -1805,27 +2076,36 @@ class GridBuilder:
             for utype, group in urban_gdf.groupby("urban_type"):
                 buf = buffer_map.get(str(utype).lower(), buffer_m)
 
-                type_shapes: list[tuple[Any, int]] = [
-                    (geom, 1)
-                    for geom in group.geometry
-                    if geom is not None and not geom.is_empty
+                type_geoms: list[Any] = [
+                    g for g in group.geometry
+                    if g is not None and not g.is_empty
                 ]
-                if not type_shapes:
+                if not type_geoms:
                     continue
 
-                type_raster = np.asarray(rasterize(
-                    type_shapes,
+                type_raster = _accel.parallel_rasterize_mask(
+                    type_geoms,
                     out_shape=(self.ny, self.nx),
                     transform=self.transform,
-                    fill=0,
-                    dtype=np.uint8,
-                    all_touched=True,
-                )).astype(bool)
+                )
+
+                # ── Filtre densité par type ──
+                if min_urban_density > 1:
+                    type_neighbor = (
+                        _accel.uniform_filter(
+                            type_raster.astype(np.float32),
+                            size=kernel_size,
+                        )
+                        * kernel_area
+                    )
+                    type_raster = type_raster & (
+                        type_neighbor >= adaptive_threshold
+                    )
 
                 if buf > 0:
                     iterations = max(1, int(buf / self.cell_size))
                     type_raster = np.asarray(
-                        binary_dilation(type_raster, iterations=iterations)
+                        binary_dilation(type_raster, iterations=iterations),
                     ).astype(bool)
 
                 combined_mask |= type_raster
@@ -1835,11 +2115,14 @@ class GridBuilder:
             if buffer_m > 0:
                 iterations = max(1, int(buffer_m / self.cell_size))
                 base_raster = np.asarray(
-                    binary_dilation(base_raster, iterations=iterations)
+                    binary_dilation(base_raster, iterations=iterations),
                 ).astype(bool)
             self.urban_mask = base_raster
 
-        _um: np.ndarray = self.urban_mask
+        # ── Sauvegarder en cache ──
+        _accel.raster_cache_save(cache_path, self.urban_mask)
+
+        _um = self.urban_mask
         urban_cells = int(_um.sum())
         urban_pct = urban_cells / _um.size * 100
         urban_ha = urban_cells * (self.cell_size**2) / 10000
@@ -1855,6 +2138,8 @@ class GridBuilder:
 
     def score_urban_proximity(self) -> GridBuilder:
         """Score de proximité urbaine — pénalise les zones proches de l'urbanisation."""
+        if self._skip_zero_weight("urban_proximity"):
+            return self        
         _um = getattr(self, "urban_mask", None)
         if not isinstance(_um, np.ndarray) or not np.any(_um):
             logger.info("⚠️ Pas de masque urbain → score neutre 1.0")
@@ -1869,7 +2154,7 @@ class GridBuilder:
 
         # Distance euclidienne en mètres depuis le bord du masque urbain
         dist_grid: np.ndarray = (
-            np.asarray(distance_transform_edt(~_um)).astype(np.float32)
+            _accel.distance_transform_edt(~_um)
             * self.cell_size
         )
         self.dist_urban_grid = dist_grid

@@ -1415,6 +1415,7 @@ class DataLoader:
             else:
                 gdf["DESCR"] = gdf["LITHO"]
 
+
         # ── Étape 1 : resolve_geology() sur DESCR (vectorisé) ───
         n = len(gdf)
         resolved = np.zeros(n, dtype=bool)
@@ -1502,7 +1503,7 @@ class DataLoader:
         # ── Score pré-calculé ────────────────────────────────────
         gdf["geology_score"] = gdf["geology_canonical"].map(
             lambda c: config.GEOLOGY_SCORES.get(
-                c, config.GEOLOGY_SCORES["unknown"],
+                str(c), config.GEOLOGY_SCORES["unknown"],
             ),
         )
 
