@@ -64,6 +64,7 @@ from grid_builder import GridBuilder
 from scoring import MorilleScoring
 from species_enricher import SpeciesEnricher
 from visualize import MorilleVisualizer
+from weather import WeatherChecker
 
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTES MODULE
@@ -1050,6 +1051,27 @@ def main(args: argparse.Namespace) -> int:
     model.apply_monotony_penalty()
     model.apply_calcdry_penalty()
     model.apply_spatial_smoothing(sigma=args.smoothing_sigma)
+
+    # ── Niveau météo : modulation temporelle ──────────────────
+    if not getattr(args, "no_weather", False):
+        try:
+            _checker = WeatherChecker()
+            _days = _checker.evaluate()
+            if _days:
+                _today = _days[0]
+                # Facteur ∈ [0.40, 1.00] : préserve la structure spatiale
+                # Score météo 0.0 → ×0.40 / Score 1.0 → ×1.00
+                _wf = float(np.float32(0.4 + 0.6 * _today.score))
+                assert model.final_score is not None
+                model.final_score = model.final_score * np.float32(_wf)
+                logger.info(
+                    "🌤️  Météo J+0 : %s  (score=%.2f → ×%.2f)",
+                    _today.label, _today.score, _wf,
+                )
+                logger.info(WeatherChecker.format_report(_days))
+        except Exception as _exc:
+            logger.debug("Météo indisponible, skip : %s", _exc)
+
     model.classify_probability()
 
     hotspots = model.get_hotspots(threshold=args.hotspot_threshold)
@@ -1362,6 +1384,10 @@ Exemples d'utilisation :
     special_group.add_argument(
         "--verbose", action="store_true",
         help="Activer les logs de niveau DEBUG.",
+    )
+    special_group.add_argument(
+        "--no-weather", action="store_true", dest="no_weather",
+        help="Désactiver la modulation météo (mode hors-ligne).",
     )
 
     return parser
