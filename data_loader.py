@@ -1312,6 +1312,72 @@ class DataLoader:
         gdf = self._generate_synthetic_geology()
         return self._normalize_geology(gdf, source="synthetic")
 
+    def load_geology_lines(
+        self, filepath: str | None = None
+    ) -> gpd.GeoDataFrame | None:
+        """
+        Charge les contacts géologiques linéaires (BDCharm-50 L_FGEOL).
+
+        Filtre : contours observés/visibles et supposés/probables/masqués.
+        Exclut : limites de carte, limites hydrographiques, failles structurales.
+        Retourne un GeoDataFrame de LineStrings en L93, ou None si indisponible.
+        """
+        _CONTACT_DESCR = {
+            "Contour géologique observé, visible",
+            "Contour géologique supposé, probable, masqué",
+        }
+
+        # Résolution du chemin
+        candidates: list[Path] = []
+        if filepath:
+            candidates.append(Path(filepath))
+        candidates += list(
+            Path("data").rglob("*L_FGEOL*2154*.shp")
+        )
+
+        shp_path: Path | None = None
+        for p in candidates:
+            if p.exists():
+                shp_path = p
+                break
+
+        if shp_path is None:
+            logger.debug("load_geology_lines : aucun fichier L_FGEOL trouvé, skip")
+            return None
+
+        try:
+            gdf: gpd.GeoDataFrame = gpd.read_file(shp_path)  # type: ignore[assignment]
+            if gdf.empty:
+                return None
+
+            # Filtrer sur DESCR si disponible
+            if "DESCR" in gdf.columns:
+                gdf = gdf[gdf["DESCR"].isin(_CONTACT_DESCR)].copy()
+
+            if gdf.empty:
+                logger.debug("load_geology_lines : aucun contact après filtrage DESCR")
+                return None
+
+            gdf = self._ensure_l93(gdf)
+            # Garder uniquement les géométries linéaires valides dans la BBOX
+            bbox_geom = box(
+                self.bbox_buffered["xmin"], self.bbox_buffered["ymin"],
+                self.bbox_buffered["xmax"], self.bbox_buffered["ymax"],
+            )
+            gdf = gdf[
+                gdf.geometry.notna()
+                & gdf.geometry.intersects(bbox_geom)
+            ].copy()
+
+            logger.info(
+                "✅ Contacts géologiques : %d lignes (L_FGEOL)", len(gdf)
+            )
+            return gdf if not gdf.empty else None
+
+        except Exception as exc:
+            logger.warning("⚠️ load_geology_lines : %s — skip", exc)
+            return None
+
     def _download_geology_brgm(self) -> gpd.GeoDataFrame | None:
         """Tente de charger la carte géologique harmonisée BRGM."""
         bbox_str = (

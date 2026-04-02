@@ -883,6 +883,9 @@ def main(args: argparse.Namespace) -> int:
             else "synthetic"
         )
 
+    # ── 1d'. Contacts géologiques linéaires (L_FGEOL) ────────
+    geo_lines_gdf = loader.load_geology_lines()
+
     # ── 1e. Autres couches vectorielles ───────────────────────
     hydro_gdf = loader.load_hydro(args.hydro)
 
@@ -1016,8 +1019,9 @@ def main(args: argparse.Namespace) -> int:
     grid.score_urban_proximity()
 
     # ── 2e. Scores micro-habitat ──────────────────────────────
-    logger.info("   ▸ Lisière forestière, ouverture canopée, couvert sol, perturbation...")
+    logger.info("   ▸ Lisière forestière, contacts géologiques, ouverture canopée, couvert sol, perturbation...")
     grid.score_forest_edge_distance()
+    grid.score_geology_contact_distance(geo_lines_gdf)
     grid.score_canopy_openness()
     grid.score_ground_cover()
     grid.score_disturbance()

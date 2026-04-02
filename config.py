@@ -177,9 +177,10 @@ _WEIGHTS_DICT: dict[str, float] = {
     "slope":              0.06,
     "aspect":             0.05,
     "dist_water":         0.05,
-    "terrain_roughness":  0.05,
+    "terrain_roughness":  0.04,   # -0.01 → geology_contact
     "ground_cover":       0.04,
-    "disturbance":        0.03,
+    "disturbance":        0.02,   # -0.01 → geology_contact
+    "geology_contact":    0.02,   # contacts géologiques (BDCharm-50 L_FGEOL)
 }
 
 _w_total = sum(_WEIGHTS_DICT.values())

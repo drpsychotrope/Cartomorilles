@@ -1920,6 +1920,84 @@ class GridBuilder:
         self._log_score_stats("forest_edge", score)
         return self
 
+    def score_geology_contact_distance(
+        self, geo_lines_gdf: Any
+    ) -> GridBuilder:
+        """
+        Score de distance aux contacts géologiques (BDCharm-50 L_FGEOL).
+
+        Les transitions entre formations géologiques (calcaire/marne, alluvions/
+        substrat) créent des conditions édaphiques favorables aux morilles.
+        Score maximal ≤50m du contact, décroit jusqu'à 0.2 au-delà de 500m.
+        Clé dans scores : "geology_contact" (poids 0.02 dans config.WEIGHTS).
+        """
+        name = "geology_contact"
+        if self._skip_zero_weight(name):
+            return self
+        self._require_terrain()
+
+        if geo_lines_gdf is None or (
+            hasattr(geo_lines_gdf, "empty") and geo_lines_gdf.empty
+        ):
+            self.scores[name] = np.full(
+                (self.ny, self.nx), 0.2, dtype=np.float32
+            )
+            self.score_confidence[name] = 0.0
+            logger.info("⏭️  Score %-20s : pas de données contacts géo", name)
+            return self
+
+        gdf = self._ensure_l93(geo_lines_gdf)
+        valid = gdf[
+            gdf.geometry.notna()
+            & gdf.geometry.is_valid
+            & (~gdf.geometry.is_empty)
+        ]
+        if valid.empty:
+            self.scores[name] = np.full(
+                (self.ny, self.nx), 0.2, dtype=np.float32
+            )
+            self.score_confidence[name] = 0.0
+            return self
+
+        # Rasteriser les lignes (all_touched=True pour ne pas rater les lignes fines)
+        line_raster: np.ndarray = np.asarray(rasterize(
+            valid.geometry,
+            out_shape=(self.ny, self.nx),
+            transform=self.transform,
+            fill=0,
+            dtype=np.uint8,
+            all_touched=True,
+        ))
+        contact_mask = line_raster.astype(bool)
+
+        # EDT — distance en mètres
+        dist: np.ndarray = (
+            _accel.distance_transform_edt(~contact_mask)
+            * self.cell_size
+        )
+
+        # Courbe de score
+        score = np.full_like(dist, 0.2, dtype=np.float32)
+
+        # ≤ 50m : optimal
+        score[dist <= 50] = 1.0
+
+        # 50–200m : décroissance 1.0 → 0.5
+        m1 = (dist > 50) & (dist <= 200)
+        if m1.any():
+            score[m1] = np.float32(1.0 - 0.5 * ((dist[m1] - 50.0) / 150.0))
+
+        # 200–500m : décroissance 0.5 → 0.2
+        m2 = (dist > 200) & (dist <= 500)
+        if m2.any():
+            score[m2] = np.float32(0.5 - 0.3 * ((dist[m2] - 200.0) / 300.0))
+
+        score = self._apply_nodata(np.clip(score, 0.0, 1.0))
+        self.scores[name] = score
+        self.score_confidence[name] = 0.7
+        self._log_score_stats(name, score)
+        return self
+
     def score_favorable_density(self, radius_m: float = 30.0) -> GridBuilder:
         """Score densité locale — NON INCLUS dans WEIGHTS (exploratoire)."""
         if self._skip_zero_weight("favorable_density"):
