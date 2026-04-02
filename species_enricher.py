@@ -23,6 +23,7 @@ import json
 import logging
 import time as _time
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Final
 
 import requests
@@ -1418,7 +1419,7 @@ class SpeciesEnricher:
 
     def _fetch_inaturalist(
         self,
-        bbox_wgs84: dict[str, float],
+        bbox_wgs84: Mapping[str, float],
         *,
         cache_dir: Path | None = None,
     ) -> list[dict[str, object]]:
@@ -1456,7 +1457,7 @@ class SpeciesEnricher:
 
         # Requête API avec pagination (max 5 pages)
         results: list[dict[str, object]] = []
-        params: dict[str, object] = {
+        params: dict[str, str | int | float] = {
             "taxon_name": _INAT_TAXON,
             "nelat": bbox_wgs84["north"],
             "nelng": bbox_wgs84["east"],
