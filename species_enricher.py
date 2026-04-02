@@ -768,6 +768,7 @@ class SpeciesEnricher:
 
         # ── Niveau C' : iNaturalist (Morchella, r=100m) ────────────
         inat_obs = self._fetch_inaturalist(config.BBOX_WGS84)
+        self.inat_observations: list[dict[str, object]] = inat_obs
         n_inat = self._apply_inaturalist_boost(
             tree_scores, enrichable, x_coords, y_coords, inat_obs,
         )
@@ -1070,6 +1071,29 @@ class SpeciesEnricher:
                     "  Substrat : %d cellules calcaire plat → marly "
                     "(pente<%.0f°)",
                     n_reclass, _CALC_DRY_SLOPE_THRESHOLD,
+                )
+
+        # ── Correction proximité eau : calcaire/marneux basse altitude
+        #    proche cours d'eau → alluvial (frênaies ripariennes) ────
+        altitude = getattr(grid, "altitude", None)
+        dist_water = grid.scores.get("dist_water") if hasattr(grid, "scores") else None
+        if altitude is not None and dist_water is not None:
+            altitude = np.asarray(altitude, dtype=np.float32)
+            dw = np.asarray(dist_water, dtype=np.float32)
+            # Cellules à <500m, score dist_water élevé (≥0.50 → ~<200m du cours d'eau),
+            # sur calcaire sec ou marneux → ripisylve probable (frêne, orme…)
+            riparian = (
+                ((substrate == _SUB_CALC_DRY) | (substrate == _SUB_MARLY))
+                & (altitude < 500.0)
+                & (dw >= 0.50)
+            )
+            n_riparian = int(np.count_nonzero(riparian))
+            if n_riparian > 0:
+                substrate[riparian] = _SUB_ALLUVIAL
+                logger.info(
+                    "  Substrat : %d cellules calc/marly basse alt. + eau → alluvial "
+                    "(ripisylve)",
+                    n_riparian,
                 )
 
         self._substrate_grid = substrate

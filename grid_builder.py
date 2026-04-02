@@ -1254,6 +1254,16 @@ class GridBuilder:
         self._tree_code_to_name = code_to_essence
         self._tree_score_lookup = lookup
 
+        # ── Construire forest_mask (nécessaire en aval : canopy, disturbance,
+        #    ground_cover, forest_edge) ────────────────────────────
+        if self.forest_mask is None:
+            self.forest_mask = int_raster > 0
+            logger.debug(
+                "   forest_mask : %d cellules forêt (%.1f%%)",
+                int(self.forest_mask.sum()),
+                float(self.forest_mask.sum()) / max(self.forest_mask.size, 1) * 100,
+            )
+
         self.scores[name] = score
         coverage = float(np.count_nonzero(int_raster > 0)) / max(
             int_raster.size, 1,
@@ -1857,7 +1867,7 @@ class GridBuilder:
 
             self.score_confidence["disturbance"] = 0.3
         else:
-            score = np.full((self.ny, self.nx), 0.3, dtype=np.float32)
+            score = np.full((self.ny, self.nx), 0.5, dtype=np.float32)
             self.score_confidence["disturbance"] = 0.1
 
         score = self._apply_nodata(np.clip(score, 0, 1))
@@ -1877,7 +1887,7 @@ class GridBuilder:
         Basé sur BD Forêt v2 + EDT — actif même sans landcover OSM.
         Clé dans scores : "forest_edge" (poids 0.04 dans config.WEIGHTS).
         """
-        if self._skip_zero_weight("edge_distance"):
+        if self._skip_zero_weight("forest_edge"):
             return self        
         self._require_terrain()
 
