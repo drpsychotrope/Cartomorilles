@@ -675,16 +675,18 @@ class MorilleVisualizer:
     # Data PNG (score + altitude + pente encodés RGBA)
     # ──────────────────────────────────────────────────────
     def _build_data_png_bytes(self) -> bytes:
-        """Construit le PNG RGBA caché pour tooltip mousemove.
+        """Construit le PNG RGB opaque pour tooltip mousemove.
 
         R = score (0–200 → 0.00–1.00, 255 = NaN)
         G = altitude low byte (alt + 500)
         B = altitude high byte
-        A = pente (1–181 → 0–90°, 0 = NaN)
+
+        Fix B1 : RGB opaque — pas de pré-multiplication alpha navigateur.
+        La pente est encodée dans un PNG séparé (_build_slope_png_bytes).
         """
         score_wgs = self._reproject_to_wgs84(self._final_score)
         h, w = score_wgs.shape
-        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
 
         # R : score
         valid_s = np.asarray(np.isfinite(score_wgs))
@@ -693,7 +695,7 @@ class MorilleVisualizer:
             (score_wgs[valid_s] * _SCORE_SCALE).astype(np.int32),
             0, _SCORE_SCALE,
         ).astype(np.uint8)
-        rgba[:, :, 0] = r_ch
+        rgb[:, :, 0] = r_ch
 
         # G, B : altitude
         alt_grid = getattr(self.grid, "altitude", None)
@@ -705,31 +707,56 @@ class MorilleVisualizer:
                 (alt_wgs[valid_a] + _ALT_OFFSET).astype(np.int32),
                 0, 65535,
             ).astype(np.uint16)
-            rgba[:, :, 1] = (alt_enc & 0xFF).astype(np.uint8)
-            rgba[:, :, 2] = ((alt_enc >> 8) & 0xFF).astype(np.uint8)
+            rgb[:, :, 1] = (alt_enc & 0xFF).astype(np.uint8)
+            rgb[:, :, 2] = ((alt_enc >> 8) & 0xFF).astype(np.uint8)
         else:
             logger.debug("   Altitude non disponible pour data PNG")
 
-        # A : pente
+        img = Image.fromarray(rgb, mode="RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", compress_level=6)
+        png_bytes = buf.getvalue()
+        size_kb = len(png_bytes) / 1024
+        logger.info(
+            "✅ Data PNG : %dx%d px (%.0f KB) — score+alt",
+            w, h, size_kb,
+        )
+        return png_bytes
+
+    def _build_slope_png_bytes(self) -> bytes:
+        """Construit le PNG RGB opaque contenant la pente par pixel.
+
+        R = pente encodée (1–181 → 0–90°, 0 = NaN)
+        G = 0, B = 0 (réservés)
+
+        Fix B1 : séparé du data PNG pour éviter la pré-multiplication alpha.
+        """
+        score_wgs = self._reproject_to_wgs84(self._final_score)
+        h, w = score_wgs.shape
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+
         slp_grid = getattr(self.grid, "slope", None)
         if isinstance(slp_grid, np.ndarray) and slp_grid.shape == self._final_score.shape:
             slp_wgs = self._reproject_to_wgs84(slp_grid)
             valid_p = np.asarray(np.isfinite(slp_wgs))
-            a_ch = np.zeros((h, w), dtype=np.uint8)
-            a_ch[valid_p] = np.clip(
+            r_ch = np.zeros((h, w), dtype=np.uint8)
+            r_ch[valid_p] = np.clip(
                 (slp_wgs[valid_p] * _SLOPE_SCALE + _SLOPE_OFFSET).astype(
                     np.int32,
                 ),
                 1, 181,
             ).astype(np.uint8)
-            rgba[:, :, 3] = a_ch
+            rgb[:, :, 0] = r_ch
         else:
-            logger.debug("   Pente non disponible pour data PNG")
+            logger.debug("   Pente non disponible pour slope PNG")
 
-        png_bytes = _encode_rgba(rgba, compress_level=6)
+        img = Image.fromarray(rgb, mode="RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", compress_level=6)
+        png_bytes = buf.getvalue()
         size_kb = len(png_bytes) / 1024
         logger.info(
-            "✅ Data PNG : %dx%d px (%.0f KB) — score+alt+pente",
+            "✅ Slope PNG : %dx%d px (%.0f KB) — pente",
             w, h, size_kb,
         )
         return png_bytes
@@ -741,6 +768,7 @@ class MorilleVisualizer:
         self,
         folium_map: folium.Map,
         data_uri: str,
+        slope_uri: str = "",
     ) -> None:
         """Injecte CSS + JS : panneaux draggable, opacité, filtre, légende,
         tooltip mousemove, hotspot slider."""
@@ -889,6 +917,8 @@ class MorilleVisualizer:
         <img id="cartom-data-img" src="%DATA_URI%" style="display:none;">
         <canvas id="cartom-data-canvas" style="display:none;"></canvas>
         <canvas id="cartom-render-canvas" style="display:none;"></canvas>
+        <img id="cartom-slope-img" src="%SLOPE_URI%" style="display:none;">
+        <canvas id="cartom-slope-canvas" style="display:none;"></canvas>
 
         <script>
         document.addEventListener('DOMContentLoaded', function(){
@@ -1009,9 +1039,12 @@ class MorilleVisualizer:
             var dataImg    = document.getElementById('cartom-data-img');
             var dataCanvas = document.getElementById('cartom-data-canvas');
             var renderCanvas = document.getElementById('cartom-render-canvas');
+            var slopeImg    = document.getElementById('cartom-slope-img');
+            var slopeCanvas = document.getElementById('cartom-slope-canvas');
             var infoBody   = document.getElementById('cartom-info-body');
             var dataCtx    = null;
             var renderCtx  = null;
+            var slopeCtx   = null;
             var dataW = 0, dataH = 0;
 
             var south = %SOUTH%, north = %NORTH%;
@@ -1041,6 +1074,14 @@ class MorilleVisualizer:
                 renderCanvas.width = dataW;
                 renderCanvas.height = dataH;
                 renderCtx = renderCanvas.getContext('2d');
+
+                /* Slope canvas — Fix B1 */
+                if (slopeImg && slopeCanvas && slopeImg.naturalWidth > 0) {
+                    slopeCanvas.width  = slopeImg.naturalWidth;
+                    slopeCanvas.height = slopeImg.naturalHeight;
+                    slopeCtx = slopeCanvas.getContext('2d', {willReadFrequently: true});
+                    slopeCtx.drawImage(slopeImg, 0, 0);
+                }
 
                 return true;
             }
@@ -1118,6 +1159,9 @@ class MorilleVisualizer:
                 onReady();
             } else if (dataImg) {
                 dataImg.addEventListener('load', onReady);
+            }
+            if (slopeImg && !slopeImg.complete) {
+                slopeImg.addEventListener('load', function(){ initCanvases(); });
             }
 
             /* ═══════ FILTRE SLIDERS ═══════ */
@@ -1227,9 +1271,9 @@ class MorilleVisualizer:
                     py = Math.max(0, Math.min(py, dataH - 1));
 
                     var pixel = dataCtx.getImageData(px, py, 1, 1).data;
-                    var r = pixel[0], g = pixel[1], b = pixel[2], a = pixel[3];
+                    var r = pixel[0], g = pixel[1], b = pixel[2];
 
-                    if (r === SCORE_NAN || (r===0 && g===0 && b===0 && a===0)) {
+                    if (r === SCORE_NAN || (r===0 && g===0 && b===0)) {
                         infoBody.innerHTML = '<span style="color:#888;">Pas de données</span>';
                         return;
                     }
@@ -1238,11 +1282,14 @@ class MorilleVisualizer:
                     var cls = getClass(score);
                     var h = '<b>🍄 '+(score*100).toFixed(1)+'%</b> — <em>'+cls+'</em><br>';
 
+                    /* Altitude — Fix B1 : RGB opaque, plus de pré-multiplication */
                     var altRaw = g + (b << 8);
                     if (altRaw > 0) h += '⛰️ '+(altRaw - ALT_OFFSET)+' m<br>';
 
-                    if (a > 0) {
-                        var slope = (a - SLOPE_OFFSET) / SLOPE_SCALE;
+                    /* Pente — Fix B1 : lue depuis slope PNG séparé */
+                    var slopeR = slopeCtx ? slopeCtx.getImageData(px, py, 1, 1).data[0] : 0;
+                    if (slopeR > 0) {
+                        var slope = (slopeR - SLOPE_OFFSET) / SLOPE_SCALE;
                         h += '📐 '+slope.toFixed(1)+'°<br>';
                     }
 
@@ -1268,6 +1315,7 @@ class MorilleVisualizer:
 
         js_final = (
             js_block.replace("%DATA_URI%", data_uri)
+            .replace("%SLOPE_URI%", slope_uri)
             .replace("%SOUTH%", f"{self._south:.8f}")
             .replace("%NORTH%", f"{self._north:.8f}")
             .replace("%WEST%", f"{self._west:.8f}")
@@ -1477,8 +1525,9 @@ class MorilleVisualizer:
                 fut = pool.submit(render_fn)
                 future_to_idx[fut] = (idx, name, show, opa, zi, msg)
 
-            # Soumettre le data PNG
+            # Soumettre le data PNG et le slope PNG
             data_future = pool.submit(self._build_data_png_bytes)
+            slope_future = pool.submit(self._build_slope_png_bytes)
 
             # Collecter les overlays (ordre de complétion)
             indexed_results: dict[
@@ -1494,9 +1543,10 @@ class MorilleVisualizer:
             for idx in sorted(indexed_results):
                 overlay_results.append(indexed_results[idx])
 
-            # Data PNG
+            # Data PNG + Slope PNG
             data_png_bytes = data_future.result()
             data_uri = self._png_to_data_uri(data_png_bytes)
+            slope_uri = self._png_to_data_uri(slope_future.result())
 
         logger.info(
             "⏱️  Encoding PNG parallèle : %.2fs — %d workers",
@@ -1537,7 +1587,7 @@ class MorilleVisualizer:
         folium.LayerControl(collapsed=False, position="topright").add_to(m)
 
         # ── Contrôles interactifs (JS + data PNG) ──
-        self._add_interactive_controls(m, data_uri)
+        self._add_interactive_controls(m, data_uri, slope_uri)
 
         m.fit_bounds(self._bounds)
 

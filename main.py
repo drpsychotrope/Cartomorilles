@@ -1015,7 +1015,8 @@ def main(args: argparse.Namespace) -> int:
     grid.score_urban_proximity()
 
     # ── 2e. Scores micro-habitat ──────────────────────────────
-    logger.info("   ▸ Ouverture canopée, couvert sol, perturbation...")
+    logger.info("   ▸ Lisière forestière, ouverture canopée, couvert sol, perturbation...")
+    grid.score_forest_edge_distance()
     grid.score_canopy_openness()
     grid.score_ground_cover()
     grid.score_disturbance()

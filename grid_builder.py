@@ -1873,10 +1873,9 @@ class GridBuilder:
         """
         Score de distance aux lisières forestières.
 
-        NON INCLUS dans WEIGHTS — redondant avec canopy_openness + disturbance.
-        Disponible pour analyse exploratoire : grid.score_forest_edge_distance()
-        Le score sera dans grid.scores["forest_edge"] mais ignoré par
-        compute_weighted_score() sauf ajout explicite à config.WEIGHTS.
+        Favorise les zones en lisière (≤5m) et pénalise l'intérieur profond (>50m).
+        Basé sur BD Forêt v2 + EDT — actif même sans landcover OSM.
+        Clé dans scores : "forest_edge" (poids 0.04 dans config.WEIGHTS).
         """
         if self._skip_zero_weight("edge_distance"):
             return self        
@@ -2103,20 +2102,22 @@ class GridBuilder:
                     )
 
                 if buf > 0:
-                    iterations = max(1, int(buf / self.cell_size))
-                    type_raster = np.asarray(
-                        binary_dilation(type_raster, iterations=iterations),
-                    ).astype(bool)
+                    iterations = max(0, round(buf / self.cell_size))
+                    if iterations > 0:
+                        type_raster = np.asarray(
+                            binary_dilation(type_raster, iterations=iterations),
+                        ).astype(bool)
 
                 combined_mask |= type_raster
 
             self.urban_mask = combined_mask
         else:
             if buffer_m > 0:
-                iterations = max(1, int(buffer_m / self.cell_size))
-                base_raster = np.asarray(
-                    binary_dilation(base_raster, iterations=iterations),
-                ).astype(bool)
+                iterations = max(0, round(buffer_m / self.cell_size))
+                if iterations > 0:
+                    base_raster = np.asarray(
+                        binary_dilation(base_raster, iterations=iterations),
+                    ).astype(bool)
             self.urban_mask = base_raster
 
         # ── Sauvegarder en cache ──

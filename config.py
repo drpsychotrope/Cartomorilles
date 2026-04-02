@@ -169,10 +169,11 @@ CELL_SIZE_AUTO_FALLBACK: Final[float] = 100.0
 _WEIGHTS_DICT: dict[str, float] = {
     "geology":            0.20,
     "tree_species":       0.16,
-    "canopy_openness":    0.11,
+    "canopy_openness":    0.07,   # réduit : dégradé sans landcover (→ forest_edge)
     "urban_proximity":    0.10,
     "altitude":           0.08,
     "twi":                0.07,
+    "forest_edge":        0.04,   # lisière forestière (BD Forêt + EDT)
     "slope":              0.06,
     "aspect":             0.05,
     "dist_water":         0.05,
