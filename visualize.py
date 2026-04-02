@@ -266,7 +266,7 @@ class MorilleVisualizer:
         # vecteurs → plus de décalage TWI ↔ cours d'eau).
         _corners_x = [self._xmin_l93, self._xmax_l93, self._xmin_l93, self._xmax_l93]
         _corners_y = [self._ymin_l93, self._ymin_l93, self._ymax_l93, self._ymax_l93]
-        _cx, _cy = self._transformer.transform(_corners_x, _corners_y)
+        _cx, _cy = self._to_wgs84.transform(_corners_x, _corners_y)
         self._west = float(min(_cx))
         self._east = float(max(_cx))
         self._south = float(min(_cy))
