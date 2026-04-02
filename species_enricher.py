@@ -1537,7 +1537,9 @@ class SpeciesEnricher:
 
         boosted = 0
         for obs in observations:
-            x_l93, y_l93 = _TO_L93.transform(float(obs["lng"]), float(obs["lat"]))
+            lng = float(str(obs["lng"]))
+            lat = float(str(obs["lat"]))
+            x_l93, y_l93 = _TO_L93.transform(lng, lat)
             score_val = float(
                 _INAT_QUALITY_SCORES.get(str(obs.get("quality_grade", "needs_id")), 0.75)
             )
