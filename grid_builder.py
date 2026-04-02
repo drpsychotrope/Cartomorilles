@@ -1823,20 +1823,22 @@ class GridBuilder:
                 )).astype(bool)
 
                 if buf > 0:
-                    iterations = max(1, int(buf / self.cell_size))
-                    type_raster = np.asarray(
-                        binary_dilation(type_raster, iterations=iterations)
-                    ).astype(bool)
+                    iterations = max(0, round(buf / self.cell_size))
+                    if iterations > 0:
+                        type_raster = np.asarray(
+                            binary_dilation(type_raster, iterations=iterations)
+                        ).astype(bool)
 
                 combined_mask |= type_raster
 
             self.urban_mask = combined_mask
         else:
             if buffer_m > 0:
-                iterations = max(1, int(buffer_m / self.cell_size))
-                base_raster = np.asarray(
-                    binary_dilation(base_raster, iterations=iterations)
-                ).astype(bool)
+                iterations = max(0, round(buffer_m / self.cell_size))
+                if iterations > 0:
+                    base_raster = np.asarray(
+                        binary_dilation(base_raster, iterations=iterations)
+                    ).astype(bool)
             self.urban_mask = base_raster
 
         _um: np.ndarray = self.urban_mask
