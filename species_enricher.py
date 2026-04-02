@@ -23,7 +23,10 @@ import json
 import logging
 import time as _time
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
+
+import requests
+from pyproj import Transformer
 
 import numpy as np
 
@@ -41,6 +44,23 @@ except ImportError:
 logger = logging.getLogger("cartomorilles.species_enricher")
 
 __all__ = ["SpeciesEnricher"]
+
+# ═══════════════════════════════════════════════════════════════════
+# CONSTANTES — iNaturalist
+# ═══════════════════════════════════════════════════════════════════
+
+_INAT_BASE_URL: Final[str] = "https://api.inaturalist.org/v1/observations"
+_INAT_TAXON: Final[str] = "Morchella"
+_INAT_PER_PAGE: Final[int] = 200
+_INAT_CACHE_TTL_S: Final[int] = 7 * 24 * 3600          # 7 jours
+_INAT_QUALITY_SCORES: Final[dict[str, float]] = {
+    "research": 0.90,
+    "needs_id": 0.75,
+}
+_INAT_BUFFER_M: Final[float] = 100.0                    # rayon boost (mètres L93)
+_TO_L93: Final[Transformer] = Transformer.from_crs(
+    "EPSG:4326", "EPSG:2154", always_xy=True,
+)
 
 # ═══════════════════════════════════════════════════════════════════
 # CONSTANTES — MAPPING BD FORÊT v2 (calibré sur données réelles)
@@ -738,12 +758,20 @@ class SpeciesEnricher:
                     n_sub, " ".join(parts),
                 )
 
-        # ── Niveau C : observations ────────────────────────────────
+        # ── Niveau C : observations terrain ───────────────────────
         n_obs = self._apply_observations(
             tree_scores, enrichable, x_coords, y_coords,
         )
         if n_obs > 0:
             logger.info("  Niveau C : %d cellules", n_obs)
+
+        # ── Niveau C' : iNaturalist (Morchella, r=100m) ────────────
+        inat_obs = self._fetch_inaturalist(config.BBOX_WGS84)
+        n_inat = self._apply_inaturalist_boost(
+            tree_scores, enrichable, x_coords, y_coords, inat_obs,
+        )
+        if n_inat > 0:
+            logger.info("  Niveau C' : %d cellules (iNaturalist)", n_inat)
 
         # ── Niveaux B+D — vectorisé par combo keys ────────────────
         enriched = self._compute_regional_scores(
@@ -1383,6 +1411,153 @@ class SpeciesEnricher:
             )
 
         return count
+
+    # ═══════════════════════════════════════════════════════════════
+    # iNATURALIST — fetch + boost Morchella
+    # ═══════════════════════════════════════════════════════════════
+
+    def _fetch_inaturalist(
+        self,
+        bbox_wgs84: dict[str, float],
+        *,
+        cache_dir: Path | None = None,
+    ) -> list[dict[str, object]]:
+        """Récupère les observations Morchella iNaturalist dans la BBOX.
+
+        Retourne une liste de dicts : {"id", "lat", "lng", "quality_grade",
+        "observed_on"}.
+        Cache JSON TTL 7 jours dans cache_dir (défaut : data/cache/).
+        Retourne [] silencieusement si API indisponible.
+        """
+        cache_dir = cache_dir or Path("data/cache")
+        bbox_key = (
+            f"{bbox_wgs84['west']:.4f}_{bbox_wgs84['south']:.4f}_"
+            f"{bbox_wgs84['east']:.4f}_{bbox_wgs84['north']:.4f}"
+        )
+        cache_file = (
+            cache_dir
+            / f"inaturalist_{hashlib.md5(bbox_key.encode()).hexdigest()[:8]}.json"
+        )
+
+        # Charger le cache s'il est valide
+        if cache_file.exists():
+            try:
+                raw = json.loads(cache_file.read_text(encoding="utf-8"))
+                age = _time.time() - raw.get("fetched_at", 0)
+                if age < _INAT_CACHE_TTL_S:
+                    logger.info(
+                        "✅ iNaturalist : %d obs. depuis cache (%.0fh)",
+                        len(raw["results"]),
+                        age / 3600,
+                    )
+                    return list(raw["results"])
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+
+        # Requête API avec pagination (max 5 pages)
+        results: list[dict[str, object]] = []
+        params: dict[str, object] = {
+            "taxon_name": _INAT_TAXON,
+            "nelat": bbox_wgs84["north"],
+            "nelng": bbox_wgs84["east"],
+            "swlat": bbox_wgs84["south"],
+            "swlng": bbox_wgs84["west"],
+            "has_geo": "true",
+            "per_page": _INAT_PER_PAGE,
+            "page": 1,
+            "order_by": "quality_grade",
+        }
+        try:
+            while True:
+                resp = requests.get(_INAT_BASE_URL, params=params, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+                page_results: list[dict[str, object]] = data.get("results", [])
+                for obs in page_results:
+                    loc = obs.get("location", "")
+                    if not loc:
+                        continue
+                    parts = str(loc).split(",")
+                    if len(parts) != 2:
+                        continue
+                    results.append({
+                        "id": obs.get("id"),
+                        "lat": float(parts[0]),
+                        "lng": float(parts[1]),
+                        "quality_grade": obs.get("quality_grade", "needs_id"),
+                        "observed_on": obs.get("observed_on", ""),
+                    })
+                total = int(data.get("total_results", 0))
+                if len(results) >= total or len(page_results) < _INAT_PER_PAGE:
+                    break
+                params["page"] = int(params["page"]) + 1  # type: ignore[arg-type]
+                if int(params["page"]) > 5:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ iNaturalist indisponible : %s — skip", exc)
+            return []
+
+        # Sauvegarder le cache
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(
+            json.dumps(
+                {"fetched_at": _time.time(), "results": results},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        logger.info(
+            "✅ iNaturalist : %d observations Morchella récupérées", len(results),
+        )
+        return results
+
+    def _apply_inaturalist_boost(
+        self,
+        tree_scores: np.ndarray,
+        enrichable: np.ndarray,
+        x_coords: Any,
+        y_coords: Any,
+        observations: list[dict[str, object]],
+    ) -> int:
+        """Booste tree_species pour cellules dans un rayon de 100m d'une obs. Morchella.
+
+        Seules les cellules `enrichable` (unknown) sont ciblées.
+        Score : 0.90 (research) ou 0.75 (needs_id).
+        Retourne le nombre de cellules boostées.
+        """
+        if not observations or x_coords is None or y_coords is None:
+            return 0
+
+        if isinstance(x_coords, np.ndarray) and x_coords.ndim == 1:
+            xx, yy = np.meshgrid(x_coords, y_coords)
+        else:
+            xx, yy = np.asarray(x_coords), np.asarray(y_coords)
+
+        boosted = 0
+        for obs in observations:
+            x_l93, y_l93 = _TO_L93.transform(float(obs["lng"]), float(obs["lat"]))
+            score_val = float(
+                _INAT_QUALITY_SCORES.get(str(obs.get("quality_grade", "needs_id")), 0.75)
+            )
+            dist2: np.ndarray = (xx - x_l93) ** 2 + (yy - y_l93) ** 2
+            target = (
+                enrichable
+                & (dist2 <= _INAT_BUFFER_M ** 2)
+                & (tree_scores < score_val)
+            )
+            if np.any(target):
+                tree_scores[target] = np.float32(score_val)
+                enrichable[target] = False
+                boosted += int(np.count_nonzero(target))
+
+        if boosted:
+            logger.info(
+                "✅ iNaturalist boost : %d cellules (Morchella, r=%.0fm)",
+                boosted,
+                _INAT_BUFFER_M,
+            )
+        return boosted
 
     # ═══════════════════════════════════════════════════════════════
     # PARSEUR TFV — code structuré + texte libre
