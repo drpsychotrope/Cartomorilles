@@ -36,7 +36,6 @@ from branca.element import Element  # type: ignore[import-untyped]  # noqa: E402
 from folium.plugins import MeasureControl, MiniMap, MousePosition  # noqa: E402
 from folium.raster_layers import ImageOverlay  # noqa: E402
 from PIL import Image  # noqa: E402
-from pyproj import Transformer  # noqa: E402
 from rasterio.crs import CRS  # noqa: E402
 from rasterio.transform import from_bounds  # noqa: E402
 from rasterio.warp import (  # noqa: E402
@@ -49,6 +48,7 @@ from shapely.geometry import box as shapely_box  # noqa: E402
 import _accel  # noqa: E402
 import config  # noqa: E402
 from config import TWI_OPTIMAL, TWI_WATERLOG  # noqa: E402
+from utils import TO_WGS84  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -181,10 +181,12 @@ def _encode_rgba(
     Centralise la compression rapide (compress_level=1 par défaut).
     PIL relâche le GIL pendant la compression → thread-safe.
     """
-    img = Image.fromarray(np.asarray(rgba, dtype=np.uint8), mode="RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", compress_level=compress_level)
-    return buf.getvalue()
+    with Image.fromarray(
+        np.asarray(rgba, dtype=np.uint8), mode="RGBA",
+    ) as img:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", compress_level=compress_level)
+        return buf.getvalue()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -225,11 +227,7 @@ class MorilleVisualizer:
         self._elim_mask: np.ndarray = _em
         self._elim_detail: dict[str, Any] = _ed
 
-        self._to_wgs84 = Transformer.from_crs(
-            "EPSG:2154",
-            "EPSG:4326",
-            always_xy=True,
-        )
+        self._to_wgs84 = TO_WGS84
 
         half = config.CELL_SIZE / 2.0
         self._xmin_l93 = float(np.min(self.grid.x_coords)) - half
@@ -712,10 +710,10 @@ class MorilleVisualizer:
         else:
             logger.debug("   Altitude non disponible pour data PNG")
 
-        img = Image.fromarray(rgb, mode="RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", compress_level=6)
-        png_bytes = buf.getvalue()
+        with Image.fromarray(rgb, mode="RGB") as img:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", compress_level=6)
+            png_bytes = buf.getvalue()
         size_kb = len(png_bytes) / 1024
         logger.info(
             "✅ Data PNG : %dx%d px (%.0f KB) — score+alt",
@@ -750,10 +748,10 @@ class MorilleVisualizer:
         else:
             logger.debug("   Pente non disponible pour slope PNG")
 
-        img = Image.fromarray(rgb, mode="RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", compress_level=6)
-        png_bytes = buf.getvalue()
+        with Image.fromarray(rgb, mode="RGB") as img:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", compress_level=6)
+            png_bytes = buf.getvalue()
         size_kb = len(png_bytes) / 1024
         logger.info(
             "✅ Slope PNG : %dx%d px (%.0f KB) — pente",

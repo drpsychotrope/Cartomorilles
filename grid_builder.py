@@ -68,6 +68,7 @@ from config import (
     URBAN_DIST_FULL,
     URBAN_PROXIMITY_FLOOR,
 )
+from utils import TO_WGS84, compute_array_stats
 
 try:
     from _twi_numba import _accumulate_d8
@@ -189,9 +190,7 @@ class GridBuilder:
             self.ny,
         )
 
-        self.to_wgs84: Transformer = Transformer.from_crs(
-            "EPSG:2154", "EPSG:4326", always_xy=True
-        )
+        self.to_wgs84: Transformer = TO_WGS84
 
         # Scores par critère (chaque valeur = array (ny, nx) dans [0, 1])
         self.scores: dict[str, np.ndarray] = {}
@@ -417,7 +416,7 @@ class GridBuilder:
             nan_mask_raw = np.isnan(dem_raw)
             altitude = self._zoom_grid(dem_raw, nan_mask_raw, order=1)
         else:
-            altitude = dem_raw.copy()
+            altitude = dem_raw
         self.altitude = altitude
 
         # ── Masque NoData (sur grille cible) ──
@@ -2527,11 +2526,7 @@ class GridBuilder:
             )
 
             summary[name] = {
-                "min": round(float(np.nanmin(valid)), 4),
-                "max": round(float(np.nanmax(valid)), 4),
-                "mean": round(float(np.nanmean(valid)), 4),
-                "median": round(float(np.nanmedian(valid)), 4),
-                "std": round(float(np.nanstd(valid)), 4),
+                **compute_array_stats(valid, decimals=4),
                 "pct_zero": round(
                     float(np.sum(valid == 0)) / valid.size * 100, 2
                 ),

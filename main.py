@@ -42,7 +42,6 @@ from types import FrameType
 from typing import Any
 
 import numpy as np
-from pyproj import Transformer
 
 from config import (
     ALTITUDE_OPTIMAL,
@@ -51,6 +50,9 @@ from config import (
     BBOX_WGS84,
     CELL_SIZE,
     GEOLOGY_SCORES,
+    N_SCORING_GRIDS,
+    SCORE_THRESHOLD_HIGH,
+    SCORE_THRESHOLD_MEDIUM,
     SLOPE_MAX,
     SLOPE_OPTIMAL,
     TREE_SCORES,
@@ -63,6 +65,7 @@ from data_loader import DataLoader
 from grid_builder import GridBuilder
 from scoring import MorilleScoring
 from species_enricher import SpeciesEnricher
+from utils import TO_L93, TO_WGS84, compute_array_stats, hotspot_to_export_dict
 from visualize import MorilleVisualizer
 from weather import WeatherChecker
 
@@ -71,10 +74,6 @@ from weather import WeatherChecker
 # ═══════════════════════════════════════════════════════════════
 
 VERSION = "2.4.0"
-
-# Transformer réutilisable (L93 → WGS84, always_xy pour lon/lat)
-_TO_WGS84 = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
-_TO_L93 = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
 
 # ── Chemins par défaut des données locales ─────────────────────
 _DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -305,7 +304,7 @@ def estimate_grid_size(cell_size: float) -> dict[str, Any]:
     nx = int(dx / cell_size)
     ny = int(dy / cell_size)
     n_cells = nx * ny
-    mem_mb = n_cells * 4 * 15 / 1024 / 1024  # 15 grids × float32
+    mem_mb = n_cells * 4 * N_SCORING_GRIDS / 1024 / 1024  # float32
 
     return {
         "dx_m": dx, "dy_m": dy,
@@ -375,22 +374,29 @@ def compute_statistics(
     threshold: float,
 ) -> dict[str, Any]:
     """Calcule les statistiques du score final."""
+    base = compute_array_stats(final_score, decimals=4)
     return {
         "n_cells": int(final_score.size),
-        "score_min": round(float(np.nanmin(final_score)), 4),
-        "score_max": round(float(np.nanmax(final_score)), 4),
-        "score_mean": round(float(np.nanmean(final_score)), 4),
-        "score_median": round(float(np.nanmedian(final_score)), 4),
-        "score_std": round(float(np.nanstd(final_score)), 4),
-        "n_high": int(np.sum(final_score >= 0.7)),
-        "n_medium": int(np.sum((final_score >= 0.4) & (final_score < 0.7))),
-        "n_low": int(np.sum(final_score < 0.4)),
+        "score_min": base["min"],
+        "score_max": base["max"],
+        "score_mean": base["mean"],
+        "score_median": base["median"],
+        "score_std": base["std"],
+        "n_high": int(np.sum(final_score >= SCORE_THRESHOLD_HIGH)),
+        "n_medium": int(np.sum(
+            (final_score >= SCORE_THRESHOLD_MEDIUM)
+            & (final_score < SCORE_THRESHOLD_HIGH)
+        )),
+        "n_low": int(np.sum(final_score < SCORE_THRESHOLD_MEDIUM)),
         "pct_high": round(
-            float(np.sum(final_score >= 0.7)) / final_score.size * 100, 2,
+            float(np.sum(final_score >= SCORE_THRESHOLD_HIGH))
+            / final_score.size * 100, 2,
         ),
         "pct_medium": round(
-            float(np.sum((final_score >= 0.4) & (final_score < 0.7)))
-            / final_score.size * 100, 2,
+            float(np.sum(
+                (final_score >= SCORE_THRESHOLD_MEDIUM)
+                & (final_score < SCORE_THRESHOLD_HIGH)
+            )) / final_score.size * 100, 2,
         ),
         "hotspot_threshold": threshold,
     }
@@ -444,7 +450,7 @@ def validate_against_terrain(model: MorilleScoring) -> float | None:
         logger.info("📍 Validation croisée terrain :")
 
         for pt in TERRAIN_CHECKPOINTS:
-            x, y = _TO_L93.transform(pt["lon"], pt["lat"])
+            x, y = TO_L93.transform(pt["lon"], pt["lat"])
 
             if not hasattr(grid, "x_coords") or not hasattr(grid, "y_coords"):
                 logger.debug(
@@ -507,7 +513,7 @@ def display_hotspots(
     )
 
     for h in hotspots[:n_show]:
-        lon, lat = _TO_WGS84.transform(h["x_l93"], h["y_l93"])
+        lon, lat = TO_WGS84.transform(h["x_l93"], h["y_l93"])
 
         parts: list[str] = [
             f"Score {h['mean_score']:.2f}",
@@ -552,7 +558,7 @@ def save_hotspots_csv(
 
     rows: list[dict[str, Any]] = []
     for rank, h in enumerate(hotspots, 1):
-        lon, lat = _TO_WGS84.transform(h["x_l93"], h["y_l93"])
+        enriched = hotspot_to_export_dict(h, rank=rank)
         rows.append({
             "rank": rank,
             "id": h.get("id", ""),
@@ -566,13 +572,11 @@ def save_hotspots_csv(
             "dominant_geology": h.get("dominant_geology", "unknown"),
             "compactness": round(float(h.get("compactness", 0.0)), 3),
             "confidence": round(float(h.get("confidence", 0.0)), 2),
-            "lat": round(lat, 5),
-            "lon": round(lon, 5),
+            "lat": enriched["lat"],
+            "lon": enriched["lon"],
             "x_l93": round(float(h["x_l93"]), 1),
             "y_l93": round(float(h["y_l93"]), 1),
-            "google_maps": (
-                f"https://www.google.com/maps?q={lat:.5f},{lon:.5f}"
-            ),
+            "google_maps": enriched["google_maps"],
         })
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -599,18 +603,9 @@ def save_report(
     enrichment_stats: dict[str, Any] | None = None,
 ) -> Path:
     """Sauvegarde un rapport JSON complet et reproductible."""
-    hotspots_export: list[dict[str, Any]] = []
-    for h in hotspots[:30]:
-        lon, lat = _TO_WGS84.transform(h["x_l93"], h["y_l93"])
-        entry: dict[str, Any] = {
-            **h,
-            "lat": round(lat, 5),
-            "lon": round(lon, 5),
-            "google_maps": (
-                f"https://www.google.com/maps?q={lat:.5f},{lon:.5f}"
-            ),
-        }
-        hotspots_export.append(entry)
+    hotspots_export: list[dict[str, Any]] = [
+        hotspot_to_export_dict(h) for h in hotspots[:30]
+    ]
 
     report: dict[str, Any] = {
         "tool": "Cartomorilles",

@@ -751,6 +751,13 @@ PROBABILITY_LABELS: Final[tuple[str, ...]] = (
     "Excellent",
 )
 
+# Seuils binaires pour statistiques de reporting (main.compute_final_stats)
+SCORE_THRESHOLD_HIGH: Final[float] = 0.7
+SCORE_THRESHOLD_MEDIUM: Final[float] = 0.4
+
+# Nombre de grilles float32 gardées en mémoire simultanément (estim. RAM)
+N_SCORING_GRIDS: Final[int] = 15
+
 
 # ═══════════════════════════════════════════════════════════════
 #  FONDS DE CARTE FOLIUM
