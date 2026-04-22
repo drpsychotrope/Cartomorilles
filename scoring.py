@@ -27,6 +27,7 @@ from scipy.ndimage import (
     generate_binary_structure,
     zoom,
 )
+
 import _accel
 import config
 from config import TWI_WATERLOG
@@ -266,6 +267,7 @@ class MorilleScoring:
         self._compute_global_confidence()
 
         self._step_weighted = True
+        _accel.free_gpu_memory()
         return self
 
     def _compute_global_confidence(self) -> None:
@@ -411,6 +413,7 @@ class MorilleScoring:
         self.elimination_detail = detail
 
         self._step_eliminated = True
+        _accel.free_gpu_memory()
         return self
 
     # ------------------------------------------------------------------

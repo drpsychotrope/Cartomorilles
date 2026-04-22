@@ -24,11 +24,17 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numba import njit, prange
+from pyproj import Transformer
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger("cartomorilles._accel")
+
+# Transformer module-level (évite réinstanciation à chaque appel)
+_WGS84_TO_L93: Transformer = Transformer.from_crs(
+    "EPSG:4326", "EPSG:2154", always_xy=True,
+)
 
 # ═══════════════════════════════════════════════════════════════════
 # GPU BACKEND DETECTION
@@ -707,11 +713,7 @@ def reproject_l93_to_wgs84(
     lons_2d, lats_2d = np.meshgrid(lons_1d, lats_1d)
 
     # ── Projection WGS84 → L93 ──
-    from pyproj import Transformer
-    wgs84_to_l93 = Transformer.from_crs(
-        "EPSG:4326", "EPSG:2154", always_xy=True,
-    )
-    x_l93, y_l93 = wgs84_to_l93.transform(lons_2d, lats_2d)
+    x_l93, y_l93 = _WGS84_TO_L93.transform(lons_2d, lats_2d)
 
     # ── Coordonnées pixel dans le raster source ──
     # Source orienté row 0 = nord → ymax en haut

@@ -27,12 +27,12 @@ from collections.abc import Mapping
 from typing import Any, Final
 
 import requests
-from pyproj import Transformer
 
 import numpy as np
 
 import _accel
 import config
+from utils import TO_L93 as _TO_L93
 
 try:
     import geopandas as gpd
@@ -59,9 +59,6 @@ _INAT_QUALITY_SCORES: Final[dict[str, float]] = {
     "needs_id": 0.75,
 }
 _INAT_BUFFER_M: Final[float] = 100.0                    # rayon boost (mètres L93)
-_TO_L93: Final[Transformer] = Transformer.from_crs(
-    "EPSG:4326", "EPSG:2154", always_xy=True,
-)
 
 # ═══════════════════════════════════════════════════════════════════
 # CONSTANTES — MAPPING BD FORÊT v2 (calibré sur données réelles)

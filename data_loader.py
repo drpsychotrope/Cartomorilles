@@ -20,6 +20,7 @@ import json
 import logging
 import time
 from collections.abc import Mapping
+from contextlib import ExitStack
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -28,7 +29,6 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 import requests
-from pyproj import Transformer
 from rasterio.errors import RasterioIOError
 from rasterio.windows import Window  # type: ignore[call-arg]
 from rasterio.transform import from_bounds
@@ -48,6 +48,7 @@ from config import (
     resolve_geology,
     resolve_tree_name,
 )
+from utils import TO_L93 as _TO_L93
 
 # ═══════════════════════════════════════════════════════════════
 #  MODULE-LEVEL
@@ -59,8 +60,6 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 TARGET_CRS = "EPSG:2154"
-
-_TO_L93 = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
 
 OVERPASS_SERVERS: tuple[str, ...] = (
     "https://overpass-api.de/api/interpreter",
@@ -709,15 +708,15 @@ class DataLoader:
         if len(valid_paths) > 1:
             from rasterio.merge import merge
 
-            datasets = [rasterio.open(p) for p in valid_paths]
-            try:
+            with ExitStack() as stack:
+                datasets = [
+                    stack.enter_context(rasterio.open(p))
+                    for p in valid_paths
+                ]
                 dem_merged, merged_transform = merge(datasets)
                 dem_wgs84 = dem_merged[0].astype(np.float32)
                 src_crs = datasets[0].crs
                 src_transform = merged_transform
-            finally:
-                for ds in datasets:
-                    ds.close()
         else:
             with rasterio.open(valid_paths[0]) as src:
                 from rasterio.windows import from_bounds as window_from_bounds
