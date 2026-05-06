@@ -49,6 +49,7 @@ from config import (
     BBOX,
     BBOX_WGS84,
     CELL_SIZE,
+    CONFIG_VERSION,
     GEOLOGY_SCORES,
     N_SCORING_GRIDS,
     SCORE_THRESHOLD_HIGH,
@@ -73,7 +74,7 @@ from weather import WeatherChecker
 #  CONSTANTES MODULE
 # ═══════════════════════════════════════════════════════════════
 
-VERSION = "2.5.0"
+VERSION = CONFIG_VERSION
 
 # ── Chemins par défaut des données locales ─────────────────────
 _DATA_DIR = Path(__file__).resolve().parent / "data"
