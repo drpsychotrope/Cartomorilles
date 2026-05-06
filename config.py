@@ -2,16 +2,22 @@
 🍄 CARTOMORILLES — Configuration du modèle (v2.5.4)
    Zone : Isère (38) — 107.4×131.2 km, emprise dept élargie est+sud
 
-   v2.5.4 :
-     - SLOPE_OPTIMAL (0,15) → (0,20) — biblio M. esculenta 0-20° optimal
-     - ALTITUDE_OPTIMAL (200,600) → (200,700) — étage collinéen classique étendu
-     - SOFT_ELIM_BUFFER hardcoded 15m → constant 15m (config) — réduction 5m TESTÉE puis ABANDONNÉE
-       Test 5m a régressé max 0.739→0.680 car buffer agit comme anti-noise
-       indirect (réduit cellules low-score près d'élim, élève baricentre smoothing).
-     - _accel.gaussian_filter accepte truncate (défaut 4.0) — API bonus
-     - scoring.apply_spatial_smoothing : truncate=2.0 TESTÉ puis ABANDONNÉ
-       (régression similaire — smoothing normalisé BOOST les borderlines)
-     - Décisions ajoutées : D36 (D36-c et D36-d documentés comme rejets)
+   v2.5.4 — TENTATIVES TOUTES ABANDONNÉES (régressions confirmées) :
+     - SLOPE_OPTIMAL (0,15)→(0,20) : régresse max 0.739→0.679
+       contre-intuitif (slope widening augmente pourtant pré-pipeline scores).
+       Cause exacte : interaction smoothing + redistribution scores neighbors.
+     - ALTITUDE_OPTIMAL (200,600)→(200,700) : régresse de manière similaire
+     - SOFT_ELIM_BUFFER 15m→5m : régresse max 0.739→0.680 — buffer 15m
+       agit comme anti-noise indirect (réduit cellules low-score près d'élim,
+       élève baricentre smoothing pour cellules forêt voisines).
+     - scoring.apply_spatial_smoothing truncate=4.0→2.0 : régresse pour
+       raison similaire — smoothing normalisé BOOST les borderlines via
+       convolution avec voisins valides, pas réduction des pics.
+     APIs ajoutées et CONSERVÉES (utiles indépendamment du score) :
+     - _accel.gaussian_filter accepte truncate kwarg
+     - SOFT_ELIM_BUFFER explicité dans config (avant : fallback hardcoded)
+     CONFIG_VERSION conservé en 2.5.4 pour tracer les apprentissages.
+     Décision : v2.5.3 retenu comme état production. D36 documente l'échec.
 
    v2.5.3 :
      - calc_dry threshold tree_species ≤ 0.50 → ≤ 0.30 (scoring.py)
@@ -629,7 +635,7 @@ def get_geology_score(raw_code: str | None) -> float:
 #  M. esculenta — optimal 200-600m (plaine + collines)
 #  M. elata     — peut monter à 800-1200m (conifères)
 
-ALTITUDE_OPTIMAL: Final[tuple[float, float]] = (200.0, 700.0)   # v2.5.4 : 600→700 (M. esculenta classique 200-700m)
+ALTITUDE_OPTIMAL: Final[tuple[float, float]] = (200.0, 600.0)   # v2.5.4 (200,700) testé puis reverté
 ALTITUDE_RANGE: Final[tuple[float, float]] = (150.0, 900.0)
 
 # Centre du bonus micro-nappe / humidité résiduelle
@@ -649,17 +655,13 @@ ALTITUDE_ALLUVIAL_CENTER: Final[float] = 350.0
 #  40-45°  : très raide (0.1 → 0.0)
 #    >45°  : éliminatoire
 
-SLOPE_OPTIMAL: Final[tuple[float, float]] = (0.0, 20.0)   # v2.5.4 : 15→20 (biblio M. esculenta 0-20° optimal)
+SLOPE_OPTIMAL: Final[tuple[float, float]] = (0.0, 15.0)   # v2.5.4 (0,20) testé puis reverté
 SLOPE_MODERATE: Final[float] = 30.0
 SLOPE_STEEP: Final[float] = 40.0
 SLOPE_MAX: Final[float] = 45.0
 
-# v2.5.4 : SOFT_ELIM_BUFFER explicité dans config (auparavant fallback 15.0)
-# Test 5m a régressé le max (0.739→0.680) car le buffer agissait comme
-# anti-noise indirect : il réduisait les cellules low-score adjacentes aux
-# zones éliminées, élevant le baricentre du smoothing normalisé pour les
-# cellules forêt voisines. Buffer trop petit (1px à cell=10m) désactive l'effet.
-# 15m maintenu comme valeur fonctionnelle.
+# v2.5.4 : SOFT_ELIM_BUFFER explicité dans config (auparavant fallback 15.0
+# dans scoring.py via getattr). Tests 5m régressaient le max — 15m conservé.
 SOFT_ELIM_BUFFER: Final[float] = 15.0
 
 
