@@ -260,7 +260,8 @@ _TREE_SCORES_DICT: dict[str, float] = {
     "bouleau":            0.05,
     "buis":               0.05,
     # ── Défaut — forêt sans essence connue ≠ pas de forêt ──
-    "unknown":            0.25,
+    # v2.5.2 : 0.25 → 0.40 — forêt taguée sans essence ID = 64% du couvert
+    "unknown":            0.40,
 }
 
 # ── Landcover : plancher green_score pour cellules BD Forêt ──
