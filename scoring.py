@@ -59,10 +59,11 @@ _MIN_CLUSTER_SIZE: int = getattr(config, "MIN_CLUSTER_SIZE", 4)
 _HOTSPOT_CLOSING_RADIUS: int = getattr(config, "HOTSPOT_CLOSING_RADIUS", 1)
 
 # Fix #23 — Pénalité de couverture pour cellules à critères manquants
-# v2.5.1 : floor 0.5 → 0.75 (pénalité max 25% au lieu de 50%)
+# v2.5.1 : floor 0.5 → 0.75 (pénalité max 25%)
+# v2.5.2 : floor 0.75 → 0.85 (pénalité max 15%) — D34
 # Cellule complète (10/10 critères) : × 1.0
-# Cellule à 50% de couverture       : × 0.875 (était 0.75)
-_COVERAGE_PENALTY_FLOOR: float = 0.75
+# Cellule à 50% de couverture       : × 0.925 (était 0.875)
+_COVERAGE_PENALTY_FLOOR: float = 0.85
 
 # Structure 8-connexité réutilisée
 _STRUCT_8CONN: np.ndarray = np.asarray(generate_binary_structure(2, 2))
