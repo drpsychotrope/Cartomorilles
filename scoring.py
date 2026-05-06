@@ -800,11 +800,13 @@ class MorilleScoring:
         score_valid = np.where(valid, self.final_score, 0.0)
         weights = valid.astype(np.float64)
 
+        # v2.5.4 : truncate=2.0 (au lieu de 4.0 par défaut) — kernel plus
+        # compact, préserve mieux les pics. Avec sigma=0.5, kernel passe de 5x5 à 3x3.
         num: np.ndarray = _accel.gaussian_filter(
-            score_valid, sigma=sigma, mode="nearest",
+            score_valid, sigma=sigma, mode="nearest", truncate=2.0,
         )
         den: np.ndarray = _accel.gaussian_filter(
-            weights, sigma=sigma, mode="nearest",
+            weights, sigma=sigma, mode="nearest", truncate=2.0,
         )
 
         with np.errstate(invalid="ignore", divide="ignore"):

@@ -1,6 +1,16 @@
 """
-🍄 CARTOMORILLES — Configuration du modèle (v2.5.3)
+🍄 CARTOMORILLES — Configuration du modèle (v2.5.4)
    Zone : Isère (38) — 107.4×131.2 km, emprise dept élargie est+sud
+
+   v2.5.4 :
+     - SLOPE_OPTIMAL (0,15) → (0,20) — biblio M. esculenta 0-20° optimal
+     - ALTITUDE_OPTIMAL (200,600) → (200,700) — étage collinéen classique étendu
+     - SOFT_ELIM_BUFFER hardcoded 15m → constant 5m (config)
+       Préserve cellules forêt légitimes adjacentes routes/ruisseaux
+     - _accel.gaussian_filter accepte truncate (défaut 4.0)
+     - scoring.apply_spatial_smoothing : truncate=2.0
+       Kernel plus compact (5x5 → 3x3 à sigma=0.5), préserve pics
+     - Décisions ajoutées : D36
 
    v2.5.3 :
      - calc_dry threshold tree_species ≤ 0.50 → ≤ 0.30 (scoring.py)
@@ -56,7 +66,7 @@ from typing import Any, Final
 #  MÉTADONNÉES
 # ═══════════════════════════════════════════════════════════════
 
-CONFIG_VERSION: Final[str] = "2.5.3"
+CONFIG_VERSION: Final[str] = "2.5.4"
 
 logger = logging.getLogger("cartomorilles.config")
 
@@ -618,7 +628,7 @@ def get_geology_score(raw_code: str | None) -> float:
 #  M. esculenta — optimal 200-600m (plaine + collines)
 #  M. elata     — peut monter à 800-1200m (conifères)
 
-ALTITUDE_OPTIMAL: Final[tuple[float, float]] = (200.0, 600.0)
+ALTITUDE_OPTIMAL: Final[tuple[float, float]] = (200.0, 700.0)   # v2.5.4 : 600→700 (M. esculenta classique 200-700m)
 ALTITUDE_RANGE: Final[tuple[float, float]] = (150.0, 900.0)
 
 # Centre du bonus micro-nappe / humidité résiduelle
@@ -638,10 +648,15 @@ ALTITUDE_ALLUVIAL_CENTER: Final[float] = 350.0
 #  40-45°  : très raide (0.1 → 0.0)
 #    >45°  : éliminatoire
 
-SLOPE_OPTIMAL: Final[tuple[float, float]] = (0.0, 15.0)
+SLOPE_OPTIMAL: Final[tuple[float, float]] = (0.0, 20.0)   # v2.5.4 : 15→20 (biblio M. esculenta 0-20° optimal)
 SLOPE_MODERATE: Final[float] = 30.0
 SLOPE_STEEP: Final[float] = 40.0
 SLOPE_MAX: Final[float] = 45.0
+
+# v2.5.4 : transition douce autour zones éliminées (urbain/eau/géol/etc.)
+# 15m rabotait des cellules forêt légitimes près de routes/ruisseaux.
+# 5m suffit pour cohérence visuelle, préserve cellules adjacentes.
+SOFT_ELIM_BUFFER: Final[float] = 5.0
 
 
 # ═══════════════════════════════════════════════════════════════
