@@ -5,13 +5,13 @@
    v2.5.4 :
      - SLOPE_OPTIMAL (0,15) → (0,20) — biblio M. esculenta 0-20° optimal
      - ALTITUDE_OPTIMAL (200,600) → (200,700) — étage collinéen classique étendu
-     - SOFT_ELIM_BUFFER hardcoded 15m → constant 5m (config)
-       Préserve cellules forêt légitimes adjacentes routes/ruisseaux
+     - SOFT_ELIM_BUFFER hardcoded 15m → constant 15m (config) — réduction 5m TESTÉE puis ABANDONNÉE
+       Test 5m a régressé max 0.739→0.680 car buffer agit comme anti-noise
+       indirect (réduit cellules low-score près d'élim, élève baricentre smoothing).
      - _accel.gaussian_filter accepte truncate (défaut 4.0) — API bonus
-     - scoring.apply_spatial_smoothing : truncate=2.0 ABANDONNÉ
-       Test a régressé max 0.739 → 0.680. Smoothing normalisé BOOST les
-       cellules borderline (pas réduction des pics). Truncate=4.0 maintenu.
-     - Décisions ajoutées : D36 (D36-d truncate documentée comme rejet)
+     - scoring.apply_spatial_smoothing : truncate=2.0 TESTÉ puis ABANDONNÉ
+       (régression similaire — smoothing normalisé BOOST les borderlines)
+     - Décisions ajoutées : D36 (D36-c et D36-d documentés comme rejets)
 
    v2.5.3 :
      - calc_dry threshold tree_species ≤ 0.50 → ≤ 0.30 (scoring.py)
@@ -654,10 +654,13 @@ SLOPE_MODERATE: Final[float] = 30.0
 SLOPE_STEEP: Final[float] = 40.0
 SLOPE_MAX: Final[float] = 45.0
 
-# v2.5.4 : transition douce autour zones éliminées (urbain/eau/géol/etc.)
-# 15m rabotait des cellules forêt légitimes près de routes/ruisseaux.
-# 5m suffit pour cohérence visuelle, préserve cellules adjacentes.
-SOFT_ELIM_BUFFER: Final[float] = 5.0
+# v2.5.4 : SOFT_ELIM_BUFFER explicité dans config (auparavant fallback 15.0)
+# Test 5m a régressé le max (0.739→0.680) car le buffer agissait comme
+# anti-noise indirect : il réduisait les cellules low-score adjacentes aux
+# zones éliminées, élevant le baricentre du smoothing normalisé pour les
+# cellules forêt voisines. Buffer trop petit (1px à cell=10m) désactive l'effet.
+# 15m maintenu comme valeur fonctionnelle.
+SOFT_ELIM_BUFFER: Final[float] = 15.0
 
 
 # ═══════════════════════════════════════════════════════════════
