@@ -58,7 +58,7 @@ _INAT_QUALITY_SCORES: Final[dict[str, float]] = {
     "research": 0.90,
     "needs_id": 0.75,
 }
-_INAT_BUFFER_M: Final[float] = 100.0                    # rayon boost (mètres L93)
+_INAT_BUFFER_M: Final[float] = 200.0                    # rayon boost (mètres L93)
 
 # ═══════════════════════════════════════════════════════════════════
 # CONSTANTES — MAPPING BD FORÊT v2 (calibré sur données réelles)

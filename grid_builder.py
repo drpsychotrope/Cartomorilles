@@ -459,7 +459,7 @@ class GridBuilder:
         # ── Resample vers grille cible ──
         if needs_resample:
             self.slope = self._zoom_grid(
-                native_slope, nan_mask_native, order=1,
+                native_slope, nan_mask_native, order=0,
             )
             self.aspect = self._zoom_grid(
                 native_aspect, nan_mask_native, order=0,
@@ -727,11 +727,11 @@ class GridBuilder:
           0–15°  optimal     → 1.0
          15–30°  modéré      → 1.0 → 0.55
          30–40°  raide       → 0.55 → 0.15
-         40–50°  très raide  → 0.15 → 0.0
-           >50°  éliminatoire → 0.0
+         40–45°  très raide  → 0.15 → 0.0
+           >45°  éliminatoire → 0.0
         """
         if self._skip_zero_weight("slope"):
-            return self        
+            return self
         self._require_terrain()
         _slope = self.slope
         assert _slope is not None
@@ -739,7 +739,7 @@ class GridBuilder:
         opt_max  = SLOPE_OPTIMAL[1]    # 15°
         moderate = SLOPE_MODERATE       # 30°
         steep    = SLOPE_STEEP          # 40°
-        maximum  = SLOPE_MAX            # 50°
+        maximum  = SLOPE_MAX            # 45°
 
         score = np.ones_like(_slope, dtype=np.float32)
 
@@ -755,13 +755,13 @@ class GridBuilder:
             t = (_slope[mask] - moderate) / (steep - moderate)
             score[mask] = 0.55 - 0.40 * (t ** 0.7)
 
-        # 40–50° : très raide (0.15 → 0.0)
+        # 40–45° : très raide (0.15 → 0.0)
         mask = (_slope > steep) & (_slope <= maximum)
         if mask.any():
             t = (_slope[mask] - steep) / (maximum - steep)
             score[mask] = 0.15 * (1.0 - t)
 
-        # >50° : éliminatoire
+        # >45° : éliminatoire
         score[_slope > maximum] = 0.0
 
         score = self._apply_nodata(np.clip(score, 0, 1))
@@ -1755,15 +1755,24 @@ class GridBuilder:
             )
             deep_forest_dry = deep_forest & ~ideal_humid
 
-            # v2.3.6 : cap plus haut si géologie favorable
-            cap = np.full((self.ny, self.nx), 0.45, dtype=np.float32)
+            # v2.5.0 : cap relevé — hêtraie riche sur calcaire = signal fort
+            # même en intérieur profond (couverture litière, pH favorable).
+            cap = np.full((self.ny, self.nx), 0.55, dtype=np.float32)  # défaut 0.45→0.55
             geo = self.scores.get("geology")
+            ts = self.scores.get("tree_species")
             if (
                 geo is not None
                 and isinstance(geo, np.ndarray)
                 and geo.shape == cap.shape
             ):
-                cap[geo > 0.70] = 0.55
+                cap[geo > 0.70] = 0.70  # calcaire : 0.55→0.70
+                # bonus combiné calcaire + essence favorable : cap 0.80
+                if (
+                    ts is not None
+                    and isinstance(ts, np.ndarray)
+                    and ts.shape == cap.shape
+                ):
+                    cap[(geo > 0.70) & (ts > 0.60)] = 0.80
 
             if deep_forest_dry.any():
                 score[deep_forest_dry] = np.minimum(
@@ -1787,16 +1796,17 @@ class GridBuilder:
         self, disturbance_data: np.ndarray | None = None
     ) -> GridBuilder:
         """
-        Score de perturbation du sol — v2.3.6.
+        Score de perturbation du sol — v2.5.0.
 
+        v2.5.0 : floor 0.30→0.40 en forêt intérieure — vieille hêtraie/frênaie
+                  stable fructifie aussi (pas uniquement coupes/chablis récents).
         v2.3.6 : bonus pente (chablis/exploitation) + bande altitudinale.
-                  Corrige biais plaine vs montagne.
 
         Note : le bonus proximité urbaine nécessite que apply_urban_mask()
         ait été appelé AVANT cette méthode (Fix #15 — corrigé dans main.py).
         """
         if self._skip_zero_weight("disturbance"):
-            return self        
+            return self
         self._require_terrain()
 
         if disturbance_data is not None:
@@ -1814,11 +1824,12 @@ class GridBuilder:
                 * self.cell_size
             )
 
-            score = np.full((self.ny, self.nx), 0.3, dtype=np.float32)
+            # v2.5.0 : base 0.40 (vs 0.30) — fructification baseline vieille forêt
+            score = np.full((self.ny, self.nx), 0.40, dtype=np.float32)
             near_edge = dist_to_edge < 15
             if near_edge.any():
                 t = dist_to_edge[near_edge] / 15.0
-                score[near_edge] = 0.7 - 0.4 * t
+                score[near_edge] = 0.7 - 0.3 * t  # 0.7 → 0.40 à 15m
 
             # ── v2.3.6 : bonus pente 15-35° en forêt (chablis naturels) ──
             _slope = self.slope
@@ -1909,19 +1920,25 @@ class GridBuilder:
             * self.cell_size
         )
 
+        # v2.5.0 : floor 0.5 en forêt intérieure (morilles poussent partout,
+        # pas juste à la lisière). Ancienne courbe : dist>50m → 0.1 (biais lisière).
         score = np.zeros_like(dist, dtype=np.float32)
 
         score[dist <= 5] = 1.0
 
         mask = (dist > 5) & (dist <= 20)
         if mask.any():
-            score[mask] = 1.0 - 0.5 * ((dist[mask] - 5) / 15.0)
+            score[mask] = 1.0 - 0.25 * ((dist[mask] - 5) / 15.0)  # 1.0 → 0.75
 
         mask = (dist > 20) & (dist <= 50)
         if mask.any():
-            score[mask] = 0.5 - 0.4 * ((dist[mask] - 20) / 30.0)
+            score[mask] = 0.75 - 0.25 * ((dist[mask] - 20) / 30.0)  # 0.75 → 0.50
 
-        score[dist > 50] = 0.1
+        # Hors forêt OU intérieur profond → floor différencié
+        interior = (dist > 50) & (self.forest_mask if self.forest_mask is not None else np.zeros_like(dist, dtype=bool))
+        score[interior] = 0.5  # forêt intérieure : floor signal favorable
+        outside = (dist > 50) & ~(self.forest_mask if self.forest_mask is not None else np.zeros_like(dist, dtype=bool))
+        score[outside] = 0.1   # hors forêt : neutre bas
 
         score = self._apply_nodata(np.clip(score, 0, 1))
         self.scores["forest_edge"] = score
@@ -2082,12 +2099,22 @@ class GridBuilder:
         urban_gdf = self._ensure_l93(urban_gdf)
 
         # ── Cache disque ──
+        _src_col = urban_gdf.get("source")
+        _src_name = (
+            str(_src_col.iloc[0])
+            if _src_col is not None and len(_src_col) > 0
+            else "unknown"
+        )
         cache_path = _accel.raster_cache_path(
             "urban_mask",
-            urban_gdf.attrs.get("source", "unknown"),
+            _src_name,
             len(urban_gdf),
             self.cell_size,
             (self.ny, self.nx),
+            bbox=(
+                self.bbox["xmin"], self.bbox["ymin"],
+                self.bbox["xmax"], self.bbox["ymax"],
+            ),
         )
         cached = _accel.raster_cache_load(cache_path)
         if cached is not None:
@@ -2156,6 +2183,12 @@ class GridBuilder:
                     int(self.cell_size),
                 )
 
+        _AREA_TYPES = frozenset({
+            "residential", "commercial", "industrial", "retail",
+            "cemetery", "parking", "school", "pitch",
+            "sports_centre", "route", "voie_ferree",
+        })
+
         if "urban_type" in urban_gdf.columns:
             combined_mask = np.zeros((self.ny, self.nx), dtype=bool)
 
@@ -2175,18 +2208,10 @@ class GridBuilder:
                     transform=self.transform,
                 )
 
-                # ── Filtre densité par type ──
-                if min_urban_density > 1:
-                    type_neighbor = (
-                        _accel.uniform_filter(
-                            type_raster.astype(np.float32),
-                            size=kernel_size,
-                        )
-                        * kernel_area
-                    )
-                    type_raster = type_raster & (
-                        type_neighbor >= adaptive_threshold
-                    )
+                # ── Filtre densité : global pour bâtiments, skip pour zones ──
+                utype_lower = str(utype).lower()
+                if min_urban_density > 1 and utype_lower not in _AREA_TYPES:
+                    type_raster = type_raster & base_raster
 
                 if buf > 0:
                     iterations = max(0, round(buf / self.cell_size))

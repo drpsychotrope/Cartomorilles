@@ -429,8 +429,10 @@ class LandcoverDetector:
         # 4. Classifier les couleurs
         classification = self._classify_colors(cropped, cropped_alpha)
 
-        # 5. Rééchantillonner à la grille L93
-        class_resized = self._resample_to_grid(classification, ny, nx)
+        # 5. Rééchantillonner à la grille L93 (reprojection Mercator → L93)
+        class_resized = self._resample_to_grid(
+            classification, ny, nx, bbox_wgs84, bbox_l93
+        )
 
         # 6. Construire les masques — Fix #19 : altitude, Fix #25 : water
         urban_mask, green_score, water_mask = self._build_masks(
@@ -915,19 +917,61 @@ class LandcoverDetector:
         classification: np.ndarray,
         ny: int,
         nx: int,
+        bbox_wgs84: dict[str, float],
+        bbox_l93: dict[str, float],
     ) -> np.ndarray:
+        """Rééchantillonne la classification WGS84/Mercator vers la grille L93.
+
+        Mapping inverse : pour chaque cellule L93, calcule les coordonnées
+        WGS84 correspondantes puis lookup nearest-neighbor dans l'image source.
+        Corrige la distorsion Mercator (significative à 45°N).
+        """
         if classification.shape == (ny, nx):
             return classification
 
-        resized = np.asarray(
-            ndizoom(
-                classification.astype(np.float32),
-                (ny / classification.shape[0], nx / classification.shape[1]),
-                order=0,
-            ),
-            dtype=np.int8,
+        src_h, src_w = classification.shape
+
+        # Coordonnées centre de chaque cellule L93
+        cs_x = (bbox_l93["xmax"] - bbox_l93["xmin"]) / nx
+        cs_y = (bbox_l93["ymax"] - bbox_l93["ymin"]) / ny
+        x_l93 = np.linspace(
+            bbox_l93["xmin"] + cs_x / 2,
+            bbox_l93["xmax"] - cs_x / 2,
+            nx,
         )
-        return resized
+        y_l93 = np.linspace(
+            bbox_l93["ymax"] - cs_y / 2,
+            bbox_l93["ymin"] + cs_y / 2,
+            ny,
+        )
+        xx, yy = np.meshgrid(x_l93, y_l93)
+
+        # L93 → WGS84
+        from pyproj import Transformer
+
+        tf = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+        lons, lats = tf.transform(xx, yy)
+
+        # Colonnes : linéaires en longitude
+        col_frac = (lons - bbox_wgs84["west"]) / (
+            bbox_wgs84["east"] - bbox_wgs84["west"]
+        )
+
+        # Lignes : linéaires en Mercator Y (pas en latitude)
+        merc_n = math.log(
+            math.tan(math.pi / 4 + math.radians(bbox_wgs84["north"]) / 2)
+        )
+        merc_s = math.log(
+            math.tan(math.pi / 4 + math.radians(bbox_wgs84["south"]) / 2)
+        )
+        merc_lats = np.log(np.tan(np.pi / 4 + np.radians(lats) / 2))
+        row_frac = (merc_n - merc_lats) / (merc_n - merc_s)
+
+        src_cols = np.clip((col_frac * src_w).astype(np.intp), 0, src_w - 1)
+        src_rows = np.clip((row_frac * src_h).astype(np.intp), 0, src_h - 1)
+
+        resized = classification[src_rows, src_cols]
+        return resized.astype(np.int8)
 
     # ═══════════════════════════════════════════════════════════════
     # CONSTRUCTION DES MASQUES — Fix #19 : altitude, Fix #25 : water

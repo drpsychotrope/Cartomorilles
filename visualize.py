@@ -48,7 +48,7 @@ from shapely.geometry import box as shapely_box  # noqa: E402
 import _accel  # noqa: E402
 import config  # noqa: E402
 from config import TWI_OPTIMAL, TWI_WATERLOG  # noqa: E402
-from utils import TO_WGS84  # noqa: E402
+from utils import TO_MERC, TO_WGS84  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -243,7 +243,9 @@ class MorilleVisualizer:
         _yc = np.asarray(self.grid.y_coords)
         self._y_ascending: bool = bool(_yc.size > 1 and _yc[-1] > _yc[0])
 
-        # Reprojection L93 → WGS84 (paramètres)
+        # Reprojection L93 → Web Mercator (EPSG:3857) pour overlays Folium.
+        # Leaflet affiche en Mercator : les pixels doivent être espacés
+        # linéairement en Mercator Y, pas en latitude (EPSG:4326).
         self._src_transform = from_bounds(
             self._xmin_l93,
             self._ymin_l93,
@@ -253,22 +255,28 @@ class MorilleVisualizer:
             self.grid.ny,
         )
         self._src_crs = CRS.from_epsg(2154)
-        self._dst_crs = CRS.from_epsg(4326)
+        self._dst_crs = CRS.from_epsg(3857)
 
         # Résolution de rendu (découplée de la grille)
         render_scale = max(1.0, config.CELL_SIZE / _RENDER_MAX_CELL_M)
         render_nx = min(int(self.grid.nx * render_scale), _RENDER_MAX_PX)
         render_ny = min(int(self.grid.ny * render_scale), _RENDER_MAX_PX)
 
-        # Emprise WGS84 exacte depuis pyproj (même transformation que les
-        # vecteurs → plus de décalage TWI ↔ cours d'eau).
+        # Emprise WGS84 exacte depuis pyproj (pour bounds Folium)
         _corners_x = [self._xmin_l93, self._xmax_l93, self._xmin_l93, self._xmax_l93]
         _corners_y = [self._ymin_l93, self._ymin_l93, self._ymax_l93, self._ymax_l93]
-        _cx, _cy = self._transformer.transform(_corners_x, _corners_y)
+        _cx, _cy = self._to_wgs84.transform(_corners_x, _corners_y)
         self._west = float(min(_cx))
         self._east = float(max(_cx))
         self._south = float(min(_cy))
         self._north = float(max(_cy))
+
+        # Bounds Mercator pour la destination de reprojection
+        _mx, _my = TO_MERC.transform(_corners_x, _corners_y)
+        _xmin_merc = float(min(_mx))
+        _xmax_merc = float(max(_mx))
+        _ymin_merc = float(min(_my))
+        _ymax_merc = float(max(_my))
 
         dst_transform, dst_width, dst_height = calculate_default_transform(
             self._src_crs,
@@ -283,17 +291,17 @@ class MorilleVisualizer:
         assert dst_width is not None
         assert dst_height is not None
 
-        # Recalculer le dst_transform depuis les bounds WGS84 exactes pour
-        # garantir l'alignement pixel-parfait avec les vecteurs reprojetés.
+        # dst_transform depuis bounds Mercator exactes pour alignement
+        # pixel-parfait avec le fond de carte Leaflet (Web Mercator).
         self._dst_width: int = dst_width
         self._dst_height: int = dst_height
         self._dst_transform = from_bounds(
-            self._west, self._south,
-            self._east, self._north,
+            _xmin_merc, _ymin_merc,
+            _xmax_merc, _ymax_merc,
             dst_width, dst_height,
         )
 
-        # Bounds Folium (réutilisé partout)
+        # Bounds Folium en WGS84 (lat/lng) — Leaflet les convertit en Mercator
         self._bounds: list[list[float]] = [
             [self._south, self._west],
             [self._north, self._east],
@@ -545,10 +553,13 @@ class MorilleVisualizer:
                 continue
 
             # Lissage en espace source via _accel
+            # Sigma réduit pour la pente : préserver les bandes étroites
+            # de falaises au lieu de les éroder par excès de lissage.
+            sigma = 0.5 if key == "slope" else _ELIM_SMOOTH_SIGMA
             mask_f = np.asarray(
                 _accel.gaussian_filter(
                     mask.astype(np.float32),
-                    sigma=_ELIM_SMOOTH_SIGMA,
+                    sigma=sigma,
                     mode="reflect",
                 ),
             )
@@ -828,6 +839,14 @@ class MorilleVisualizer:
         #cartom-filter   { top: 190px;    left: 10px; }
         #cartom-hotspots { top: 310px;    left: 10px; }
         #cartom-info     { bottom: 30px;  right: 10px; min-width: 200px; }
+        #wx-panel        { bottom: 30px;  right: 10px; }
+        #wx-panel table  { border-collapse:collapse; width:100%; }
+        #wx-panel td     { padding:2px 6px; }
+        #wx-panel .wx-good  { color:#2d8a4e; font-weight:bold; }
+        #wx-panel .wx-ok    { color:#b8860b; }
+        #wx-panel .wx-bad   { color:#999; }
+        #wx-panel .wx-burst { color:#0066cc; margin-top:4px; font-weight:bold; }
+        #wx-panel .wx-best  { margin-top:4px; color:#333; }
 
         .cartom-slider-row {
             display: flex; align-items: center; gap: 6px; margin: 4px 0;
@@ -1492,25 +1511,16 @@ class MorilleVisualizer:
             )
 
         html = f"""
-        <div id="wx-panel" style="
-            position:fixed; bottom:30px; right:10px; z-index:1000;
-            background:rgba(255,255,255,0.92); border-radius:8px;
-            padding:10px 14px; font-size:12px; font-family:sans-serif;
-            box-shadow:0 2px 8px rgba(0,0,0,0.3); max-width:260px;
-            border:1px solid #ccc;">
-          <style>
-            #wx-panel table {{ border-collapse:collapse; width:100%; }}
-            #wx-panel td {{ padding:2px 6px; }}
-            #wx-panel .wx-good {{ color:#2d8a4e; font-weight:bold; }}
-            #wx-panel .wx-ok {{ color:#b8860b; }}
-            #wx-panel .wx-bad {{ color:#999; }}
-            #wx-panel .wx-burst {{ color:#0066cc; margin-top:4px; font-weight:bold; }}
-            #wx-panel .wx-best {{ margin-top:4px; color:#333; }}
-          </style>
-          <b>&#127780; Météo prospection</b>
-          <table>{rows}</table>
-          {burst_html}
-          {best_html}
+        <div id="wx-panel" class="cartom-panel">
+          <div class="cartom-titlebar">
+            <span>&#127780; Météo prospection</span>
+            <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
+          </div>
+          <div class="cartom-body">
+            <table>{rows}</table>
+            {burst_html}
+            {best_html}
+          </div>
         </div>
         """
         folium_map.get_root().html.add_child(Element(html))

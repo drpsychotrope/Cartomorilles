@@ -904,8 +904,11 @@ def _cache_key(
     n_geom: int,
     cell_size: float,
     out_shape: tuple[int, int],
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> str:
     raw = f"{source_name}|{n_geom}|{cell_size}|{out_shape}"
+    if bbox is not None:
+        raw += f"|{bbox[0]:.1f},{bbox[1]:.1f},{bbox[2]:.1f},{bbox[3]:.1f}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -915,9 +918,10 @@ def raster_cache_path(
     n_geom: int,
     cell_size: float,
     out_shape: tuple[int, int],
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> Path:
     """Chemin du fichier cache pour un masque rasterisé."""
-    key = _cache_key(source_name, n_geom, cell_size, out_shape)
+    key = _cache_key(source_name, n_geom, cell_size, out_shape, bbox)
     return _CACHE_DIR / f"{name}_{key}.npy"
 
 
