@@ -1,6 +1,15 @@
 """
-🍄 CARTOMORILLES — Configuration du modèle (v2.5.0)
+🍄 CARTOMORILLES — Configuration du modèle (v2.5.2)
    Zone : Isère (38) — 107.4×131.2 km, emprise dept élargie est+sud
+
+   v2.5.2 :
+     - Tree score `unknown` 0.25 → 0.40 (forêt sans essence ID = 64% du couvert)
+     - Géologie calcaire saturée : calcaire 0.95 → 1.00, cascade marneux/marne/etc.
+     - LANDCOVER_FOREST_FLOOR 0.80 → 0.85 (D8 floor relevé)
+     - scoring.py : _COVERAGE_PENALTY_FLOOR 0.75 → 0.85
+     - scoring.py : _CALCDRY_FLOOR 0.75 → 0.85, _CALCDRY_MAX_PENALTY 0.25 → 0.15
+     - Cible : score_max 0.72 → 0.78, mean forêt 0.32 → 0.40
+     - Décisions ajoutées : D32, D33, D34
 
    v2.5.0 :
      - Emprise élargie : +Oisans (est, xmax 932112→965000)
@@ -37,7 +46,7 @@ from typing import Any, Final
 #  MÉTADONNÉES
 # ═══════════════════════════════════════════════════════════════
 
-CONFIG_VERSION: Final[str] = "2.5.0"
+CONFIG_VERSION: Final[str] = "2.5.2"
 
 logger = logging.getLogger("cartomorilles.config")
 
