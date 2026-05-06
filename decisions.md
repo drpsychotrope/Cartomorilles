@@ -27,6 +27,9 @@ D20	TWI accumulation D8 acceptée comme incompressible (~14s sur 73M px) | Dépe
  Changement de scores dans config.py → lookup.tobytes() change → hash MD5 change → cache miss automatique
 D24|Attributs `_*_int_raster` / `_*_code_to_name` / `_*_score_lookup`sur GridBuilder, consommés par scoring.py | Découplage rasterisation (grid_builder) / évaluation (scoring) — scoring n'a plus besoin du GeoDataFrame ni de config 
 |D25|`np.isin()` pour masques éliminatoires, `np.bincount()`pour dominant catégoriel dans clusters |Complète D6 — supprime tout string matching et intersection spatiale dans scoring.py 
+|D32|tree_scores["unknown"] = 0.40, pas 0.25 | Forêt taguée BD Forêt v2 sans essence ID = 24.5M/38.2M (64%) cellules. Sous-scoring statistiquement significatif. Cohérent progression v2.2.0 (0.15→0.25) puis v2.5.2 (0.25→0.40).
+|D33|geology_scores["calcaire"] = 1.00 + cascade marneux/marne/alluvions_calcaires/calcaire_lacustre/eboulis_calcaire/dolomie +0.05 | Top discriminant (96.5% data coverage). Saturation = optimum biblio non amélioré (M. esculenta + M. elata sur sols calcaires bien drainés). Aucun substrat ne dépasse, hiérarchie préservée.
+|D34|_COVERAGE_PENALTY_FLOOR 0.75→0.85 (scoring.py) + _CALCDRY_FLOOR 0.75→0.85, _CALCDRY_MAX_PENALTY 0.25→0.15 (apply_calcdry_penalty) | Pénalités résiduelles signalent incertitude sans écraser la zone. Concordance Vouillants Δ=0.18 → cible Δ≤0.10. Cohérent progression v2.5.1 (0.50→0.75 puis 0.75→0.85).
 <decisions_new>
 
 **Approches REJETÉES :**
