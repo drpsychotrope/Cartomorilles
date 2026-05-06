@@ -265,8 +265,9 @@ _TREE_SCORES_DICT: dict[str, float] = {
 }
 
 # ── Landcover : plancher green_score pour cellules BD Forêt ──
-# D8 : Forest floor 0.80 pour cellules BD Forêt
-LANDCOVER_FOREST_FLOOR: Final[float] = 0.80
+# D8 : Forest floor pour cellules BD Forêt
+# v2.5.2 : 0.80 → 0.85 — relève plancher micro-habitats forêt
+LANDCOVER_FOREST_FLOOR: Final[float] = 0.85
 # Surface maximale (km²) pour le landcover automatique.
 # Au-delà, landcover est désactivé sauf --landcover explicite.
 LANDCOVER_AUTO_MAX_KM2: Final[float] = 2000.0
