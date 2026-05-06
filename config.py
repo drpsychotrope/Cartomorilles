@@ -474,13 +474,14 @@ _GEOLOGY_KEYWORD_MAP: tuple[tuple[str, str], ...] = (
 
 _GEOLOGY_SCORES_DICT: dict[str, float] = {
     # ── Substrats calcaires = optimaux morilles ──────────────────
-    "calcaire":              0.95,
-    "calcaire_marneux":      0.90,
-    "marne":                 0.85,
-    "alluvions_calcaires":   0.85,
-    "calcaire_lacustre":     0.80,
-    "eboulis_calcaire":      0.75,
-    "dolomie":               0.75,
+    # v2.5.2 : saturation optimum biblio (D33) — calcaire = pic absolu
+    "calcaire":              1.00,   # était 0.95
+    "calcaire_marneux":      0.95,   # était 0.90
+    "marne":                 0.90,   # était 0.85
+    "alluvions_calcaires":   0.90,   # était 0.85
+    "calcaire_lacustre":     0.85,   # était 0.80
+    "eboulis_calcaire":      0.80,   # était 0.75
+    "dolomie":               0.80,   # était 0.75
     # ── Substrats alluviaux = variables ──────────────────────────
     "colluvions":            0.65,
     "alluvions":             0.55,
