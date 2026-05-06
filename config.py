@@ -1,6 +1,16 @@
 """
-🍄 CARTOMORILLES — Configuration du modèle (v2.5.2)
+🍄 CARTOMORILLES — Configuration du modèle (v2.5.3)
    Zone : Isère (38) — 107.4×131.2 km, emprise dept élargie est+sud
+
+   v2.5.3 :
+     - calc_dry threshold tree_species ≤ 0.50 → ≤ 0.30 (scoring.py)
+       Exclut `unknown` (0.40) et `platane` (0.20) du malus.
+       Cible restreinte aux vraies chênaies/buis xérothermophiles.
+     - _CANOPY_BASE_INTERIOR 0.45 → 0.55 (grid_builder.py)
+       Forêt intérieure mieux notée — cap 0.90 préservé.
+     - forest_edge interior floor 0.5 → 0.65 + transition 20-50m 0.75→0.65
+       (grid_builder.py) — réduit pénalité d'intérieur forêt profonde.
+     - Décisions ajoutées : D35
 
    v2.5.2 :
      - Tree score `unknown` 0.25 → 0.40 (forêt sans essence ID = 64% du couvert)
@@ -46,7 +56,7 @@ from typing import Any, Final
 #  MÉTADONNÉES
 # ═══════════════════════════════════════════════════════════════
 
-CONFIG_VERSION: Final[str] = "2.5.2"
+CONFIG_VERSION: Final[str] = "2.5.3"
 
 logger = logging.getLogger("cartomorilles.config")
 

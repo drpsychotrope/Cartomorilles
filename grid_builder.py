@@ -114,7 +114,7 @@ _VEGETATION_CRITERIA: frozenset[str] = frozenset({
 })
 
 # ── Canopy terrain correlation (v2.3.6) ─────────────────────────
-_CANOPY_BASE_INTERIOR: float = 0.45       # was 0.55 — marge pour bonus
+_CANOPY_BASE_INTERIOR: float = 0.55       # v2.5.3 : 0.45 → 0.55 — relève plancher forêt intérieure (cap 0.90 conservé)
 _CANOPY_SLOPE_BONUS: float = 0.10         # trouées naturelles 10-30°
 _CANOPY_ALT_BONUS: float = 0.05           # structure montagnarde 300-800m
 _CANOPY_SPECIES_BONUS: float = 0.05       # essences favorables (score > 0.40)
@@ -1922,6 +1922,8 @@ class GridBuilder:
 
         # v2.5.0 : floor 0.5 en forêt intérieure (morilles poussent partout,
         # pas juste à la lisière). Ancienne courbe : dist>50m → 0.1 (biais lisière).
+        # v2.5.3 : interior floor 0.5 → 0.65 + transition 20-50m 0.75→0.65
+        # (plus de pénalité d'intérieur, morilles abondantes en forêt profonde).
         score = np.zeros_like(dist, dtype=np.float32)
 
         score[dist <= 5] = 1.0
@@ -1932,11 +1934,11 @@ class GridBuilder:
 
         mask = (dist > 20) & (dist <= 50)
         if mask.any():
-            score[mask] = 0.75 - 0.25 * ((dist[mask] - 20) / 30.0)  # 0.75 → 0.50
+            score[mask] = 0.75 - 0.10 * ((dist[mask] - 20) / 30.0)  # 0.75 → 0.65
 
         # Hors forêt OU intérieur profond → floor différencié
         interior = (dist > 50) & (self.forest_mask if self.forest_mask is not None else np.zeros_like(dist, dtype=bool))
-        score[interior] = 0.5  # forêt intérieure : floor signal favorable
+        score[interior] = 0.65  # forêt intérieure : floor signal favorable
         outside = (dist > 50) & ~(self.forest_mask if self.forest_mask is not None else np.zeros_like(dist, dtype=bool))
         score[outside] = 0.1   # hors forêt : neutre bas
 

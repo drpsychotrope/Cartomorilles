@@ -30,6 +30,7 @@ D24|Attributs `_*_int_raster` / `_*_code_to_name` / `_*_score_lookup`sur GridBui
 |D32|tree_scores["unknown"] = 0.40, pas 0.25 | Forêt taguée BD Forêt v2 sans essence ID = 24.5M/38.2M (64%) cellules. Sous-scoring statistiquement significatif. Cohérent progression v2.2.0 (0.15→0.25) puis v2.5.2 (0.25→0.40).
 |D33|geology_scores["calcaire"] = 1.00 + cascade marneux/marne/alluvions_calcaires/calcaire_lacustre/eboulis_calcaire/dolomie +0.05 | Top discriminant (96.5% data coverage). Saturation = optimum biblio non amélioré (M. esculenta + M. elata sur sols calcaires bien drainés). Aucun substrat ne dépasse, hiérarchie préservée.
 |D34|_COVERAGE_PENALTY_FLOOR 0.75→0.85 (scoring.py) + _CALCDRY_FLOOR 0.75→0.85, _CALCDRY_MAX_PENALTY 0.25→0.15 (apply_calcdry_penalty) | Pénalités résiduelles signalent incertitude sans écraser la zone. Concordance Vouillants Δ=0.18 → cible Δ≤0.10. Cohérent progression v2.5.1 (0.50→0.75 puis 0.75→0.85).
+|D35|v2.5.3 — calc_dry threshold tree_species ≤ 0.30 (était ≤ 0.50) + _CANOPY_BASE_INTERIOR 0.55 (était 0.45) + forest_edge interior floor 0.65 (était 0.5) | v2.5.2 a doublé n_high (cellules ≥0.7) ×13.5 mais plafond 0.738 < cible 0.75. Trois leviers complémentaires : exclure `unknown=0.40` du calc_dry (24M cellules concernées), relever planchers micro-habitat forêt intérieure (canopy + forest_edge). Cible : max ≥ 0.78, classe Excellent non vide.
 <decisions_new>
 
 **Approches REJETÉES :**

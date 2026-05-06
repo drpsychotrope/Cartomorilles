@@ -695,11 +695,13 @@ class MorilleScoring:
 
         # v2.5.0 : exclure essences favorables (hêtre, frêne, pommier, tilleul,
         # érable, charme, châtaignier) — ne sont pas des chênaies-buis xérothermophiles.
-        # Cible : chênes/buis (tree_species ≤ 0.50). Hêtraies (0.75) exclues.
+        # v2.5.3 : seuil 0.50 → 0.30 — exclut aussi `unknown` (0.40) et `platane`
+        # (0.20). Cible restreinte aux vraies chênaies/buis xérothermophiles
+        # (chêne 0.15, chêne pubescent 0.10, robinier 0.15, bouleau 0.05, buis 0.05).
         ts = grid.scores.get("tree_species") if hasattr(grid, "scores") else None
         if ts is not None and isinstance(ts, np.ndarray) and ts.shape == score.shape:
             _ts = np.asarray(ts, dtype=np.float32)
-            target = target & (_ts <= 0.50)
+            target = target & (_ts <= 0.30)
 
         # Exclure les cellules déjà éliminées
         if self.elimination_mask is not None:
