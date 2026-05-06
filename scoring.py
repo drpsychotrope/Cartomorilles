@@ -735,11 +735,12 @@ class MorilleScoring:
 
         # Malus : score × multiplier
         # v2.5.1 : calibration adoucie (Vouillants/Chartreuse scoraient 0.50)
+        # v2.5.2 : floor 0.75 → 0.85, max_penalty 0.25 → 0.15 (D34)
         # severity=0   → multiplier=1.0  (pas de malus)
-        # severity=0.5 → multiplier=0.875 (était 0.75)
-        # severity=1.0 → multiplier=0.75  (était 0.50)
-        _CALCDRY_FLOOR = 0.75
-        _CALCDRY_MAX_PENALTY = 0.25  # multiplier min = 1.0 - 0.25 = 0.75
+        # severity=0.5 → multiplier=0.925 (était 0.875)
+        # severity=1.0 → multiplier=0.85  (était 0.75)
+        _CALCDRY_FLOOR = 0.85
+        _CALCDRY_MAX_PENALTY = 0.15  # multiplier min = 1.0 - 0.15 = 0.85
 
         multiplier = np.ones_like(score, dtype=np.float32)
         multiplier[target] = 1.0 - _CALCDRY_MAX_PENALTY * severity[target]
