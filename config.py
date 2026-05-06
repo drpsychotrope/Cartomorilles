@@ -7,10 +7,11 @@
      - ALTITUDE_OPTIMAL (200,600) → (200,700) — étage collinéen classique étendu
      - SOFT_ELIM_BUFFER hardcoded 15m → constant 5m (config)
        Préserve cellules forêt légitimes adjacentes routes/ruisseaux
-     - _accel.gaussian_filter accepte truncate (défaut 4.0)
-     - scoring.apply_spatial_smoothing : truncate=2.0
-       Kernel plus compact (5x5 → 3x3 à sigma=0.5), préserve pics
-     - Décisions ajoutées : D36
+     - _accel.gaussian_filter accepte truncate (défaut 4.0) — API bonus
+     - scoring.apply_spatial_smoothing : truncate=2.0 ABANDONNÉ
+       Test a régressé max 0.739 → 0.680. Smoothing normalisé BOOST les
+       cellules borderline (pas réduction des pics). Truncate=4.0 maintenu.
+     - Décisions ajoutées : D36 (D36-d truncate documentée comme rejet)
 
    v2.5.3 :
      - calc_dry threshold tree_species ≤ 0.50 → ≤ 0.30 (scoring.py)

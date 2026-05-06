@@ -800,13 +800,15 @@ class MorilleScoring:
         score_valid = np.where(valid, self.final_score, 0.0)
         weights = valid.astype(np.float64)
 
-        # v2.5.4 : truncate=2.0 (au lieu de 4.0 par défaut) — kernel plus
-        # compact, préserve mieux les pics. Avec sigma=0.5, kernel passe de 5x5 à 3x3.
+        # v2.5.4 expérimentation truncate=2.0 ABANDONNÉE — régression confirmée
+        # max 0.739 → 0.680. Smoothing normalisé ne réduit pas les pics,
+        # il BOOST les cellules borderline via convolution avec voisins valides.
+        # Truncate compact retire ce boost. Truncate=4.0 (default scipy) maintenu.
         num: np.ndarray = _accel.gaussian_filter(
-            score_valid, sigma=sigma, mode="nearest", truncate=2.0,
+            score_valid, sigma=sigma, mode="nearest",
         )
         den: np.ndarray = _accel.gaussian_filter(
-            weights, sigma=sigma, mode="nearest", truncate=2.0,
+            weights, sigma=sigma, mode="nearest",
         )
 
         with np.errstate(invalid="ignore", divide="ignore"):
