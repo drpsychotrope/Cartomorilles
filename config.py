@@ -1,6 +1,48 @@
 """
-🍄 CARTOMORILLES — Configuration du modèle (v2.4.0)
-   Zone : Isère (38) — 74.5×98.8 km, emprise limitée par données
+🍄 CARTOMORILLES — Configuration du modèle (v2.5.4)
+   Zone : Isère (38) — 107.4×131.2 km, emprise dept élargie est+sud
+
+   v2.5.4 — TENTATIVES TOUTES ABANDONNÉES (régressions confirmées) :
+     - SLOPE_OPTIMAL (0,15)→(0,20) : régresse max 0.739→0.679
+       contre-intuitif (slope widening augmente pourtant pré-pipeline scores).
+       Cause exacte : interaction smoothing + redistribution scores neighbors.
+     - ALTITUDE_OPTIMAL (200,600)→(200,700) : régresse de manière similaire
+     - SOFT_ELIM_BUFFER 15m→5m : régresse max 0.739→0.680 — buffer 15m
+       agit comme anti-noise indirect (réduit cellules low-score près d'élim,
+       élève baricentre smoothing pour cellules forêt voisines).
+     - scoring.apply_spatial_smoothing truncate=4.0→2.0 : régresse pour
+       raison similaire — smoothing normalisé BOOST les borderlines via
+       convolution avec voisins valides, pas réduction des pics.
+     APIs ajoutées et CONSERVÉES (utiles indépendamment du score) :
+     - _accel.gaussian_filter accepte truncate kwarg
+     - SOFT_ELIM_BUFFER explicité dans config (avant : fallback hardcoded)
+     CONFIG_VERSION conservé en 2.5.4 pour tracer les apprentissages.
+     Décision : v2.5.3 retenu comme état production. D36 documente l'échec.
+
+   v2.5.3 :
+     - calc_dry threshold tree_species ≤ 0.50 → ≤ 0.30 (scoring.py)
+       Exclut `unknown` (0.40) et `platane` (0.20) du malus.
+       Cible restreinte aux vraies chênaies/buis xérothermophiles.
+     - _CANOPY_BASE_INTERIOR 0.45 → 0.55 (grid_builder.py)
+       Forêt intérieure mieux notée — cap 0.90 préservé.
+     - forest_edge interior floor 0.5 → 0.65 + transition 20-50m 0.75→0.65
+       (grid_builder.py) — réduit pénalité d'intérieur forêt profonde.
+     - Décisions ajoutées : D35
+
+   v2.5.2 :
+     - Tree score `unknown` 0.25 → 0.40 (forêt sans essence ID = 64% du couvert)
+     - Géologie calcaire saturée : calcaire 0.95 → 1.00, cascade marneux/marne/etc.
+     - LANDCOVER_FOREST_FLOOR 0.80 → 0.85 (D8 floor relevé)
+     - scoring.py : _COVERAGE_PENALTY_FLOOR 0.75 → 0.85
+     - scoring.py : _CALCDRY_FLOOR 0.75 → 0.85, _CALCDRY_MAX_PENALTY 0.25 → 0.15
+     - Cible : score_max 0.72 → 0.78, mean forêt 0.32 → 0.40
+     - Décisions ajoutées : D32, D33, D34
+
+   v2.5.0 :
+     - Emprise élargie : +Oisans (est, xmax 932112→965000)
+                        +Trièves (sud, ymin 6435430→6403000)
+     - DEM multi-tuiles : Copernicus N44-45 × E004-006 (merge auto)
+     - CELL_SIZE 10m → 20m (35.2M cellules, sous seuil warn 50M)
 
    v2.4.0 :
      - Extension emprise : Grenoble 20×20km → Isère 74.5×98.8km
@@ -31,7 +73,7 @@ from typing import Any, Final
 #  MÉTADONNÉES
 # ═══════════════════════════════════════════════════════════════
 
-CONFIG_VERSION: Final[str] = "2.4.0"
+CONFIG_VERSION: Final[str] = "2.5.4"
 
 logger = logging.getLogger("cartomorilles.config")
 
@@ -87,19 +129,19 @@ __all__ = [
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Emprise — Isère 38 (limitée par données disponibles)
+# Emprise — Isère 38 (dept élargi : +Oisans est, +Trièves sud)
 # ══════════════════════════════════════════════════════════════════════
-# Intersection : DEM Copernicus N45_E005 ∩ BD Forêt ∩ Géologie BRGM 38
-# X limité par DEM (lon 5°–6°) — Oisans (lon > 6°) non couvert
-# Y limité par BD Forêt (6 534 209 m nord)
+# DEM Copernicus multi-tuiles (N44-45 × E004-006, merge auto)
+# BD Forêt v2 (full dept, 127×131 km) ∩ Géologie BRGM dept 38
+# Limite ouest conservée (Bas-Dauphiné). Rhône-Vienne hors scope.
 
 _BBOX_XMIN: Final[float] = 857_571.0
-_BBOX_YMIN: Final[float] = 6_435_430.0
-_BBOX_XMAX: Final[float] = 932_112.0
+_BBOX_YMIN: Final[float] = 6_403_000.0
+_BBOX_XMAX: Final[float] = 965_000.0
 _BBOX_YMAX: Final[float] = 6_534_209.0
 
-_CENTER_X_L93: Final[float] = (_BBOX_XMIN + _BBOX_XMAX) / 2  # ≈ 894 842
-_CENTER_Y_L93: Final[float] = (_BBOX_YMIN + _BBOX_YMAX) / 2  # ≈ 6 484 820
+_CENTER_X_L93: Final[float] = (_BBOX_XMIN + _BBOX_XMAX) / 2  # ≈ 911 286
+_CENTER_Y_L93: Final[float] = (_BBOX_YMIN + _BBOX_YMAX) / 2  # ≈ 6 468 604
 
 BBOX: MappingProxyType[str, float] = MappingProxyType({
     "xmin": _BBOX_XMIN,
@@ -108,16 +150,17 @@ BBOX: MappingProxyType[str, float] = MappingProxyType({
     "ymax": _BBOX_YMAX,
 })
 
+# WGS84 (Overpass/OSM) — bornes convertie depuis L93 + buffer 0.001°
 BBOX_WGS84: MappingProxyType[str, float] = MappingProxyType({
-    "west": 5.0000,
-    "south": 45.0001,
-    "east": 5.9999,
-    "north": 45.8564,
+    "west": 4.9990,
+    "south": 44.7180,
+    "east": 6.4421,
+    "north": 45.8574,
 })
 
 MAP_CENTER: MappingProxyType[str, float] = MappingProxyType({
-    "lat": 45.428,
-    "lon": 5.500,
+    "lat": 45.288,
+    "lon": 5.721,
 })
 
 
@@ -135,7 +178,7 @@ GEOLOGY_SHAPEFILE: Final[str] = "GEO050K_HARM_038_S_FGEOL_2154.shp"
 # Maillage & buffers
 # ══════════════════════════════════════════════════════════════════════
 
-CELL_SIZE: float = 10.0
+CELL_SIZE: float = 20.0
 DATA_BUFFER: Final[float] = 500.0
 
 # ── Auto-scaling résolution ──────────────────────────────────────
@@ -143,9 +186,9 @@ DATA_BUFFER: Final[float] = 500.0
 CELL_SIZE_AUTO_THRESHOLDS: tuple[tuple[float, float], ...] = (
     (500.0, 5.0),
     (2000.0, 10.0),
-    (8000.0, 50.0),
+    (8000.0, 10.0),
 )
-CELL_SIZE_AUTO_FALLBACK: Final[float] = 100.0
+CELL_SIZE_AUTO_FALLBACK: Final[float] = 50.0
 
 # ═══════════════════════════════════════════════════════════════
 #  PONDÉRATIONS DU MODÈLE MULTICRITÈRE  (v2.3.6)
@@ -167,20 +210,21 @@ CELL_SIZE_AUTO_FALLBACK: Final[float] = 100.0
 #  disturbance     0.03
 
 _WEIGHTS_DICT: dict[str, float] = {
-    "geology":            0.20,
-    "tree_species":       0.16,
-    "canopy_openness":    0.07,   # réduit : dégradé sans landcover (→ forest_edge)
-    "urban_proximity":    0.10,
-    "altitude":           0.08,
-    "twi":                0.07,
-    "forest_edge":        0.04,   # lisière forestière (BD Forêt + EDT)
-    "slope":              0.06,
-    "aspect":             0.05,
-    "dist_water":         0.05,
-    "terrain_roughness":  0.04,   # -0.01 → geology_contact
-    "ground_cover":       0.04,
-    "disturbance":        0.02,   # -0.01 → geology_contact
-    "geology_contact":    0.02,   # contacts géologiques (BDCharm-50 L_FGEOL)
+    # ── v2.5.0 : redistribution centrée sur discriminants humidité/perturbation
+    "geology":            0.20,   # top discriminant (calcaire/alluvions)
+    "tree_species":       0.20,   # top discriminant (hêtre/frêne/pommier)
+    "altitude":           0.08,   # +0.01 — thermique important
+    "twi":                0.08,   # +0.02 — humidité sol, signal fort
+    "disturbance":        0.08,   # +0.06 — vrai signal morilles (chablis, coupes)
+    "dist_water":         0.07,   # +0.02 — corrélé humidité
+    "slope":              0.05,   # -0.01
+    "aspect":             0.05,   # +0.02 — exposition discriminante montagne
+    "forest_edge":        0.05,   # -0.03 — morilles aussi en intérieur (floor 0.5)
+    "ground_cover":       0.05,   # +0.01 — bon indicateur composite
+    "canopy_openness":    0.04,   # -0.02 — dégradé sans landcover fin
+    "terrain_roughness":  0.03,   # -0.01 — corrélé slope
+    "urban_proximity":    0.01,   # -0.06 — éliminatoire gère déjà
+    "geology_contact":    0.01,   # -0.01 — redondant avec geology
 }
 
 _w_total = sum(_WEIGHTS_DICT.values())
@@ -222,10 +266,12 @@ _TREE_SCORES_DICT: dict[str, float] = {
     "aulne":              0.55,
     "saule":              0.45,
     "noisetier":          0.40,
-    "charme":             0.35,
-    "tilleul":            0.35,
-    "erable":             0.30,
-    "hetre":              0.30,
+    # v2.5.1 : feuillus montagnards rehaussés (M. elata en hêtraies-
+    # sapinières Vercors/Chartreuse/Belledonne, sol calcaire frais)
+    "hetre":              0.75,   # était 0.30 — hêtraies Vouillants & Co
+    "tilleul":            0.65,   # était 0.35 — sol calcaire frais
+    "erable":             0.65,   # était 0.30 — sycomore en versants
+    "charme":             0.55,   # était 0.35
     # ── Conifères montagnards (M. elata / M. conica) ─────────────
     # v2.3.6 : rehaussés — M. elata documentée en sapinière calcaire,
     # épicéa en forêts mixtes montagne, pin sylvestre sols calcaires secs
@@ -241,12 +287,14 @@ _TREE_SCORES_DICT: dict[str, float] = {
     "bouleau":            0.05,
     "buis":               0.05,
     # ── Défaut — forêt sans essence connue ≠ pas de forêt ──
-    "unknown":            0.25,
+    # v2.5.2 : 0.25 → 0.40 — forêt taguée sans essence ID = 64% du couvert
+    "unknown":            0.40,
 }
 
 # ── Landcover : plancher green_score pour cellules BD Forêt ──
-# D8 : Forest floor 0.80 pour cellules BD Forêt
-LANDCOVER_FOREST_FLOOR: Final[float] = 0.80
+# D8 : Forest floor pour cellules BD Forêt
+# v2.5.2 : 0.80 → 0.85 — relève plancher micro-habitats forêt
+LANDCOVER_FOREST_FLOOR: Final[float] = 0.85
 # Surface maximale (km²) pour le landcover automatique.
 # Au-delà, landcover est désactivé sauf --landcover explicite.
 LANDCOVER_AUTO_MAX_KM2: Final[float] = 2000.0
@@ -454,13 +502,14 @@ _GEOLOGY_KEYWORD_MAP: tuple[tuple[str, str], ...] = (
 
 _GEOLOGY_SCORES_DICT: dict[str, float] = {
     # ── Substrats calcaires = optimaux morilles ──────────────────
-    "calcaire":              0.95,
-    "calcaire_marneux":      0.90,
-    "marne":                 0.85,
-    "alluvions_calcaires":   0.85,
-    "calcaire_lacustre":     0.80,
-    "eboulis_calcaire":      0.75,
-    "dolomie":               0.75,
+    # v2.5.2 : saturation optimum biblio (D33) — calcaire = pic absolu
+    "calcaire":              1.00,   # était 0.95
+    "calcaire_marneux":      0.95,   # était 0.90
+    "marne":                 0.90,   # était 0.85
+    "alluvions_calcaires":   0.90,   # était 0.85
+    "calcaire_lacustre":     0.85,   # était 0.80
+    "eboulis_calcaire":      0.80,   # était 0.75
+    "dolomie":               0.80,   # était 0.75
     # ── Substrats alluviaux = variables ──────────────────────────
     "colluvions":            0.65,
     "alluvions":             0.55,
@@ -586,7 +635,7 @@ def get_geology_score(raw_code: str | None) -> float:
 #  M. esculenta — optimal 200-600m (plaine + collines)
 #  M. elata     — peut monter à 800-1200m (conifères)
 
-ALTITUDE_OPTIMAL: Final[tuple[float, float]] = (200.0, 600.0)
+ALTITUDE_OPTIMAL: Final[tuple[float, float]] = (200.0, 600.0)   # v2.5.4 (200,700) testé puis reverté
 ALTITUDE_RANGE: Final[tuple[float, float]] = (150.0, 900.0)
 
 # Centre du bonus micro-nappe / humidité résiduelle
@@ -603,13 +652,17 @@ ALTITUDE_ALLUVIAL_CENTER: Final[float] = 350.0
 #   0-15°  : optimal (score 1.0)
 #  15-30°  : modéré  (1.0 → 0.6)
 #  30-40°  : raide   (0.6 → 0.1)
-#  40-50°  : très raide (0.1 → 0.0)
-#    >50°  : éliminatoire
+#  40-45°  : très raide (0.1 → 0.0)
+#    >45°  : éliminatoire
 
-SLOPE_OPTIMAL: Final[tuple[float, float]] = (0.0, 15.0)
+SLOPE_OPTIMAL: Final[tuple[float, float]] = (0.0, 15.0)   # v2.5.4 (0,20) testé puis reverté
 SLOPE_MODERATE: Final[float] = 30.0
 SLOPE_STEEP: Final[float] = 40.0
-SLOPE_MAX: Final[float] = 50.0
+SLOPE_MAX: Final[float] = 45.0
+
+# v2.5.4 : SOFT_ELIM_BUFFER explicité dans config (auparavant fallback 15.0
+# dans scoring.py via getattr). Tests 5m régressaient le max — 15m conservé.
+SOFT_ELIM_BUFFER: Final[float] = 15.0
 
 
 # ═══════════════════════════════════════════════════════════════

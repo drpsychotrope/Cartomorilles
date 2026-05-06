@@ -19,6 +19,9 @@ TO_WGS84: Final[Transformer] = Transformer.from_crs(
 TO_L93: Final[Transformer] = Transformer.from_crs(
     "EPSG:4326", "EPSG:2154", always_xy=True,
 )
+TO_MERC: Final[Transformer] = Transformer.from_crs(
+    "EPSG:2154", "EPSG:3857", always_xy=True,
+)
 
 
 def hotspot_to_export_dict(
@@ -53,6 +56,7 @@ def compute_array_stats(
 __all__ = [
     "TO_WGS84",
     "TO_L93",
+    "TO_MERC",
     "hotspot_to_export_dict",
     "compute_array_stats",
 ]

@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **CARTOMORILLES** is a probabilistic spatial multicriteria model for mapping favorable zones for morel mushroom (*Morchella*) foraging in Isère (France). It combines DEM terrain analysis, forest species data (BD Forêt v2), geology (BDCharm-50), hydrology, and OSM-derived landcover into a weighted score grid at 10–100m resolution.
 
-- **CRS**: EPSG:2154 (Lambert-93), covering Isère department (~7 363 km²)
-- **Default grid**: 10m cells → ~73.6M cells
+- **CRS**: EPSG:2154 (Lambert-93), covering Isère department bbox (~14 091 km², 107.4×131.2 km)
+- **Default grid**: 20m cells → ~35.2M cells
+- **DEM**: 6-tile Copernicus merge (N44-45 × E004-006)
 - **Python**: 3.12+
 
 ## Running the Model
@@ -34,7 +35,7 @@ python main.py --cell-size 10 --hotspot-threshold 0.65 --output-dir ./results --
 python main.py --discover-wfs
 ```
 
-Key flags: `--cell-size`, `--hotspot-threshold` (default 0.60), `--smoothing-sigma` (default 2.0), `--urban-buffer`, `--no-urban`, `--no-landcover`, `--landcover`, `--max-hotspots` (default 8), `--seed` (default 42), `--force` (bypass grid size/weight warnings).
+Key flags: `--cell-size`, `--hotspot-threshold` (default 0.60), `--smoothing-sigma` (default 1.0), `--urban-buffer`, `--no-urban`, `--no-landcover`, `--landcover`, `--max-hotspots` (default 8), `--seed` (default 42), `--force` (bypass grid size/weight warnings).
 
 Outputs go to `output/`: `carte_morilles.html`, `morilles_probability.tif`, `hotspots.csv`, `cartomorilles.log`, and optionally `morilles_grid.gpkg`.
 
@@ -86,6 +87,12 @@ These decisions are documented in `decisions.md` — do not reverse them without
 | **D12** | `ProcessPoolExecutor` for categorical rasterization (rasterio holds the GIL in Cython) |
 | **D13** | Urban masks are disk-cached as `.npy` in `data/cache/` (446k polygons: 27s → 0s) |
 | **D22** | Scores burned ascending so last-wins rasterize picks the highest score in overlaps |
+| **D30** | Slope resampled from native DEM to grid with `order=0` (nearest-neighbor) to preserve peak values at cliff edges — bilinear interpolation would average extremes below the 45° eliminatory threshold |
+| **D31** | Eliminatory slope overlay uses Gaussian σ=0.5 (vs σ=1.5 for other masks) to avoid eroding narrow cliff bands; weather panel uses the `.cartom-panel` / `.cartom-titlebar` drag pattern for consistency |
+| **D26** | Urban density filter uses **global** combined raster, not per-type. Only `batiment` type is density-filtered; area types (`residential`, `route`, etc.) skip filtering |
+| **D27** | Raster cache key must include bbox (xmin,ymin,xmax,ymax) to prevent stale cache on extent change |
+| **D28** | Landcover `_resample_to_grid()` uses inverse L93→WGS84 mapping with Mercator Y correction (not naive ndizoom) |
+| **D29** | Folium overlays are reprojected to **EPSG:3857** (Web Mercator), not EPSG:4326 — Leaflet stretches ImageOverlay linearly in Mercator space, so pixels must be evenly spaced in Mercator Y |
 
 ## Session / Branch Workflow
 
@@ -97,8 +104,8 @@ Active development uses a multi-session system tracked in `.sessions/`:
 
 ## Performance Notes
 
-- **TWI** (~14s at 73M cells): topologically ordered D8 — cannot be trivially parallelized (D20)
-- Grid size: warn at 50M cells (TWI >5 min), hard limit at 200M unless `--force`
+- **TWI** (~5-8s at 35M cells @20m; ~30s at 169M cells @10m): topologically ordered D8 — cannot be trivially parallelized (D20)
+- Grid size: warn at 50M cells (TWI >5 min), hard limit at 200M unless `--force`. Bbox dept élargi @10m = 169M (sous limite mais lourd)
 - Avoid adding string matching inside scoring loops — use int-coded raster lookups (D6, D25)
 - PNG overlays use `compress_level=1` (parallel speed); data GeoTIFFs use level 6 (D17)
 - Cache files live in `data/cache/` — keyed by MD5 of lookup arrays so config changes auto-invalidate (D23)

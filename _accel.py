@@ -166,11 +166,12 @@ def _nb_slope_aspect(
 def _nb_gaussian_filter_nearest(
     data: np.ndarray,
     sigma: float,
+    truncate: float = 4.0,
 ) -> np.ndarray:
     """Filtre gaussien séparable — boundary mode 'nearest' (clamp)."""
     ny, nx = data.shape
 
-    radius = int(4.0 * sigma + 0.5)
+    radius = int(truncate * sigma + 0.5)
     if radius < 1:
         radius = 1
     ksize = 2 * radius + 1
@@ -253,11 +254,12 @@ def _nb_uniform_filter(data: np.ndarray, size: int) -> np.ndarray:
 def _nb_gaussian_filter(
     data: np.ndarray,
     sigma: float,
+    truncate: float = 4.0,
 ) -> np.ndarray:
     """Filtre gaussien séparable 1D — Numba parallèle."""
     ny, nx = data.shape
 
-    radius = int(4.0 * sigma + 0.5)
+    radius = int(truncate * sigma + 0.5)
     if radius < 1:
         radius = 1
     ksize = 2 * radius + 1
@@ -429,12 +431,13 @@ def _gpu_gaussian_filter(
     data: np.ndarray,
     sigma: float,
     mode: str = "reflect",
+    truncate: float = 4.0,
 ) -> np.ndarray:
     """Filtre gaussien CuPy."""
     assert _cp is not None and _cpx_ndi is not None
 
     g = _cp.asarray(data, dtype=_cp.float32)
-    result = _cpx_ndi.gaussian_filter(g, sigma=sigma, mode=mode)
+    result = _cpx_ndi.gaussian_filter(g, sigma=sigma, mode=mode, truncate=truncate)
     return _cp.asnumpy(result)
 
 
@@ -595,25 +598,31 @@ def gaussian_filter(
     data: np.ndarray,
     sigma: float,
     mode: str = "reflect",
+    truncate: float = 4.0,
 ) -> np.ndarray:
-    """Filtre gaussien accéléré."""
+    """Filtre gaussien accéléré.
+
+    `truncate` : kernel cutoff en multiples de sigma (défaut 4.0 = scipy default).
+    v2.5.4 : exposé pour permettre kernel plus compact dans apply_spatial_smoothing
+    (truncate=2.0 préserve mieux les pics).
+    """
     data = np.asarray(data, dtype=np.float32)
     t0 = time.perf_counter()
 
     if _GPU_AVAILABLE:
-        result = _gpu_gaussian_filter(data, sigma, mode=mode)
+        result = _gpu_gaussian_filter(data, sigma, mode=mode, truncate=truncate)
         backend = "GPU"
     else:
         if mode == "nearest":
-            result = _nb_gaussian_filter_nearest(data, sigma)
+            result = _nb_gaussian_filter_nearest(data, sigma, truncate=truncate)
         else:
-            result = _nb_gaussian_filter(data, sigma)
+            result = _nb_gaussian_filter(data, sigma, truncate=truncate)
         backend = "CPU"
 
     dt = time.perf_counter() - t0
     logger.info(
-        "⚡ gaussian σ=%.1f %dx%d → %.2fs [%s]",
-        sigma, data.shape[1], data.shape[0], dt, backend,
+        "⚡ gaussian σ=%.1f trunc=%.1f %dx%d → %.2fs [%s]",
+        sigma, truncate, data.shape[1], data.shape[0], dt, backend,
     )
     return result
 
@@ -904,8 +913,11 @@ def _cache_key(
     n_geom: int,
     cell_size: float,
     out_shape: tuple[int, int],
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> str:
     raw = f"{source_name}|{n_geom}|{cell_size}|{out_shape}"
+    if bbox is not None:
+        raw += f"|{bbox[0]:.1f},{bbox[1]:.1f},{bbox[2]:.1f},{bbox[3]:.1f}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -915,9 +927,10 @@ def raster_cache_path(
     n_geom: int,
     cell_size: float,
     out_shape: tuple[int, int],
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> Path:
     """Chemin du fichier cache pour un masque rasterisé."""
-    key = _cache_key(source_name, n_geom, cell_size, out_shape)
+    key = _cache_key(source_name, n_geom, cell_size, out_shape, bbox)
     return _CACHE_DIR / f"{name}_{key}.npy"
 
 

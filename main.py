@@ -49,6 +49,7 @@ from config import (
     BBOX,
     BBOX_WGS84,
     CELL_SIZE,
+    CONFIG_VERSION,
     GEOLOGY_SCORES,
     N_SCORING_GRIDS,
     SCORE_THRESHOLD_HIGH,
@@ -73,13 +74,14 @@ from weather import WeatherChecker
 #  CONSTANTES MODULE
 # ═══════════════════════════════════════════════════════════════
 
-VERSION = "2.4.0"
+VERSION = CONFIG_VERSION
 
 # ── Chemins par défaut des données locales ─────────────────────
 _DATA_DIR = Path(__file__).resolve().parent / "data"
-_DEFAULT_DEM = str(
-    _DATA_DIR / "Copernicus_DSM_COG_10_N45_00_E005_00_DEM.tif",
-)
+# DEM : bbox dept élargi couvre 6 tuiles Copernicus (N44-45 × E004-006) —
+# load_dem() tombe sur _download_copernicus_dem() qui merge automatiquement
+# les tuiles locales. Un chemin unique cropperait à la fenêtre d'une seule tuile.
+_DEFAULT_DEM: str | None = None
 _DEFAULT_BD_FORET = str(_DATA_DIR / "FORMATION_VEGETALE.shp")
 _DEFAULT_GEOLOGY = str(
     _DATA_DIR / "geologie_38" / "GEO050K_HARM_038_S_FGEOL_2154.shp",
@@ -223,18 +225,20 @@ def setup_logging(output_dir: Path, verbose: bool = False) -> None:
 
 def _resolve_data_path(
     cli_arg: str | None,
-    default: str,
+    default: str | None,
     label: str,
-    glob_pattern: str,
+    glob_pattern: str | None,
 ) -> str | None:
     """Résout un chemin de données : CLI > défaut > glob récursif.
 
     Parameters
     ----------
     cli_arg : argument CLI explicite (prioritaire).
-    default : chemin par défaut absolu.
+    default : chemin par défaut absolu (None = pas de défaut fichier unique,
+              ex. DEM multi-tuiles géré par load_dem).
     label : nom humain pour le logging.
-    glob_pattern : pattern glob fallback dans data/ et sous-dossiers.
+    glob_pattern : pattern glob fallback dans data/ et sous-dossiers
+                   (None = pas de glob).
     """
     # 1. Argument CLI explicite
     if cli_arg is not None:
@@ -245,22 +249,31 @@ def _resolve_data_path(
         logger.warning("   ❌ %s (CLI) introuvable : %s", label, p)
 
     # 2. Chemin par défaut
-    dp = Path(default)
-    if dp.exists():
-        logger.info("   ✅ %s : %s", label, dp.name)
-        return str(dp)
+    if default is not None:
+        dp = Path(default)
+        if dp.exists():
+            logger.info("   ✅ %s : %s", label, dp.name)
+            return str(dp)
+    else:
+        dp = None
 
     # 3. Glob récursif dans data/ (couvre sous-dossiers type geologie_38/)
-    candidates = sorted(_DATA_DIR.rglob(glob_pattern))
-    if candidates:
-        chosen = candidates[0]
-        logger.info("   ✅ %s (glob) : %s", label, chosen.name)
-        return str(chosen)
+    if glob_pattern is not None:
+        candidates = sorted(_DATA_DIR.rglob(glob_pattern))
+        if candidates:
+            chosen = candidates[0]
+            logger.info("   ✅ %s (glob) : %s", label, chosen.name)
+            return str(chosen)
 
-    logger.warning(
-        "   ❌ %s introuvable (défaut=%s, glob=%s)",
-        label, dp.name, glob_pattern,
-    )
+    if default is None and glob_pattern is None:
+        logger.info("   ℹ️ %s : aucun défaut local (géré par loader)", label)
+    else:
+        logger.warning(
+            "   ❌ %s introuvable (défaut=%s, glob=%s)",
+            label,
+            dp.name if dp else "None",
+            glob_pattern,
+        )
     return None
 
 
@@ -789,8 +802,10 @@ def main(args: argparse.Namespace) -> int:
 
     # ── 1a. Résolution des chemins ────────────────────────────
     logger.info("   Résolution des chemins de données :")
+    # DEM : pas de glob (une tuile unique ne couvre pas le bbox élargi) —
+    # load_dem() merge les 6 tuiles Copernicus locales si filepath=None.
     dem_path = _resolve_data_path(
-        args.dem, _DEFAULT_DEM, "DEM", "*.tif",
+        args.dem, _DEFAULT_DEM, "DEM", None,
     )
     bd_foret_path = _resolve_data_path(
         args.bd_foret, _DEFAULT_BD_FORET, "BD Forêt",
@@ -1272,7 +1287,7 @@ Exemples d'utilisation :
     data_group = parser.add_argument_group("📂 Données d'entrée")
     data_group.add_argument(
         "--dem", type=str, default=None,
-        help="Chemin MNT raster (.tif). Défaut : Copernicus N45_E005.",
+        help="Chemin MNT raster (.tif). Défaut : merge Copernicus N44-45/E004-006.",
     )
     data_group.add_argument(
         "--forest", type=str, default=None,
@@ -1346,8 +1361,8 @@ Exemples d'utilisation :
         help="Seuil de score pour les hotspots (défaut: 0.60).",
     )
     model_group.add_argument(
-        "--smoothing-sigma", type=float, default=2.0, metavar="S",
-        help="Sigma du lissage gaussien spatial (défaut: 2.0).",
+        "--smoothing-sigma", type=float, default=0.5, metavar="S",
+        help="Sigma du lissage gaussien spatial (défaut: 0.5 — préserve mieux les pics).",
     )
     model_group.add_argument(
         "--seed", type=int, default=42,

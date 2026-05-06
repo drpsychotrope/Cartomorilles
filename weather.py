@@ -23,7 +23,7 @@ logger = logging.getLogger("cartomorilles.weather")
 
 _METEOBLUE_BASE_URL = "https://my.meteoblue.com/packages/basic-day"
 _API_KEY_ENV = "METEOBLUE_API_KEY"
-_API_KEY_DEFAULT = "Rgyb8cKoA9MNOLHv"
+_API_KEY_DEFAULT = "QEIkHCy5dvuctmA7"
 
 _CACHE_DIR = Path("data")
 _CACHE_MAX_AGE_S = 3600  # 1 h

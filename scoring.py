@@ -59,9 +59,11 @@ _MIN_CLUSTER_SIZE: int = getattr(config, "MIN_CLUSTER_SIZE", 4)
 _HOTSPOT_CLOSING_RADIUS: int = getattr(config, "HOTSPOT_CLOSING_RADIUS", 1)
 
 # Fix #23 — Pénalité de couverture pour cellules à critères manquants
+# v2.5.1 : floor 0.5 → 0.75 (pénalité max 25%)
+# v2.5.2 : floor 0.75 → 0.85 (pénalité max 15%) — D34
 # Cellule complète (10/10 critères) : × 1.0
-# Cellule à 50% de couverture       : × 0.75
-_COVERAGE_PENALTY_FLOOR: float = 0.5
+# Cellule à 50% de couverture       : × 0.925 (était 0.875)
+_COVERAGE_PENALTY_FLOOR: float = 0.85
 
 # Structure 8-connexité réutilisée
 _STRUCT_8CONN: np.ndarray = np.asarray(generate_binary_structure(2, 2))
@@ -70,7 +72,7 @@ _STRUCT_8CONN: np.ndarray = np.asarray(generate_binary_structure(2, 2))
 # Pénalise les zones où altitude, pente et TWI sont simultanément
 # dans leur zone optimale sur de grandes surfaces — typiquement
 # plaine alluviale péri-urbaine, pas micro-habitat forestier.
-_MONOTONY_RADIUS: int = 50          # cellules (~250m à 5m/cell)
+_MONOTONY_RADIUS_M: float = 250.0   # mètres — converti en cellules via cell_size
 _MONOTONY_FLOOR: float = 0.85       # plancher du malus (15% max)
 _MONOTONY_SLOPE_THRESHOLD: float = 8.0   # pente < seuil = "plat"
 _MONOTONY_ALT_STD_THRESHOLD: float = 15.0  # écart-type altitude < seuil = "homogène"
@@ -572,18 +574,24 @@ class MorilleScoring:
         # ── Masque "plat" : pente < seuil ──
         flat_mask = (slope < _MONOTONY_SLOPE_THRESHOLD).astype(np.float32)
 
+        # v2.5.0 : sigma calculé en cellules depuis radius en mètres
+        # (correction bug : avant, _MONOTONY_RADIUS=50 cellules indépendamment
+        # de cell_size → radius effectif ×4 sur grille 20m vs 5m calibrée)
+        cell_size = float(getattr(self.grid, "cell_size", 20.0))
+        sigma_cells = max(1.0, (_MONOTONY_RADIUS_M / cell_size) / 2.0)
+
         # ── Fraction de cellules plates dans le voisinage ──
         flat_frac: np.ndarray = _accel.gaussian_filter(
-            flat_mask, sigma=_MONOTONY_RADIUS / 2.0, mode="nearest",
+            flat_mask, sigma=sigma_cells, mode="nearest",
         )
 
         # ── Écart-type local de l'altitude (proxy homogénéité) ──
         alt_f32 = np.where(np.isfinite(alt), alt, 0.0).astype(np.float32)
         alt_mean: np.ndarray = _accel.gaussian_filter(
-            alt_f32, sigma=_MONOTONY_RADIUS / 2.0, mode="nearest",
+            alt_f32, sigma=sigma_cells, mode="nearest",
         )
         alt_sq_mean: np.ndarray = _accel.gaussian_filter(
-            alt_f32 ** 2, sigma=_MONOTONY_RADIUS / 2.0, mode="nearest",
+            alt_f32 ** 2, sigma=sigma_cells, mode="nearest",
         )
 
         alt_var = np.maximum(alt_sq_mean - alt_mean ** 2, 0.0)
@@ -685,6 +693,16 @@ class MorilleScoring:
             # 1=feuillus, 0=unknown (souvent feuillus dans ce contexte)
             target = target & ((_ft == 1) | (_ft == 0))
 
+        # v2.5.0 : exclure essences favorables (hêtre, frêne, pommier, tilleul,
+        # érable, charme, châtaignier) — ne sont pas des chênaies-buis xérothermophiles.
+        # v2.5.3 : seuil 0.50 → 0.30 — exclut aussi `unknown` (0.40) et `platane`
+        # (0.20). Cible restreinte aux vraies chênaies/buis xérothermophiles
+        # (chêne 0.15, chêne pubescent 0.10, robinier 0.15, bouleau 0.05, buis 0.05).
+        ts = grid.scores.get("tree_species") if hasattr(grid, "scores") else None
+        if ts is not None and isinstance(ts, np.ndarray) and ts.shape == score.shape:
+            _ts = np.asarray(ts, dtype=np.float32)
+            target = target & (_ts <= 0.30)
+
         # Exclure les cellules déjà éliminées
         if self.elimination_mask is not None:
             target = target & ~self.elimination_mask
@@ -718,11 +736,13 @@ class MorilleScoring:
         severity = 0.4 * roughness_factor + 0.6 * twi_factor
 
         # Malus : score × multiplier
-        # severity=0 → multiplier=1.0 (pas de malus)
-        # severity=0.5 → multiplier=0.75
-        # severity=1.0 → multiplier=0.50
-        _CALCDRY_FLOOR = 0.50
-        _CALCDRY_MAX_PENALTY = 0.50  # multiplier min = 1.0 - 0.50 = 0.50
+        # v2.5.1 : calibration adoucie (Vouillants/Chartreuse scoraient 0.50)
+        # v2.5.2 : floor 0.75 → 0.85, max_penalty 0.25 → 0.15 (D34)
+        # severity=0   → multiplier=1.0  (pas de malus)
+        # severity=0.5 → multiplier=0.925 (était 0.875)
+        # severity=1.0 → multiplier=0.85  (était 0.75)
+        _CALCDRY_FLOOR = 0.85
+        _CALCDRY_MAX_PENALTY = 0.15  # multiplier min = 1.0 - 0.15 = 0.85
 
         multiplier = np.ones_like(score, dtype=np.float32)
         multiplier[target] = 1.0 - _CALCDRY_MAX_PENALTY * severity[target]
@@ -780,6 +800,10 @@ class MorilleScoring:
         score_valid = np.where(valid, self.final_score, 0.0)
         weights = valid.astype(np.float64)
 
+        # v2.5.4 expérimentation truncate=2.0 ABANDONNÉE — régression confirmée
+        # max 0.739 → 0.680. Smoothing normalisé ne réduit pas les pics,
+        # il BOOST les cellules borderline via convolution avec voisins valides.
+        # Truncate compact retire ce boost. Truncate=4.0 (default scipy) maintenu.
         num: np.ndarray = _accel.gaussian_filter(
             score_valid, sigma=sigma, mode="nearest",
         )
