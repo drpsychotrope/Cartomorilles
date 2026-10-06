@@ -1057,11 +1057,13 @@ def main(args: argparse.Namespace) -> int:
     model.apply_spatial_smoothing(sigma=args.smoothing_sigma)
 
     # ── Niveau météo : modulation temporelle ──────────────────
+    weather_days: list[Any] | None = None
     if not getattr(args, "no_weather", False):
         try:
             _checker = WeatherChecker()
             _days = _checker.evaluate()
             if _days:
+                weather_days = _days
                 _today = _days[0]
                 # Facteur ∈ [0.40, 1.00] : préserve la structure spatiale
                 # Score météo 0.0 → ×0.40 / Score 1.0 → ×1.00
@@ -1101,8 +1103,13 @@ def main(args: argparse.Namespace) -> int:
     logger.info("\n🗺️  [4/4] Génération des exports...")
     t0 = time.time()
 
+    # Récupérer les observations iNaturalist depuis l'enrichisseur
+    _inat_obs = getattr(enricher, "inat_observations", None) or []
+
     viz = MorilleVisualizer(
         model, hotspots=hotspots, hydro_gdf=hydro_gdf, urban_gdf=urban_gdf,
+        inat_observations=_inat_obs,
+        weather_days=weather_days,
     )
     # Carte Folium HTML
     html_path = str(output_dir / "carte_morilles.html")

@@ -2032,13 +2032,26 @@ class DataLoader:
 
         all_elements: list[dict[str, Any]] = []
 
-        # Bâtiments par quadrant
+        # Types de bâtiments exclus (agricoles, ruines, abris non-urbains)
+        _BUILDING_EXCLUDE = (
+            "barn|farm|farm_auxiliary|greenhouse|shed|ruins|hut|silo"
+            "|stable|cowshed|slurry_tank|storage_tank|roof|collapsed"
+        )
+        logger.info(
+            "   Tags OSM urbain : building (excl. %s), "
+            "landuse=residential|commercial|industrial|retail, "
+            "amenity=parking|school, leisure=pitch|sports_centre, "
+            "highway=motorway|trunk|primary|secondary, railway=rail|light_rail",
+            _BUILDING_EXCLUDE,
+        )
+
+        # Bâtiments par quadrant (hors bâtiments agricoles/ruraux)
         for i, quad_bbox in enumerate(quadrants):
             try:
                 logger.debug("   Bâtiments quadrant %d/4...", i + 1)
                 q = f"""
                 [out:json][timeout:30];
-                way["building"]({quad_bbox});
+                way["building"]["building"!~"{_BUILDING_EXCLUDE}"]({quad_bbox});
                 out geom;
                 """
                 data = _overpass_query(q, timeout=45)
@@ -2102,6 +2115,25 @@ class DataLoader:
             len(all_elements),
             len(unique_elements),
         )
+
+        # Audit : répartition par tag principal
+        from collections import Counter as _Counter
+
+        _tag_counts: _Counter[str] = _Counter()
+        for _el in unique_elements:
+            _tags = _el.get("tags", {})
+            if "building" in _tags:
+                _tag_counts[f"building={_tags['building']}"] += 1
+            elif "landuse" in _tags:
+                _tag_counts[f"landuse={_tags['landuse']}"] += 1
+            elif "highway" in _tags:
+                _tag_counts[f"highway={_tags['highway']}"] += 1
+            elif "railway" in _tags:
+                _tag_counts[f"railway={_tags['railway']}"] += 1
+            else:
+                _tag_counts["other"] += 1
+        for _tag, _cnt in _tag_counts.most_common(15):
+            logger.info("   📋 %s : %d", _tag, _cnt)
 
         # Parser les géométries
         geometries: list[Any] = []
