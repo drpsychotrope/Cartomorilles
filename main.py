@@ -43,6 +43,7 @@ from typing import Any
 
 import numpy as np
 
+import config
 from config import (
     ALTITUDE_OPTIMAL,
     ALTITUDE_RANGE,
@@ -56,6 +57,7 @@ from config import (
     SCORE_THRESHOLD_MEDIUM,
     SLOPE_MAX,
     SLOPE_OPTIMAL,
+    SUPPORTED_SPECIES,
     TREE_SCORES,
     WEIGHTS,
     LANDCOVER_AUTO_MAX_KM2,
@@ -97,9 +99,9 @@ _ZONE_LABEL = f"Isère 38 — {_ZONE_DX_KM:.0f}×{_ZONE_DY_KM:.0f} km"
 _MAX_CELLS = 200_000_000  # 200M — protège contre cell_size=5m accidentel
 _WARN_CELLS = 50_000_000  # 50M — avertit sur temps de calcul TWI D8
 
-# Points de contrôle terrain (prospection réelle mars 2026)
+# Points de contrôle terrain — MORILLE (prospection réelle mars 2026)
 # v2.3.1 : châtaignier corrigé — plus éliminatoire
-TERRAIN_CHECKPOINTS: tuple[dict[str, Any], ...] = (
+TERRAIN_CHECKPOINTS_ESCULENTA: tuple[dict[str, Any], ...] = (
     # ── Contrôles positifs (morilles attendues) ──────────────────
     {
         "name": "Champy – châtaigneraie",
@@ -164,6 +166,72 @@ TERRAIN_CHECKPOINTS: tuple[dict[str, Any], ...] = (
         "obs": "forêt calcaire optimale, altitude idéale",
     },
 )
+
+# Alias rétro-compat (modules tiers / scripts ancien nom)
+TERRAIN_CHECKPOINTS = TERRAIN_CHECKPOINTS_ESCULENTA
+
+# Points de contrôle terrain — CÈPE (Boletus edulis, biblio)
+# v2.6.0 : sites typés cèpe — montagnard, mycorhize Pinaceae/Fagaceae,
+# pas d'élimination granite (cèpe ubiquiste).
+TERRAIN_CHECKPOINTS_EDULIS: tuple[dict[str, Any], ...] = (
+    # ── Contrôles positifs (cèpes attendus) ──────────────────────
+    {
+        "name": "Vercors hêtraie-sapinière 1100m",
+        "lat": 45.0660, "lon": 5.4630, "expected": 0.70,
+        "obs": "hêtre + sapin altitude optimale, sol calcaire",
+    },
+    {
+        "name": "Chartreuse sapinière 1100m",
+        "lat": 45.3500, "lon": 5.8000, "expected": 0.65,
+        "obs": "sapinière calcaire montagne moyenne",
+    },
+    {
+        "name": "Belledonne épicéa-pin granite 1500m",
+        "lat": 45.1700, "lon": 5.9500, "expected": 0.65,
+        "obs": "pessière granite — INVERSE morille (granite OK cèpe)",
+    },
+    {
+        "name": "Trièves chênaie-hêtraie 800m",
+        "lat": 44.8500, "lon": 5.6500, "expected": 0.55,
+        "obs": "chêne + hêtre versant montagne basse",
+        "tolerance": 0.50,
+    },
+    {
+        "name": "Châtaigneraie Bas-Dauphiné 500m",
+        "lat": 45.4500, "lon": 5.4000, "expected": 0.60,
+        "obs": "châtaignier acide — bon habitat cèpe",
+        "tolerance": 0.50,
+    },
+    # ── Contrôles négatifs (cèpes peu probables) ────────────────
+    {
+        "name": "Plaine Bièvre peuplier 250m",
+        "lat": 45.4500, "lon": 5.2500, "expected": 0.15,
+        "obs": "peuplier saturé, alt trop basse",
+        "tolerance": 0.50,
+    },
+    {
+        "name": "Centre-ville Grenoble",
+        "lat": 45.1885, "lon": 5.7245, "expected": 0.00,
+        "obs": "urbain dense — éliminé",
+    },
+    {
+        "name": "Lautaret alpin 2050m",
+        "lat": 45.0350, "lon": 6.4050, "expected": 0.00,
+        "obs": "altitude > 2200m éliminatoire (limite supérieure)",
+    },
+    {
+        "name": "Isère lit majeur",
+        "lat": 45.20003, "lon": 5.74186, "expected": 0.00,
+        "obs": "plan d'eau — masque eau",
+    },
+)
+
+
+# Dispatch checkpoints par espèce
+TERRAIN_CHECKPOINTS_BY_SPECIES: dict[str, tuple[dict[str, Any], ...]] = {
+    "esculenta": TERRAIN_CHECKPOINTS_ESCULENTA,
+    "edulis": TERRAIN_CHECKPOINTS_EDULIS,
+}
 
 # Fichiers partiels à nettoyer en cas d'interruption
 _cleanup_files: list[str] = []
@@ -444,11 +512,21 @@ def display_statistics(stats: dict[str, Any]) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 
-def validate_against_terrain(model: MorilleScoring) -> float | None:
+def validate_against_terrain(
+    model: MorilleScoring,
+    checkpoints: tuple[dict[str, Any], ...] | None = None,
+) -> float | None:
     """
     Compare le score modèle aux observations de terrain.
     Retourne un taux de concordance (0–1) ou None si impossible.
+
+    v2.6.0 : checkpoints species-aware — fallback sur les checkpoints de
+    l'espèce du modèle (TERRAIN_CHECKPOINTS_BY_SPECIES[model.species]).
     """
+    if checkpoints is None:
+        checkpoints = TERRAIN_CHECKPOINTS_BY_SPECIES.get(
+            model.species, TERRAIN_CHECKPOINTS_ESCULENTA,
+        )
     try:
         grid = model.grid
 
@@ -460,9 +538,9 @@ def validate_against_terrain(model: MorilleScoring) -> float | None:
 
         concordance_list: list[float] = []
         logger.info("")
-        logger.info("📍 Validation croisée terrain :")
+        logger.info("📍 Validation croisée terrain [%s] :", model.species)
 
-        for pt in TERRAIN_CHECKPOINTS:
+        for pt in checkpoints:
             x, y = TO_L93.transform(pt["lon"], pt["lat"])
 
             if not hasattr(grid, "x_coords") or not hasattr(grid, "y_coords"):
@@ -558,9 +636,13 @@ def display_hotspots(
 def save_hotspots_csv(
     output_dir: Path,
     hotspots: list[dict[str, Any]],
+    species: str = "esculenta",
 ) -> Path:
-    """Exporte tous les hotspots en CSV triés par score décroissant."""
-    csv_path = output_dir / "hotspots.csv"
+    """Exporte tous les hotspots en CSV triés par score décroissant.
+
+    v2.6.0 : nom CSV templaté par espèce — `{species}_hotspots.csv`.
+    """
+    csv_path = output_dir / f"{species}_hotspots.csv"
 
     fields = [
         "rank", "id", "mean_score", "max_score",
@@ -614,15 +696,23 @@ def save_report(
     duration: float,
     concordance: float | None,
     enrichment_stats: dict[str, Any] | None = None,
+    species: str = "esculenta",
 ) -> Path:
-    """Sauvegarde un rapport JSON complet et reproductible."""
+    """Sauvegarde un rapport JSON complet et reproductible.
+
+    v2.6.0 : nom rapport templaté par espèce — `rapport_{species}.json`.
+    """
     hotspots_export: list[dict[str, Any]] = [
         hotspot_to_export_dict(h) for h in hotspots[:30]
     ]
+    sp_checkpoints = TERRAIN_CHECKPOINTS_BY_SPECIES.get(
+        species, TERRAIN_CHECKPOINTS_ESCULENTA,
+    )
 
     report: dict[str, Any] = {
         "tool": "Cartomorilles",
         "version": VERSION,
+        "species": species,
         "generated_at": datetime.now().isoformat(),
         "duration_seconds": round(duration, 1),
         "zone": {
@@ -635,17 +725,17 @@ def save_report(
         "statistics": stats,
         "terrain_validation": {
             "concordance_rate": concordance,
-            "n_checkpoints": len(TERRAIN_CHECKPOINTS),
+            "n_checkpoints": len(sp_checkpoints),
         },
         "enrichment": enrichment_stats,
         "hotspots": hotspots_export,
     }
 
-    report_path = output_dir / "rapport_cartomorilles.json"
+    report_path = output_dir / f"rapport_{species}.json"
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False, default=str)
 
-    logger.info("📝 Rapport sauvegardé : %s", report_path)
+    logger.info("📝 Rapport sauvegardé [%s] : %s", species, report_path)
     return report_path
 
 
@@ -1053,21 +1143,19 @@ def main(args: argparse.Namespace) -> int:
     )
 
     # ══════════════════════════════════════════════════════════
-    #  ÉTAPE 3 — MODÈLE MULTICRITÈRE
+    #  ÉTAPE 3 — MODÈLE MULTICRITÈRE (multi-espèces v2.6.0)
     # ══════════════════════════════════════════════════════════
 
-    logger.info("\n🧮 [3/4] Calcul du modèle multicritère...")
+    species_list: list[str] = list(getattr(args, "species", ["esculenta"]))
+    logger.info(
+        "\n🧮 [3/4] Calcul du modèle multicritère [espèces: %s]...",
+        ", ".join(species_list),
+    )
     t0 = time.time()
 
-    model = MorilleScoring(grid)
-    model.compute_weighted_score()
-    model.apply_eliminatory_factors()
-    model.apply_monotony_penalty()
-    model.apply_calcdry_penalty()
-    model.apply_spatial_smoothing(sigma=args.smoothing_sigma)
-
-    # ── Niveau météo : modulation temporelle ──────────────────
+    # ── Niveau météo (calculé 1× pour toutes espèces) ──
     weather_days: list[Any] | None = None
+    weather_factor: float = 1.0
     if not getattr(args, "no_weather", False):
         try:
             _checker = WeatherChecker()
@@ -1075,36 +1163,81 @@ def main(args: argparse.Namespace) -> int:
             if _days:
                 weather_days = _days
                 _today = _days[0]
-                # Facteur ∈ [0.40, 1.00] : préserve la structure spatiale
-                # Score météo 0.0 → ×0.40 / Score 1.0 → ×1.00
-                _wf = float(np.float32(0.4 + 0.6 * _today.score))
-                assert model.final_score is not None
-                model.final_score = model.final_score * np.float32(_wf)
+                weather_factor = float(np.float32(0.4 + 0.6 * _today.score))
                 logger.info(
                     "🌤️  Météo J+0 : %s  (score=%.2f → ×%.2f)",
-                    _today.label, _today.score, _wf,
+                    _today.label, _today.score, weather_factor,
                 )
                 logger.info(WeatherChecker.format_report(_days))
         except Exception as _exc:
             logger.debug("Météo indisponible, skip : %s", _exc)
 
-    model.classify_probability()
+    # ── Boucle scoring par espèce ──
+    models: dict[str, MorilleScoring] = {}
+    hotspots_by_species: dict[str, list[dict[str, Any]]] = {}
+    stats_by_species: dict[str, dict[str, Any]] = {}
+    concordance_by_species: dict[str, float | None] = {}
 
-    hotspots = model.get_hotspots(threshold=args.hotspot_threshold)
+    for sp_idx, species in enumerate(species_list):
+        sp_t0 = time.time()
+        logger.info("")
+        logger.info("─" * 70)
+        logger.info("🍄 PASS %d/%d — species=%s", sp_idx + 1, len(species_list), species)
+        logger.info("─" * 70)
 
-    logger.info("   ⏱️  Scoring : %.1fs", time.time() - t0)
+        # Recompute des 6 critères species-aware (grid.scores écrasé in-place)
+        # 1ère itération esculenta : redondant avec score_* initiaux mais cache hit ~0s
+        grid.recompute_species_scores(
+            species, forest_gdf=forest_gdf, geology_gdf=geology_gdf,
+        )
 
-    # ── Statistiques ──────────────────────────────────────────
-    _final = model.final_score
-    assert _final is not None, "final_score is None after scoring pipeline"
-    final: np.ndarray = _final
+        sp_model = MorilleScoring(grid, species=species)
+        sp_model.compute_weighted_score()
+        sp_model.apply_eliminatory_factors()
+        sp_model.apply_monotony_penalty()
+        sp_model.apply_calcdry_penalty()
+        sp_model.apply_spatial_smoothing(sigma=args.smoothing_sigma)
 
-    stats = compute_statistics(final, args.hotspot_threshold)
-    stats["n_hotspots"] = len(hotspots)
-    display_statistics(stats)
+        # ── Modulation météo (multiplicative, post-smoothing) ──
+        if weather_factor != 1.0:
+            assert sp_model.final_score is not None
+            sp_model.final_score = sp_model.final_score * np.float32(weather_factor)
 
-    # ── Validation terrain ────────────────────────────────────
-    concordance = validate_against_terrain(model)
+        sp_model.classify_probability()
+
+        sp_hotspots = sp_model.get_hotspots(threshold=args.hotspot_threshold)
+        hotspots_by_species[species] = sp_hotspots
+
+        # ── Statistiques par espèce ──
+        _final = sp_model.final_score
+        assert _final is not None
+        sp_stats = compute_statistics(_final, args.hotspot_threshold)
+        sp_stats["n_hotspots"] = len(sp_hotspots)
+        sp_stats["species"] = species
+        stats_by_species[species] = sp_stats
+
+        logger.info("   📊 Stats [%s]:", species)
+        display_statistics(sp_stats)
+
+        # ── Validation terrain par espèce ──
+        sp_conc = validate_against_terrain(sp_model)
+        concordance_by_species[species] = sp_conc
+
+        models[species] = sp_model
+        logger.info("   ⏱️  [%s] : %.1fs", species, time.time() - sp_t0)
+
+    logger.info("")
+    logger.info("   ⏱️  Scoring TOTAL (%d espèces) : %.1fs",
+                len(species_list), time.time() - t0)
+
+    # ── Variables compat single-species (premier species = défaut affichage) ──
+    primary_species: str = species_list[0]
+    model: MorilleScoring = models[primary_species]
+    hotspots: list[dict[str, Any]] = hotspots_by_species[primary_species]
+    stats: dict[str, Any] = stats_by_species[primary_species]
+    concordance: float | None = concordance_by_species[primary_species]
+    final = model.final_score
+    assert final is not None
 
     # ══════════════════════════════════════════════════════════
     #  ÉTAPE 4 — EXPORTS
@@ -1116,36 +1249,56 @@ def main(args: argparse.Namespace) -> int:
     # Récupérer les observations iNaturalist depuis l'enrichisseur
     _inat_obs = getattr(enricher, "inat_observations", None) or []
 
+    # ── Visualizer multi-espèces (v2.6.0) ──
+    # Accepte un dict de modèles + dict de hotspots. Le 1er species du dict
+    # est visible par défaut, les autres sont accessibles via toggle JS.
     viz = MorilleVisualizer(
-        model, hotspots=hotspots, hydro_gdf=hydro_gdf, urban_gdf=urban_gdf,
+        models,
+        hotspots=hotspots_by_species,
+        hydro_gdf=hydro_gdf,
+        urban_gdf=urban_gdf,
         inat_observations=_inat_obs,
         weather_days=weather_days,
     )
-    # Carte Folium HTML
-    html_path = str(output_dir / "carte_morilles.html")
+    # Carte Folium HTML — UN SEUL fichier multi-espèces avec toggle
+    html_path = str(output_dir / "cartomorilles.html")
     _cleanup_files.append(html_path)
     viz.create_folium_map(html_path)
 
-    # GeoTIFF raster
-    try:
-        tif_path = str(output_dir / "morilles_probability.tif")
-        _cleanup_files.append(tif_path)
-        viz.export_geotiff(tif_path)
-    except (IOError, OSError) as e:
-        logger.warning("GeoTIFF I/O échoué : %s", e)
-    except Exception as e:
-        logger.warning("GeoTIFF échoué : %s", e)
-
-    # GPKG vecteur (optionnel)
-    if args.export_vector:
+    # GeoTIFF raster — UN par espèce
+    for sp in species_list:
         try:
-            gpkg_path = str(output_dir / "morilles_grid.gpkg")
-            _cleanup_files.append(gpkg_path)
-            viz.export_gpkg_grid(gpkg_path, threshold=0.3)
+            tif_path = str(output_dir / f"{sp}_probability.tif")
+            _cleanup_files.append(tif_path)
+            viz.export_geotiff(tif_path, species=sp)
         except (IOError, OSError) as e:
-            logger.warning("GPKG I/O échoué : %s", e)
+            logger.warning("GeoTIFF [%s] I/O échoué : %s", sp, e)
         except Exception as e:
-            logger.warning("GPKG échoué : %s", e)
+            logger.warning("GeoTIFF [%s] échoué : %s", sp, e)
+
+    # Alias compat morilles_probability.tif (esculenta)
+    if "esculenta" in species_list:
+        try:
+            import shutil
+            src = output_dir / "esculenta_probability.tif"
+            dst = output_dir / "morilles_probability.tif"
+            if src.exists():
+                shutil.copy2(src, dst)
+                _cleanup_files.append(str(dst))
+        except Exception as e:
+            logger.debug("Alias morilles_probability.tif non créé : %s", e)
+
+    # GPKG vecteur (optionnel) — UN par espèce
+    if args.export_vector:
+        for sp in species_list:
+            try:
+                gpkg_path = str(output_dir / f"{sp}_grid.gpkg")
+                _cleanup_files.append(gpkg_path)
+                viz.export_gpkg_grid(gpkg_path, threshold=0.3, species=sp)
+            except (IOError, OSError) as e:
+                logger.warning("GPKG [%s] I/O échoué : %s", sp, e)
+            except Exception as e:
+                logger.warning("GPKG [%s] échoué : %s", sp, e)
 
     logger.info("   ⏱️  Export : %.1fs", time.time() - t0)
 
@@ -1172,19 +1325,35 @@ def main(args: argparse.Namespace) -> int:
         "bd_foret_path": bd_foret_path,
         "geology_path": geology_path,
         "regions_path": regions_path,
+        "species_modeled": species_list,
     }
 
     full_enrich_stats: dict[str, Any] = {**enricher_load_stats, **enrich_stats}
 
     duration = time.time() - t_start
 
-    save_report(
-        output_dir, stats, hotspots,
-        config_snapshot, duration, concordance,
-        enrichment_stats=full_enrich_stats,
-    )
-
-    save_hotspots_csv(output_dir, hotspots)
+    # ── Rapport JSON par espèce + CSV hotspots par espèce ──
+    for sp in species_list:
+        sp_stats = stats_by_species[sp]
+        sp_hotspots = hotspots_by_species[sp]
+        sp_conc = concordance_by_species[sp]
+        # Snapshot enrichi avec params espèce
+        sp_snapshot = dict(config_snapshot)
+        sp_snapshot["species"] = sp
+        sp_snapshot["species_params"] = {
+            k: (list(v) if isinstance(v, tuple)
+                else dict(v) if hasattr(v, "items")
+                else sorted(v) if isinstance(v, frozenset)
+                else v)
+            for k, v in config.SPECIES_PARAMS[sp].items()
+        }
+        save_report(
+            output_dir, sp_stats, sp_hotspots,
+            sp_snapshot, duration, sp_conc,
+            enrichment_stats=full_enrich_stats,
+            species=sp,
+        )
+        save_hotspots_csv(output_dir, sp_hotspots, species=sp)
 
     # ══════════════════════════════════════════════════════════
     #  RÉSUMÉ FINAL
@@ -1367,6 +1536,16 @@ Exemples d'utilisation :
     model_group.add_argument(
         "--seed", type=int, default=42,
         help="Seed pour reproductibilité des critères synthétiques.",
+    )
+    model_group.add_argument(
+        "--species", nargs="+",
+        default=list(SUPPORTED_SPECIES),
+        choices=list(SUPPORTED_SPECIES),
+        metavar="SPECIES",
+        help=(
+            "Espèces à modéliser (défaut: toutes — esculenta + edulis pour "
+            "dual-render avec toggle UI). Choix : %s." % ", ".join(SUPPORTED_SPECIES)
+        ),
     )
 
     # ── Sorties ──

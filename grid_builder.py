@@ -666,12 +666,49 @@ class GridBuilder:
 
 
     # ═══════════════════════════════════════════════════════
+    #  RECOMPUTE SPECIES SCORES (v2.6.0 multi-espèces)
+    # ═══════════════════════════════════════════════════════
+
+    def recompute_species_scores(
+        self,
+        species: str,
+        forest_gdf: gpd.GeoDataFrame | None,
+        geology_gdf: gpd.GeoDataFrame | None,
+    ) -> GridBuilder:
+        """Réécrit dans self.scores les 6 critères dépendants de l'espèce.
+
+        Critères species-aware (réécrits) :
+            altitude, slope, aspect, twi, tree_species, geology
+
+        Critères species-agnostiques (préservés) :
+            terrain_roughness, dist_water, canopy_openness, ground_cover,
+            disturbance, forest_edge, geology_contact, urban_proximity,
+            favorable_density.
+
+        Cache disque (D23) isolé par hash MD5 du lookup → caches distincts
+        par espèce coexistent automatiquement.
+        """
+        logger.info(
+            "🔄 Recompute species scores [%s] — 6 critères species-aware",
+            species,
+        )
+        self.score_altitude(species=species)
+        self.score_slope(species=species)
+        self.score_aspect(species=species)
+        self.score_twi(species=species)
+        self.score_tree_species(forest_gdf, species=species)
+        self.score_geology(geology_gdf, species=species)
+        return self
+
+
+    # ═══════════════════════════════════════════════════════
     #  SCORES TERRAIN
     # ═══════════════════════════════════════════════════════
 
-    def score_altitude(self) -> GridBuilder:
+    def score_altitude(self, species: str = "esculenta") -> GridBuilder:
         """
         Score d'altitude — v2.2.0 : optimal 200-600m, bonus à 350m.
+        v2.6.0 : ranges species-aware via config.SPECIES_PARAMS[species].
         """
         if self._skip_zero_weight("altitude"):
             return self
@@ -679,8 +716,11 @@ class GridBuilder:
         _alt = self.altitude
         assert _alt is not None
 
-        alt_min, alt_max = ALTITUDE_OPTIMAL
-        range_min, range_max = ALTITUDE_RANGE
+        params = config.SPECIES_PARAMS.get(
+            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+        )
+        alt_min, alt_max = params["altitude_optimal"]
+        range_min, range_max = params["altitude_range"]
 
         score = np.zeros_like(_alt, dtype=np.float32)
 
@@ -718,17 +758,19 @@ class GridBuilder:
         self._log_score_stats("altitude", score)
         return self
 
-    def score_slope(self) -> GridBuilder:
+    def score_slope(self, species: str = "esculenta") -> GridBuilder:
         """Score de pente — v2.3.4 fix #38.
 
         Calibré Alpes Isère : morilles confirmées 20-35° (ND-de-Mésage,
         Chartreuse, Vouillants). Piecewise, transitions douces.
 
-          0–15°  optimal     → 1.0
-         15–30°  modéré      → 1.0 → 0.55
-         30–40°  raide       → 0.55 → 0.15
-         40–45°  très raide  → 0.15 → 0.0
-           >45°  éliminatoire → 0.0
+          0–opt_max     optimal     → 1.0
+          opt_max–30°   modéré      → 1.0 → 0.55
+          30–40°        raide       → 0.55 → 0.15
+          40–slope_max  très raide  → 0.15 → 0.0
+           >slope_max   éliminatoire → 0.0
+
+        v2.6.0 : opt_max et slope_max species-aware (cèpe : 25°/45°).
         """
         if self._skip_zero_weight("slope"):
             return self
@@ -736,10 +778,13 @@ class GridBuilder:
         _slope = self.slope
         assert _slope is not None
 
-        opt_max  = SLOPE_OPTIMAL[1]    # 15°
-        moderate = SLOPE_MODERATE       # 30°
-        steep    = SLOPE_STEEP          # 40°
-        maximum  = SLOPE_MAX            # 45°
+        params = config.SPECIES_PARAMS.get(
+            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+        )
+        opt_max  = params["slope_optimal"][1]   # 15° morille / 25° cèpe
+        moderate = SLOPE_MODERATE                # 30°
+        steep    = SLOPE_STEEP                   # 40°
+        maximum  = params["slope_max"]           # 45°
 
         score = np.ones_like(_slope, dtype=np.float32)
 
@@ -797,10 +842,15 @@ class GridBuilder:
         self._log_score_stats("terrain_roughness", score)
         return self
 
-    def score_aspect(self) -> GridBuilder:
-        """Score d'exposition — fonction continue sinusoïdale."""
+    def score_aspect(self, species: str = "esculenta") -> GridBuilder:
+        """Score d'exposition — fonction continue sinusoïdale.
+
+        v2.6.0 : ref_deg, base, amplitude species-aware. Esculenta peak Sud
+        (170°, base 0.65 ± 0.35), edulis peak Nord (0°, base 0.825 ± 0.175 —
+        cèpe moins discriminant en aspect).
+        """
         if self._skip_zero_weight("aspect"):
-            return self        
+            return self
         self._require_terrain()
 
         _aspect_val = self.aspect
@@ -811,15 +861,25 @@ class GridBuilder:
         assert _slope_val is not None, "slope is None"
         _slope: np.ndarray = _slope_val
 
-        # Score continu sinusoïdal : max à _ASPECT_REF_DEG (≈Sud)
-        aspect_rad = np.radians(_aspect - _ASPECT_REF_DEG)
-        score = (_ASPECT_BASE + _ASPECT_AMPLITUDE * np.cos(aspect_rad)).astype(
-            np.float32
+        params = config.SPECIES_PARAMS.get(
+            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
         )
+        ref_deg = float(params["aspect_ref_deg"])
+        # Dérive base/amplitude des bornes du dict aspect_scores (excl. flat)
+        asp_dict = params["aspect_scores"]
+        asp_vals = [v for k, v in asp_dict.items() if k != "flat"]
+        asp_max = float(max(asp_vals))
+        asp_min = float(min(asp_vals))
+        base = (asp_max + asp_min) / 2.0
+        amplitude = (asp_max - asp_min) / 2.0
+
+        # Score continu sinusoïdal : max à ref_deg (Sud=170 esculenta / Nord=0 edulis)
+        aspect_rad = np.radians(_aspect - ref_deg)
+        score = (base + amplitude * np.cos(aspect_rad)).astype(np.float32)
 
         # Zones plates → score flat (overwrite)
         flat_mask = _slope < FLAT_SLOPE_THRESHOLD
-        score[flat_mask] = ASPECT_SCORES["flat"]
+        score[flat_mask] = float(asp_dict["flat"])
 
         score = self._apply_nodata(np.clip(score, 0, 1))
         self.scores["aspect"] = score
@@ -827,20 +887,27 @@ class GridBuilder:
         self._log_score_stats("aspect", score)
         return self
 
-    def score_twi(self) -> GridBuilder:
-        """Score TWI — courbe contrastée avec plateau optimal marqué."""
+    def score_twi(self, species: str = "esculenta") -> GridBuilder:
+        """Score TWI — courbe contrastée avec plateau optimal marqué.
+
+        v2.6.0 : optimal/dry/wet/waterlog species-aware. Cèpe = (5,9), waterlog 16
+        (vs morille (6,10) waterlog 18 — cèpe moins tolérant à la saturation).
+        """
         if self._skip_zero_weight("twi"):
-            return self        
+            return self
         self._require_terrain()
         _twi = self.twi
         assert _twi is not None
 
         twi_arr = np.asarray(_twi, dtype=np.float32)
 
-        opt_lo, opt_hi = TWI_OPTIMAL
-        dry_limit = TWI_DRY_LIMIT
-        wet_limit = TWI_WET_LIMIT
-        waterlog = TWI_WATERLOG
+        params = config.SPECIES_PARAMS.get(
+            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+        )
+        opt_lo, opt_hi = params["twi_optimal"]
+        dry_limit = float(params["twi_dry_limit"])
+        wet_limit = float(params["twi_wet_limit"])
+        waterlog = float(params["twi_waterlog"])
         dry_floor = TWI_DRY_FLOOR
         wet_floor = TWI_WET_FLOOR
 
@@ -1105,7 +1172,9 @@ class GridBuilder:
         return result
 
     def score_tree_species(
-        self, forest_gdf: gpd.GeoDataFrame | None,
+        self,
+        forest_gdf: gpd.GeoDataFrame | None,
+        species: str = "esculenta",
     ) -> GridBuilder:
         """
         Score essences forestières — raster int-codé + lookup vectorisé.
@@ -1116,6 +1185,9 @@ class GridBuilder:
 
         Le tri par score croissant garantit que la meilleure essence
         prévaut en cas de chevauchement de polygones (last wins).
+
+        v2.6.0 : table de scores species-aware via config.SPECIES_PARAMS.
+        Le hash MD5 du lookup (D23) garantit caches disque distincts par espèce.
         """
         name = "tree_species"
         if self._skip_zero_weight(name):
@@ -1184,11 +1256,17 @@ class GridBuilder:
             v: k for k, v in essence_to_code.items()
         }
 
-        # ── Lookup table code → score ─────────────────────────────
+        # ── Lookup table code → score (species-aware v2.6.0) ──────
+        sp_params = config.SPECIES_PARAMS.get(
+            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+        )
+        sp_tree_scores = sp_params["tree_scores"]
+        sp_unknown = float(sp_tree_scores.get("unknown", 0.4))
         max_code = max(essence_to_code.values()) + 1
         lookup = np.full(max_code, 0.5, dtype=np.float32)
         for ess, code in essence_to_code.items():
-            lookup[code] = config.get_tree_score(ess)
+            # canonique → score espèce ; fallback unknown si essence non dans dict
+            lookup[code] = float(sp_tree_scores.get(ess, sp_unknown))
         lookup[0] = 0.5  # nodata = neutre
 
         logger.debug(
@@ -1310,7 +1388,9 @@ class GridBuilder:
         return best
 
     def score_geology(
-        self, geology_gdf: gpd.GeoDataFrame | None,
+        self,
+        geology_gdf: gpd.GeoDataFrame | None,
+        species: str = "esculenta",
     ) -> GridBuilder:
         """
         Score géologie — raster int-codé + lookup vectorisé.
@@ -1322,6 +1402,9 @@ class GridBuilder:
         Résolution : DESCR prioritaire sur NOTATION (D2).
         Le tri par score croissant garantit que la meilleure catégorie
         prévaut en cas de chevauchement (last wins).
+
+        v2.6.0 : table de scores + ELIMINATORY_GEOLOGY species-aware.
+        Cèpe : eliminatory_geology = ∅ (ubiquiste). Cache D23 isolé par hash.
         """
         name = "geology"
         if self._skip_zero_weight(name):
@@ -1391,18 +1474,24 @@ class GridBuilder:
             v: k for k, v in cat_to_code.items()
         }
 
-        # ── Lookup table code → score ─────────────────────────────
+        # ── Lookup table code → score (species-aware v2.6.0) ──────
+        sp_params = config.SPECIES_PARAMS.get(
+            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+        )
+        sp_geo_scores = sp_params["geology_scores"]
+        sp_elim_geo = sp_params["eliminatory_geology"]
+        sp_unknown = float(sp_geo_scores.get("unknown", 0.30))
         max_code = max(cat_to_code.values()) + 1
         lookup = np.full(max_code, 0.5, dtype=np.float32)
         for cat, code in cat_to_code.items():
-            lookup[code] = config.get_geology_score(cat)
+            lookup[code] = float(sp_geo_scores.get(cat, sp_unknown))
         lookup[0] = 0.5  # nodata = neutre
 
-        # ── Masque éliminatoire (codes granite/gneiss/siliceux) ────
+        # ── Masque éliminatoire (codes éliminatoires species-aware) ────
         eliminatory_codes: frozenset[int] = frozenset(
             cat_to_code[cat]
             for cat in unique_cats
-            if cat in config.ELIMINATORY_GEOLOGY
+            if cat in sp_elim_geo
         )
 
         logger.debug(

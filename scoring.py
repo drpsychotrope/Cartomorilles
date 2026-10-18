@@ -30,9 +30,11 @@ from scipy.ndimage import (
 
 import _accel
 import config
-from config import TWI_WATERLOG
+from config import TWI_WATERLOG  # fallback module-level (display, get_twi_display_data)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from grid_builder import GridBuilder
 
 logger = logging.getLogger("cartomorilles.scoring")
@@ -92,6 +94,11 @@ class MorilleScoring:
         # Copie superficielle — ne pas aliaser le dict original
         self.scores: dict[str, np.ndarray] = dict(grid_builder.scores)
         self.species: str = species
+        # v2.6.0 — paramètres écologiques par espèce (alt_elim, twi_waterlog,
+        # slope_max, apply_calcdry, apply_monotony, eliminatory_geology, ...)
+        self.params: Mapping[str, Any] = config.SPECIES_PARAMS.get(
+            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+        )
 
         # Résultats — initialisés à None
         self.final_score: np.ndarray | None = None
@@ -104,6 +111,8 @@ class MorilleScoring:
         self._step_eliminated: bool = False
         self._step_smoothed: bool = False
         self._step_classified: bool = False
+        self._step_monotony: bool = False
+        self._step_calcdry: bool = False
 
         # Métadonnées pour le rapport
         self._criteria_used: list[str] = []
@@ -325,20 +334,22 @@ class MorilleScoring:
             combined |= nodata
             logger.info("  NoData (DEM)     : %8d cellules", int(nodata.sum()))
 
-        # ── Géologie éliminatoire ──
+        # ── Géologie éliminatoire (v2.6.0 species-aware) ──
+        sp_elim_geo = self.params["eliminatory_geology"]
         geo_mask = self._build_eliminatory_geology_mask()
         if geo_mask is not None:
             detail["geology"] = geo_mask
             combined |= geo_mask
+            elim_label = ", ".join(sorted(sp_elim_geo)) if sp_elim_geo else "aucune"
             logger.info(
                 "  Géologie élim.   : %8d cellules  (%s)",
                 int(geo_mask.sum()),
-                ", ".join(sorted(config.ELIMINATORY_GEOLOGY)),
+                elim_label,
             )
 
-        # ── Pente ──
+        # ── Pente (v2.6.0 species-aware slope_max) ──
         slope = getattr(self.grid, "slope", None)
-        slope_max = float(getattr(config, "SLOPE_MAX", 30.0))
+        slope_max = float(self.params.get("slope_max", 45.0))
         if isinstance(slope, np.ndarray) and slope.shape == (ny, nx):
             slope_elim = np.isfinite(slope) & (slope > slope_max)
             detail["slope"] = slope_elim
@@ -349,29 +360,32 @@ class MorilleScoring:
                 int(slope_elim.sum()),
             )
 
-        # ── Altitude ──
+        # ── Altitude (v2.6.0 species-aware) ──
         alt = getattr(self.grid, "altitude", None)
+        sp_alt_min = float(self.params.get("alt_eliminatory_min", _ALT_ELIM_MIN))
+        sp_alt_max = float(self.params.get("alt_eliminatory_max", _ALT_ELIM_MAX))
         if isinstance(alt, np.ndarray) and alt.shape == (ny, nx):
             finite = np.isfinite(alt)
-            alt_elim = finite & ((alt < _ALT_ELIM_MIN) | (alt > _ALT_ELIM_MAX))
+            alt_elim = finite & ((alt < sp_alt_min) | (alt > sp_alt_max))
             detail["altitude"] = alt_elim
             combined |= alt_elim
             logger.info(
                 "  Altitude hors [%.0f–%.0f]m : %8d cellules",
-                _ALT_ELIM_MIN,
-                _ALT_ELIM_MAX,
+                sp_alt_min,
+                sp_alt_max,
                 int(alt_elim.sum()),
             )
 
-        # ── TWI engorgement → éliminatoire ──
+        # ── TWI engorgement (v2.6.0 species-aware waterlog) ──
         twi_arr: np.ndarray | None = getattr(self.grid, "twi", None)  # P4
+        sp_twi_waterlog = float(self.params.get("twi_waterlog", TWI_WATERLOG))
         if isinstance(twi_arr, np.ndarray) and twi_arr.shape == (ny, nx):
-            twi_elim = twi_arr > TWI_WATERLOG
+            twi_elim = twi_arr > sp_twi_waterlog
             detail["twi"] = twi_elim
             combined |= twi_elim
             logger.info(
                 "  TWI engorgé (>%.0f) : %8d cellules",
-                TWI_WATERLOG,
+                sp_twi_waterlog,
                 int(twi_elim.sum()),
             )
             
@@ -557,9 +571,18 @@ class MorilleScoring:
 
         Le malus est multiplicatif : score × [_MONOTONY_FLOOR .. 1.0].
         Les zones éliminées et NaN sont préservées.
+
+        v2.6.0 : species-aware skip si params["apply_monotony"] is False.
         """
         self._require_step("_step_eliminated", "apply_monotony_penalty")
         assert self.final_score is not None
+
+        if not self.params.get("apply_monotony", True):
+            logger.info(
+                "Malus monotonie désactivé pour species=%s", self.species,
+            )
+            self._step_monotony = True
+            return self
 
         _slope = getattr(self.grid, "slope", None)
         _alt = getattr(self.grid, "altitude", None)
@@ -650,8 +673,20 @@ class MorilleScoring:
           - rugosité forte + TWI sec → ravine rocheuse → malus fort
           - rugosité faible + TWI normal → forêt dense → malus léger
         Les zones éliminées et NaN sont préservées.
+
+        v2.6.0 : species-aware skip si params["apply_calcdry"] is False.
+        Anti-habitat morille uniquement (cèpe pas concerné).
         """
         self._require_step("_step_monotony", "apply_calcdry_penalty")
+
+        if not self.params.get("apply_calcdry", True):
+            logger.info(
+                "Malus calc_dry désactivé pour species=%s "
+                "(pas d'anti-habitat xérique applicable)",
+                self.species,
+            )
+            self._step_calcdry = True
+            return self
 
         grid = self.grid
         score = self.final_score

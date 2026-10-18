@@ -87,6 +87,8 @@ __all__ = [
     "DATA_SUBDIR_GEOLOGY", "GEOLOGY_SHAPEFILE",
     # Poids
     "WEIGHTS",
+    # Espèces (multi-species depuis v2.6.0)
+    "SPECIES_PARAMS", "SUPPORTED_SPECIES", "DEFAULT_SPECIES",
     # Essences
     "TREE_SCORES", "TREE_ALIASES",
     "resolve_tree_name", "get_tree_score",
@@ -894,6 +896,184 @@ DEFAULT_BASEMAP: Final[str] = "IGN Plan v2"
 
 
 # ═══════════════════════════════════════════════════════════════
+#  SPECIES_PARAMS — paramètres écologiques par espèce (v2.6.0)
+# ═══════════════════════════════════════════════════════════════
+#
+#  Ajoute Boletus edulis (cèpe) à côté de Morchella esculenta.
+#  Les constantes morille existantes (TREE_SCORES, GEOLOGY_SCORES,
+#  ALTITUDE_OPTIMAL, etc.) sont préservées comme défauts ; elles
+#  alimentent le sous-dict "esculenta". Le sous-dict "edulis"
+#  redéfinit chaque paramètre selon l'écologie de B. edulis :
+#  - Montagnard (alt 600-1400m vs 200-600m morille)
+#  - Mycorhize Pinaceae/Fagaceae (sapin/épicéa/hêtre/chêne ≥ 0.85)
+#  - Pas de thermophilie : aspect N/NE favorisés
+#  - Ubiquiste géologie : ELIMINATORY_GEOLOGY = ∅ (granite OK)
+#  - Pénalité calcdry désactivée (pas d'anti-habitat xérique chêne-buis)
+#
+#  Utilisation :
+#    params = config.SPECIES_PARAMS["edulis"]
+#    optimal = params["altitude_optimal"]
+#
+
+# ── Cèpe : tree_scores (mêmes clés canoniques que TREE_SCORES morille) ──
+_TREE_SCORES_EDULIS_DICT: dict[str, float] = {
+    # ── Feuillus de plaine ──
+    "frene":              0.40,   # médiocre (sols saturés/calcaires fertiles)
+    "orme":               0.35,
+    "pommier":            0.50,
+    "poirier":            0.50,
+    "chataignier":        0.85,   # excellent — castaneraies acides
+    "peuplier":           0.20,   # mauvais — sols saturés
+    "aulne":              0.25,
+    "saule":              0.15,
+    "noisetier":          0.55,
+    # ── Feuillus mycorhiziques montagne (excellents partenaires) ──
+    "hetre":              0.95,   # hêtraies Vercors/Chartreuse — top
+    "chene":              0.90,   # chênaies sessiles/pédonculées
+    "chene_pubescent":    0.60,   # xérique — moins favorable
+    "tilleul":            0.40,
+    "erable":             0.45,
+    "charme":             0.65,
+    "bouleau":            0.75,   # bouleaux acides — bons
+    # ── Conifères : optimums absolus B. edulis ──
+    "sapin":              1.00,   # sapinière calcaire/acide — optimal
+    "epicea":             1.00,   # pessière montagnarde — optimal
+    "pin_sylvestre":      0.85,
+    "douglas":            0.70,
+    # ── Essences peu/pas favorables ──
+    "platane":            0.10,
+    "robinier":           0.30,   # allélopathique
+    "buis":               0.10,
+    # ── Défaut — forêt sans essence connue ──
+    "unknown":            0.50,
+}
+
+# ── Cèpe : geology_scores (mêmes clés canoniques que GEOLOGY_SCORES) ──
+# Cèpe ubiquiste : tolère acide ET calcaire. Préfère substrats drainants
+# (granite/gneiss/schiste/grès) ; calcaire correct mais pas optimum (vs
+# morille saturée à calcaire). Alluvions saturées défavorables.
+_GEOLOGY_SCORES_EDULIS_DICT: dict[str, float] = {
+    # ── Calcaires : bons mais pas optimaux pour cèpe ──
+    "calcaire":              0.70,
+    "calcaire_marneux":      0.65,
+    "marne":                 0.55,
+    "alluvions_calcaires":   0.55,
+    "calcaire_lacustre":     0.60,
+    "eboulis_calcaire":      0.65,
+    "dolomie":               0.65,
+    # ── Substrats alluviaux : faibles (saturation, peuplements monocultures) ──
+    "colluvions":            0.65,
+    "alluvions":             0.40,
+    "alluvions_recentes":    0.30,
+    # ── Substrats intermédiaires ──
+    "moraine":               0.85,   # souvent matériel cristallin granitique
+    "flysch":                0.55,
+    "sable":                 0.55,
+    "molasse":               0.65,
+    # ── Substrats acides drainants : OPTIMAUX cèpe ──
+    "gres":                  0.85,
+    "schiste":               0.85,
+    "granite":               0.95,
+    "gneiss":                0.90,
+    "siliceux":              0.95,
+    # ── Substrats non favorables ──
+    "remblai":               0.10,
+    "hydrographie":          0.30,
+    # ── Par défaut ──
+    "unknown":               0.45,
+}
+
+# ── Cèpe : aspect_scores (mêmes clés canoniques que ASPECT_SCORES) ──
+# Cèpe non-thermophile : préfère versants frais N/NE (humidité retenue).
+# Sud sec moins favorable.
+_ASPECT_SCORES_EDULIS_DICT: dict[str, float] = {
+    "S":    0.65,
+    "SE":   0.70,
+    "flat": 0.85,
+    "SW":   0.70,
+    "E":    0.80,
+    "W":    0.80,
+    "NE":   1.00,
+    "NW":   0.90,
+    "N":    1.00,
+}
+
+# ── Frozen wrappers pour les sous-dicts cèpe ──
+_TREE_SCORES_EDULIS: MappingProxyType[str, float] = MappingProxyType(
+    _TREE_SCORES_EDULIS_DICT,
+)
+_GEOLOGY_SCORES_EDULIS: MappingProxyType[str, float] = MappingProxyType(
+    _GEOLOGY_SCORES_EDULIS_DICT,
+)
+_ASPECT_SCORES_EDULIS: MappingProxyType[str, float] = MappingProxyType(
+    _ASPECT_SCORES_EDULIS_DICT,
+)
+
+# ── Liste des espèces supportées + défaut ──
+SUPPORTED_SPECIES: Final[tuple[str, ...]] = ("esculenta", "edulis")
+DEFAULT_SPECIES: Final[str] = "esculenta"
+
+# ── SPECIES_PARAMS : dispatch par espèce ──
+# Esculenta = morille (référence existante, ALT/SLOPE/ASPECT/TWI inchangés).
+# Edulis    = cèpe   (paramètres distincts, validés brainstorming).
+_SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
+    "esculenta": MappingProxyType({
+        "common_name":           "Morille",
+        "scientific_name":       "Morchella esculenta",
+        "emoji":                 "🍄",
+        "tree_scores":           TREE_SCORES,
+        "geology_scores":        GEOLOGY_SCORES,
+        "eliminatory_geology":   ELIMINATORY_GEOLOGY,
+        "altitude_optimal":      ALTITUDE_OPTIMAL,        # (200, 600)
+        "altitude_range":        ALTITUDE_RANGE,          # (150, 900)
+        "alt_eliminatory_min":   100.0,
+        "alt_eliminatory_max":   1400.0,
+        "slope_optimal":         SLOPE_OPTIMAL,           # (0, 15)
+        "slope_max":             SLOPE_MAX,               # 45
+        "aspect_scores":         ASPECT_SCORES,
+        "aspect_ref_deg":        180.0,                   # sud
+        "twi_optimal":           TWI_OPTIMAL,             # (6, 10)
+        "twi_dry_limit":         TWI_DRY_LIMIT,
+        "twi_wet_limit":         TWI_WET_LIMIT,
+        "twi_waterlog":          TWI_WATERLOG,            # 18
+        "apply_calcdry":         True,
+        "apply_monotony":        True,
+    }),
+    "edulis": MappingProxyType({
+        "common_name":           "Cèpe",
+        "scientific_name":       "Boletus edulis",
+        "emoji":                 "🌰",
+        "tree_scores":           _TREE_SCORES_EDULIS,
+        "geology_scores":        _GEOLOGY_SCORES_EDULIS,
+        "eliminatory_geology":   frozenset(),             # ∅ — cèpe ubiquiste
+        "altitude_optimal":      (600.0, 1400.0),
+        "altitude_range":        (300.0, 1800.0),
+        "alt_eliminatory_min":   200.0,
+        "alt_eliminatory_max":   2200.0,
+        "slope_optimal":         (0.0, 25.0),
+        "slope_max":             45.0,
+        "aspect_scores":         _ASPECT_SCORES_EDULIS,
+        "aspect_ref_deg":        0.0,                     # nord
+        "twi_optimal":           (5.0, 9.0),
+        "twi_dry_limit":         3.0,
+        "twi_wet_limit":         12.0,
+        "twi_waterlog":          16.0,
+        "apply_calcdry":         False,                   # OFF — cèpe pas anti-xérique
+        "apply_monotony":        True,
+    }),
+}
+
+SPECIES_PARAMS: MappingProxyType[str, MappingProxyType[str, Any]] = MappingProxyType(
+    _SPECIES_PARAMS_DICT,
+)
+
+
+def get_species_params(species: str) -> MappingProxyType[str, Any]:
+    """Retourne les paramètres d'une espèce (fallback default si inconnue)."""
+    return SPECIES_PARAMS.get(species, SPECIES_PARAMS[DEFAULT_SPECIES])
+
+
+# ═══════════════════════════════════════════════════════════════
 #  VALIDATION GLOBALE
 # ═══════════════════════════════════════════════════════════════
 
@@ -1017,6 +1197,78 @@ def validate_config() -> bool:
             "DEFAULT_BASEMAP '%s' absent de BASEMAPS", DEFAULT_BASEMAP,
         )
         ok = False
+
+    # ── SPECIES_PARAMS : cohérence par espèce ──
+    if DEFAULT_SPECIES not in SPECIES_PARAMS:
+        logger.error(
+            "DEFAULT_SPECIES '%s' absent de SPECIES_PARAMS", DEFAULT_SPECIES,
+        )
+        ok = False
+    for sp_name in SUPPORTED_SPECIES:
+        if sp_name not in SPECIES_PARAMS:
+            logger.error("SUPPORTED_SPECIES '%s' absent de SPECIES_PARAMS", sp_name)
+            ok = False
+            continue
+        params = SPECIES_PARAMS[sp_name]
+        # Scores [0,1]
+        for tree_key, tree_val in params["tree_scores"].items():
+            if not (0.0 <= tree_val <= 1.0):
+                logger.error(
+                    "SPECIES_PARAMS['%s'].tree_scores['%s']=%.2f hors [0,1]",
+                    sp_name, tree_key, tree_val,
+                )
+                ok = False
+        for geo_key, geo_val in params["geology_scores"].items():
+            if not (0.0 <= geo_val <= 1.0):
+                logger.error(
+                    "SPECIES_PARAMS['%s'].geology_scores['%s']=%.2f hors [0,1]",
+                    sp_name, geo_key, geo_val,
+                )
+                ok = False
+        for asp_key, asp_val in params["aspect_scores"].items():
+            if not (0.0 <= asp_val <= 1.0):
+                logger.error(
+                    "SPECIES_PARAMS['%s'].aspect_scores['%s']=%.2f hors [0,1]",
+                    sp_name, asp_key, asp_val,
+                )
+                ok = False
+        # Ranges cohérents
+        alt_opt = params["altitude_optimal"]
+        alt_rng = params["altitude_range"]
+        if alt_opt[0] >= alt_opt[1]:
+            logger.error("SPECIES_PARAMS['%s'].altitude_optimal dégénéré: %s",
+                         sp_name, alt_opt)
+            ok = False
+        if alt_rng[0] >= alt_rng[1]:
+            logger.error("SPECIES_PARAMS['%s'].altitude_range dégénéré: %s",
+                         sp_name, alt_rng)
+            ok = False
+        if (params["alt_eliminatory_min"] >= alt_opt[0]
+                or params["alt_eliminatory_max"] <= alt_opt[1]):
+            logger.warning(
+                "SPECIES_PARAMS['%s'] altitude_eliminatory ne contient pas "
+                "altitude_optimal", sp_name,
+            )
+        slo_opt = params["slope_optimal"]
+        if slo_opt[0] >= slo_opt[1] or slo_opt[1] > params["slope_max"]:
+            logger.error(
+                "SPECIES_PARAMS['%s'].slope_optimal/slope_max incohérent: "
+                "%s, max=%.1f", sp_name, slo_opt, params["slope_max"],
+            )
+            ok = False
+        twi_opt = params["twi_optimal"]
+        if twi_opt[0] >= twi_opt[1]:
+            logger.error("SPECIES_PARAMS['%s'].twi_optimal dégénéré: %s",
+                         sp_name, twi_opt)
+            ok = False
+        # Éliminatoires existent dans geology_scores
+        for geo in params["eliminatory_geology"]:
+            if geo not in params["geology_scores"]:
+                logger.error(
+                    "SPECIES_PARAMS['%s'].eliminatory_geology '%s' absent "
+                    "de geology_scores", sp_name, geo,
+                )
+                ok = False
 
     if ok:
         logger.info("✅ Configuration validée (v%s)", CONFIG_VERSION)

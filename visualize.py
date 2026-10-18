@@ -197,9 +197,9 @@ class MorilleVisualizer:
 
     def __init__(
         self,
-        scoring_model: MorilleScoring,
+        scoring_model: "MorilleScoring | dict[str, MorilleScoring]",
         *,
-        hotspots: list[dict[str, Any]] | None = None,
+        hotspots: "list[dict[str, Any]] | dict[str, list[dict[str, Any]]] | None" = None,
         landmarks: list[dict[str, Any]] | None = None,
         max_hotspot_markers: int = _MAX_HOTSPOT_MARKERS,
         hydro_gdf: gpd.GeoDataFrame | None = None,
@@ -207,10 +207,38 @@ class MorilleVisualizer:
         inat_observations: list[dict[str, Any]] | None = None,
         weather_days: list[Any] | None = None,
     ) -> None:
-        self._validate_model(scoring_model)
-        self.model: MorilleScoring = scoring_model
-        self.grid = scoring_model.grid
-        self.hotspots: list[dict[str, Any]] = hotspots or []
+        # ── v2.6.0 — accepter dict[species, MorilleScoring] OU instance unique
+        if isinstance(scoring_model, dict):
+            self.models: dict[str, MorilleScoring] = dict(scoring_model)
+            if not self.models:
+                raise ValueError("models dict empty")
+            for sp, m in self.models.items():
+                self._validate_model(m)
+        else:
+            self._validate_model(scoring_model)
+            sp_name = getattr(scoring_model, "species", "esculenta")
+            self.models = {sp_name: scoring_model}
+
+        self.species_list: list[str] = list(self.models.keys())
+        self.primary_species: str = self.species_list[0]
+        # Legacy access — premier modèle = défaut
+        self.model: MorilleScoring = self.models[self.primary_species]
+        self.grid = self.model.grid
+
+        # ── Hotspots dict OU list (backward-compat) ──
+        if isinstance(hotspots, dict):
+            self.hotspots_by_species: dict[str, list[dict[str, Any]]] = dict(hotspots)
+        elif hotspots is None:
+            self.hotspots_by_species = {sp: [] for sp in self.species_list}
+        else:
+            # Liste simple → assignée à l'espèce primaire
+            self.hotspots_by_species = {self.primary_species: hotspots}
+        # Fill missing species avec liste vide
+        for sp in self.species_list:
+            self.hotspots_by_species.setdefault(sp, [])
+        # Legacy : self.hotspots = liste de l'espèce primaire
+        self.hotspots: list[dict[str, Any]] = self.hotspots_by_species[self.primary_species]
+
         self.landmarks: list[dict[str, Any]] = landmarks or _default_landmarks()
         self.max_hotspot_markers = max_hotspot_markers
         self._hydro_gdf = hydro_gdf
@@ -218,18 +246,26 @@ class MorilleVisualizer:
         self._inat_observations: list[dict[str, Any]] = inat_observations or []
         self._weather_days: list[Any] = weather_days or []
 
-        _fs = scoring_model.final_score
-        _pc = scoring_model.probability_classes
-        _em = scoring_model.elimination_mask
-        _ed = scoring_model.elimination_detail
-        assert _fs is not None, "final_score is None after validation"
-        assert _pc is not None, "probability_classes is None after validation"
-        assert _em is not None, "elimination_mask is None after validation"
-        assert _ed is not None, "elimination_detail is None after validation"
-        self._final_score: np.ndarray = _fs
-        self._prob_classes: np.ndarray = _pc
-        self._elim_mask: np.ndarray = _em
-        self._elim_detail: dict[str, Any] = _ed
+        # Stocker raw scores par espèce pour exports per-species
+        self._final_score_by_species: dict[str, np.ndarray] = {}
+        self._prob_classes_by_species: dict[str, np.ndarray] = {}
+        self._elim_mask_by_species: dict[str, np.ndarray] = {}
+        self._elim_detail_by_species: dict[str, dict[str, Any]] = {}
+        for sp, m in self.models.items():
+            assert m.final_score is not None
+            assert m.probability_classes is not None
+            assert m.elimination_mask is not None
+            assert m.elimination_detail is not None
+            self._final_score_by_species[sp] = m.final_score
+            self._prob_classes_by_species[sp] = m.probability_classes
+            self._elim_mask_by_species[sp] = m.elimination_mask
+            self._elim_detail_by_species[sp] = m.elimination_detail
+
+        # Legacy — pointeurs sur l'espèce primaire
+        self._final_score: np.ndarray = self._final_score_by_species[self.primary_species]
+        self._prob_classes: np.ndarray = self._prob_classes_by_species[self.primary_species]
+        self._elim_mask: np.ndarray = self._elim_mask_by_species[self.primary_species]
+        self._elim_detail: dict[str, Any] = self._elim_detail_by_species[self.primary_species]
 
         self._to_wgs84 = TO_WGS84
 
@@ -495,46 +531,69 @@ class MorilleVisualizer:
     def _prepare_probability(
         self,
     ) -> list[tuple[str, Callable[[], bytes], bool, float, int, str]]:
-        """Prépare la couche probabilité (reprojection + closure render)."""
-        score: np.ndarray = self._final_score
-        valid: np.ndarray = np.asarray(np.isfinite(score))
+        """Prépare les couches probabilité (1 par espèce — v2.6.0).
 
-        if not np.any(valid):
-            logger.warning("Score entièrement NaN — overlay ignoré")
-            return []
-
-        # Upsampling source avant reprojection
-        scale = max(1.0, config.CELL_SIZE / _RENDER_MAX_CELL_M)
-        if scale > 1.0:
-            from scipy.ndimage import zoom  # upsample only — pas dans _accel
-            safe = np.where(valid, score, 0.0)
-            safe_up = np.asarray(zoom(safe, scale, order=1), dtype=np.float32)
-            valid_up = np.asarray(
-                zoom(valid.astype(np.float32), scale, order=0),
-            ) > 0.5
-            safe_up[~valid_up] = np.nan
-            score_up = safe_up
-        else:
-            score_up = score
-
-        reprojected = self._reproject_to_wgs84(score_up)
-        h_src, w_src = score.shape
-        h_dst, w_dst = reprojected.shape
+        Pour dual-render : génère N ImageOverlay (un par species). Toutes
+        sont ajoutées à la map. La 1ère espèce est visible (opacité 1.0),
+        les autres masquées (opacité 0). Le toggle JS bascule entre elles.
+        """
+        specs: list[tuple[str, Callable[[], bytes], bool, float, int, str]] = []
         thresholds = list(config.PROBABILITY_THRESHOLDS)
+        scale = max(1.0, config.CELL_SIZE / _RENDER_MAX_CELL_M)
 
-        def render() -> bytes:
-            rgba = MorilleVisualizer._colorize_score(
-                reprojected, _CMAP, thresholds,
+        for sp_idx, species in enumerate(self.species_list):
+            score: np.ndarray = self._final_score_by_species[species]
+            valid: np.ndarray = np.asarray(np.isfinite(score))
+
+            if not np.any(valid):
+                logger.warning("Score [%s] entièrement NaN — overlay ignoré", species)
+                continue
+
+            # Upsampling source avant reprojection
+            if scale > 1.0:
+                from scipy.ndimage import zoom  # upsample only — pas dans _accel
+                safe = np.where(valid, score, 0.0)
+                safe_up = np.asarray(zoom(safe, scale, order=1), dtype=np.float32)
+                valid_up = np.asarray(
+                    zoom(valid.astype(np.float32), scale, order=0),
+                ) > 0.5
+                safe_up[~valid_up] = np.nan
+                score_up = safe_up
+            else:
+                score_up = score
+
+            reprojected = self._reproject_to_wgs84(score_up)
+            h_src, w_src = score.shape
+            h_dst, w_dst = reprojected.shape
+
+            # Capture sp + reprojected pour closure
+            def _make_render(_repr: np.ndarray = reprojected) -> Callable[[], bytes]:
+                def render() -> bytes:
+                    rgba = MorilleVisualizer._colorize_score(
+                        _repr, _CMAP, thresholds,
+                    )
+                    return _encode_rgba(rgba)
+                return render
+
+            sp_params = config.SPECIES_PARAMS.get(
+                species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
             )
-            return _encode_rgba(rgba)
+            sp_emoji = sp_params.get("emoji", "🍄")
+            sp_common = sp_params.get("common_name", species)
+            label = f"{sp_emoji} Probabilité {sp_common}s"
 
-        msg = (
-            f"Couche probabilité : {w_src}×{h_src}"
-            f" → {w_dst}×{h_dst} px WGS84"
-        )
-        return [
-            ("🍄 Probabilité morilles", render, True, 1.0, 1, msg),
-        ]
+            # 1ère espèce visible, les autres masquées (toggle JS prend le relais)
+            show = (sp_idx == 0)
+
+            msg = (
+                f"Couche probabilité [{species}] : {w_src}×{h_src}"
+                f" → {w_dst}×{h_dst} px WGS84"
+            )
+            specs.append(
+                (label, _make_render(), show, 1.0, 1 + sp_idx, msg),
+            )
+
+        return specs
 
     def _prepare_elimination(
         self,
@@ -698,8 +757,8 @@ class MorilleVisualizer:
     # ──────────────────────────────────────────────────────
     # Data PNG (score + altitude + pente encodés RGBA)
     # ──────────────────────────────────────────────────────
-    def _build_data_png_bytes(self) -> bytes:
-        """Construit le PNG RGB opaque pour tooltip mousemove.
+    def _build_data_png_bytes(self, species: str | None = None) -> bytes:
+        """Construit le PNG RGB opaque pour tooltip mousemove + filtre JS.
 
         R = score (0–200 → 0.00–1.00, 255 = NaN)
         G = altitude low byte (alt + 500)
@@ -707,8 +766,12 @@ class MorilleVisualizer:
 
         Fix B1 : RGB opaque — pas de pré-multiplication alpha navigateur.
         La pente est encodée dans un PNG séparé (_build_slope_png_bytes).
+
+        v2.6.0 : species kwarg sélectionne le raster source. Si None → primary.
         """
-        score_wgs = self._reproject_to_wgs84(self._final_score)
+        sp = species or self.primary_species
+        score_src = self._final_score_by_species.get(sp, self._final_score)
+        score_wgs = self._reproject_to_wgs84(score_src)
         h, w = score_wgs.shape
         rgb = np.zeros((h, w, 3), dtype=np.uint8)
 
@@ -723,7 +786,7 @@ class MorilleVisualizer:
 
         # G, B : altitude
         alt_grid = getattr(self.grid, "altitude", None)
-        if isinstance(alt_grid, np.ndarray) and alt_grid.shape == self._final_score.shape:
+        if isinstance(alt_grid, np.ndarray) and alt_grid.shape == score_src.shape:
             alt_wgs = self._reproject_to_wgs84(alt_grid)
             valid_a = np.asarray(np.isfinite(alt_wgs))
             alt_enc = np.zeros((h, w), dtype=np.uint16)
@@ -742,8 +805,8 @@ class MorilleVisualizer:
             png_bytes = buf.getvalue()
         size_kb = len(png_bytes) / 1024
         logger.info(
-            "✅ Data PNG : %dx%d px (%.0f KB) — score+alt",
-            w, h, size_kb,
+            "✅ Data PNG [%s] : %dx%d px (%.0f KB) — score+alt",
+            sp, w, h, size_kb,
         )
         return png_bytes
 
@@ -793,11 +856,19 @@ class MorilleVisualizer:
         folium_map: folium.Map,
         data_uri: str,
         slope_uri: str = "",
+        *,
+        data_uris_by_species: dict[str, str] | None = None,
     ) -> None:
         """Injecte CSS + JS : panneaux draggable, opacité, filtre, légende,
-        tooltip mousemove, hotspot slider."""
+        tooltip mousemove, hotspot slider.
 
+        v2.6.0 : data_uris_by_species fournit un data PNG par espèce afin
+        que le filtre min/max + tooltip suivent l'espèce active.
+        """
         n_hotspots = getattr(self, "_hotspot_count_on_map", 0)
+        # Fallback : single-species → réplique data_uri sur primary
+        if data_uris_by_species is None:
+            data_uris_by_species = {self.primary_species: data_uri}
 
         # ── Template JS (inline) ──
         js_block = r"""
@@ -833,13 +904,16 @@ class MorilleVisualizer:
         .cartom-panel .cartom-minimize:hover { opacity: 1; }
         .cartom-panel.minimized .cartom-body { display: none; }
 
+        #cartom-species  { top: 10px;     left: 10px; }
         #cartom-legend   { bottom: 30px;  left: 30px; }
         #cartom-colorbar { top: 10px;     right: 10px; left: auto; }
-        #cartom-opacity  { top: 80px;     left: 10px; }
-        #cartom-filter   { top: 190px;    left: 10px; }
-        #cartom-hotspots { top: 310px;    left: 10px; }
+        #cartom-opacity  { top: 130px;    left: 10px; }
+        #cartom-filter   { top: 240px;    left: 10px; }
+        #cartom-hotspots { top: 360px;    left: 10px; }
         #cartom-info     { bottom: 30px;  right: 10px; min-width: 200px; }
         #wx-panel        { bottom: 30px;  right: 10px; }
+        #cartom-species label { display:block; margin:3px 0; cursor:pointer; }
+        #cartom-species input[type=radio] { margin-right:6px; }
         #wx-panel table  { border-collapse:collapse; width:100%; }
         #wx-panel td     { padding:2px 6px; }
         #wx-panel .wx-good  { color:#2d8a4e; font-weight:bold; }
@@ -862,6 +936,14 @@ class MorilleVisualizer:
 
         .cartom-hotspot-hidden { display: none !important; }
         </style>
+
+        <div id="cartom-species" class="cartom-panel">
+            <div class="cartom-titlebar">
+                <span>🍄 Espèce</span>
+                <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
+            </div>
+            <div class="cartom-body" id="cartom-species-body">%SPECIES_RADIOS%</div>
+        </div>
 
         <div id="cartom-legend" class="cartom-panel">
             <div class="cartom-titlebar">
@@ -947,6 +1029,7 @@ class MorilleVisualizer:
         </div>
 
         <img id="cartom-data-img" src="%DATA_URI%" style="display:none;">
+        %SPECIES_DATA_IMGS%
         <canvas id="cartom-data-canvas" style="display:none;"></canvas>
         <canvas id="cartom-render-canvas" style="display:none;"></canvas>
         <img id="cartom-slope-img" src="%SLOPE_URI%" style="display:none;">
@@ -1068,16 +1151,26 @@ class MorilleVisualizer:
             }
 
             /* ═══════ DATA & RENDER CANVAS ═══════ */
+            /* v2.6.0 : 1 dataCtx par espèce (filtre + tooltip suivent active). */
+            /* speciesList/primarySpecies déclarés tôt — utilisés par initCanvases */
+            var speciesList = %SPECIES_LIST_JSON%;
+            var speciesEmojis = %SPECIES_EMOJIS_JSON%;
+            var primarySpecies = %PRIMARY_SPECIES_JSON%;
+            var currentSpecies = primarySpecies;
+
             var dataImg    = document.getElementById('cartom-data-img');
             var dataCanvas = document.getElementById('cartom-data-canvas');
             var renderCanvas = document.getElementById('cartom-render-canvas');
             var slopeImg    = document.getElementById('cartom-slope-img');
             var slopeCanvas = document.getElementById('cartom-slope-canvas');
             var infoBody   = document.getElementById('cartom-info-body');
-            var dataCtx    = null;
+            var dataCtx    = null;       /* legacy: pointe sur ctx primary */
             var renderCtx  = null;
             var slopeCtx   = null;
             var dataW = 0, dataH = 0;
+            var dataCtxBySpecies = {};   /* species → CanvasRenderingContext2D */
+            var dataImgBySpecies = {};   /* species → HTMLImageElement */
+            var activeDataSpecies = null;
 
             var south = %SOUTH%, north = %NORTH%;
             var west  = %WEST%,  east  = %EAST%;
@@ -1098,10 +1191,29 @@ class MorilleVisualizer:
                 dataH = dataImg.naturalHeight;
                 if (dataW === 0 || dataH === 0) return false;
 
+                /* v2.6.0 : crée 1 canvas off-screen par espèce, dessine son data PNG */
+                speciesList.forEach(function(sp){
+                    var img = document.getElementById('cartom-data-img-' + sp);
+                    if (!img && sp === primarySpecies) img = dataImg;
+                    if (!img || img.naturalWidth === 0) return;
+                    var off = document.createElement('canvas');
+                    off.width = dataW; off.height = dataH;
+                    var ctx = off.getContext('2d', {willReadFrequently: true});
+                    ctx.drawImage(img, 0, 0);
+                    dataCtxBySpecies[sp] = ctx;
+                    dataImgBySpecies[sp] = img;
+                });
+
+                /* Legacy : dataCtx pointe sur primary species (active par défaut) */
                 dataCanvas.width = dataW;
                 dataCanvas.height = dataH;
-                dataCtx = dataCanvas.getContext('2d', {willReadFrequently: true});
-                dataCtx.drawImage(dataImg, 0, 0);
+                dataCtx = dataCtxBySpecies[primarySpecies] ||
+                          (function(){
+                              var c = dataCanvas.getContext('2d', {willReadFrequently: true});
+                              c.drawImage(dataImg, 0, 0);
+                              return c;
+                          })();
+                activeDataSpecies = primarySpecies;
 
                 renderCanvas.width = dataW;
                 renderCanvas.height = dataH;
@@ -1116,6 +1228,14 @@ class MorilleVisualizer:
                 }
 
                 return true;
+            }
+
+            /* Switch dataCtx actif → re-render avec filtres courants */
+            function setActiveDataSpecies(sp) {
+                if (dataCtxBySpecies[sp]) {
+                    dataCtx = dataCtxBySpecies[sp];
+                    activeDataSpecies = sp;
+                }
             }
 
             function renderOverlay(filterMin, filterMax) {
@@ -1187,10 +1307,36 @@ class MorilleVisualizer:
                 renderOverlay(0.0, 1.0);
             }
 
-            if (dataImg && dataImg.complete && dataImg.naturalWidth > 0) {
+            /* Attendre que TOUS les data imgs (1 par espèce) soient chargés
+               avant initCanvases — sinon dataCtxBySpecies incomplet. */
+            function allDataImgsReady() {
+                if (dataImg && (!dataImg.complete || dataImg.naturalWidth === 0)) {
+                    return false;
+                }
+                for (var i = 0; i < speciesList.length; i++) {
+                    var sp = speciesList[i];
+                    if (sp === primarySpecies) continue;
+                    var img = document.getElementById('cartom-data-img-' + sp);
+                    if (img && (!img.complete || img.naturalWidth === 0)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            function tryReady() {
+                if (allDataImgsReady()) onReady();
+            }
+
+            if (allDataImgsReady()) {
                 onReady();
-            } else if (dataImg) {
-                dataImg.addEventListener('load', onReady);
+            } else {
+                if (dataImg) dataImg.addEventListener('load', tryReady);
+                speciesList.forEach(function(sp){
+                    if (sp === primarySpecies) return;
+                    var img = document.getElementById('cartom-data-img-' + sp);
+                    if (img) img.addEventListener('load', tryReady);
+                });
             }
             if (slopeImg && !slopeImg.complete) {
                 slopeImg.addEventListener('load', function(){ initCanvases(); });
@@ -1334,6 +1480,126 @@ class MorilleVisualizer:
                     infoBody.innerHTML = '<span style="color:#888;">Survolez la carte…</span>';
                 });
             }
+
+            /* ═══════ SPECIES TOGGLE (v2.6.0) ═══════ */
+            /* Vars déclarés plus haut (DATA & RENDER CANVAS section). */
+
+            // Trouve les ImageOverlay correspondant à chaque species par
+            // pattern dans leur "name" Folium (ex: "🍄 Probabilité Morilles").
+            function findOverlayForSpecies(sp) {
+                if (!map) return null;
+                var layers = [];
+                map.eachLayer(function(l){
+                    if (l instanceof L.ImageOverlay && l.options && l.options.name) {
+                        if (l.options.name.indexOf(speciesEmojis[sp]) >= 0
+                            && l.options.name.indexOf("Probabilité") >= 0) {
+                            layers.push(l);
+                        }
+                    }
+                });
+                return layers.length > 0 ? layers[0] : null;
+            }
+
+            function findHotspotGroupForSpecies(sp) {
+                if (!map) return null;
+                var groups = [];
+                map.eachLayer(function(l){
+                    if (l instanceof L.FeatureGroup && l.options && l.options.name) {
+                        if (l.options.name.indexOf("Hotspots") >= 0
+                            && l.options.name.toLowerCase().indexOf(sp) < 0) {
+                            // Match par nom commun n'est pas robuste — on filtre par
+                            // marqueur cartom-species-* dans children
+                            var hasMatch = false;
+                            l.eachLayer(function(child){
+                                if (child.options && child.options.className
+                                    && child.options.className.indexOf("cartom-species-"+sp) >= 0) {
+                                    hasMatch = true;
+                                }
+                            });
+                            if (hasMatch) groups.push(l);
+                        }
+                    }
+                });
+                return groups.length > 0 ? groups[0] : null;
+            }
+
+            // Récupère opacité du slider (réutilise slider opacité existant)
+            function getCurrentOpacity() {
+                var sl = document.getElementById('cartom_opacity_slider');
+                if (sl) return parseInt(sl.value, 10) / 100.0;
+                return 0.7;
+            }
+
+            function applySpeciesSelection(sp) {
+                currentSpecies = sp;
+                var op = getCurrentOpacity();
+                speciesList.forEach(function(other){
+                    var ov = findOverlayForSpecies(other);
+                    if (ov) {
+                        try { ov.setOpacity(other === sp ? op : 0); } catch(e){}
+                    }
+                });
+
+                /* v2.6.0 — switch dataCtx + re-render probOverlay (filtre)
+                   pour que filtre min/max suive l'espèce active */
+                if (typeof setActiveDataSpecies === 'function'
+                    && dataCtxBySpecies[sp]) {
+                    setActiveDataSpecies(sp);
+                    if (typeof renderDebounced === 'function') {
+                        renderDebounced();
+                    }
+                }
+                /* probOverlay garde son opacité par sliderProb, pas géré ici */
+
+                // Hotspot FeatureGroups : iter all layers, hide others
+                if (map) {
+                    map.eachLayer(function(l){
+                        if (l instanceof L.FeatureGroup && l.options && l.options.name
+                            && l.options.name.indexOf("Hotspots") >= 0) {
+                            // Détermine espèce du group via marqueurs enfants
+                            var ownerSp = null;
+                            l.eachLayer(function(child){
+                                if (child.options && child.options.className) {
+                                    var m = child.options.className.match(/cartom-species-(\w+)/);
+                                    if (m) { ownerSp = m[1]; }
+                                }
+                            });
+                            if (ownerSp && ownerSp !== sp) {
+                                map.removeLayer(l);
+                            }
+                        }
+                    });
+                    // Réajoute le group de l'espèce active
+                    var hg = window["_cartom_hotspot_groups_"+sp];
+                    if (hg && !map.hasLayer(hg)) hg.addTo(map);
+                }
+
+                // Update legend titlebar text
+                var legendTitle = document.querySelector('#cartom-legend .cartom-titlebar span:first-child');
+                if (legendTitle && speciesEmojis[sp]) {
+                    var common = sp === 'esculenta' ? 'Morilles'
+                                : sp === 'edulis' ? 'Cèpes' : sp;
+                    legendTitle.textContent = speciesEmojis[sp] + ' Probabilité ' + common;
+                }
+            }
+
+            // Bind radios
+            document.querySelectorAll('input[name="cartom-species-radio"]').forEach(function(r){
+                r.addEventListener('change', function(e){
+                    if (e.target.checked) applySpeciesSelection(e.target.value);
+                });
+            });
+
+            // Slider opacité bind : repropage à l'overlay actif
+            var opSlider = document.getElementById('cartom_opacity_slider');
+            if (opSlider) {
+                opSlider.addEventListener('input', function(){
+                    applySpeciesSelection(currentSpecies);
+                });
+            }
+
+            // Init : applique sélection initiale après que les overlays soient ajoutés
+            setTimeout(function(){ applySpeciesSelection(primarySpecies); }, 100);
         });
         </script>
         """
@@ -1344,6 +1610,40 @@ class MorilleVisualizer:
             list(_CLASS_COLORS[: len(config.PROBABILITY_LABELS)]),
         )
         cmap_stops_json = json.dumps([[pos, col] for pos, col in _CMAP_STOPS])
+
+        # ── v2.6.0 species selector ──
+        species_emojis: dict[str, str] = {}
+        species_radios_parts: list[str] = []
+        for sp_idx, sp_name in enumerate(self.species_list):
+            sp_p = config.SPECIES_PARAMS.get(
+                sp_name, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+            )
+            emoji = sp_p.get("emoji", "🍄")
+            common = sp_p.get("common_name", sp_name)
+            species_emojis[sp_name] = emoji
+            checked = "checked" if sp_idx == 0 else ""
+            species_radios_parts.append(
+                f'<label><input type="radio" name="cartom-species-radio" '
+                f'value="{sp_name}" {checked}> {emoji} {common}</label>'
+            )
+        species_radios = "\n".join(species_radios_parts)
+        species_list_json = json.dumps(self.species_list)
+        species_emojis_json = json.dumps(species_emojis)
+        primary_species_json = json.dumps(self.primary_species)
+
+        # ── Data PNG IMG tags supplémentaires (1 par espèce non-primary) ──
+        # Le primary species réutilise le tag #cartom-data-img existant.
+        extra_imgs_parts: list[str] = []
+        for sp_name in self.species_list:
+            if sp_name == self.primary_species:
+                continue
+            sp_uri = data_uris_by_species.get(sp_name, "")
+            if sp_uri:
+                extra_imgs_parts.append(
+                    f'<img id="cartom-data-img-{sp_name}" '
+                    f'src="{sp_uri}" style="display:none;">'
+                )
+        species_data_imgs = "\n        ".join(extra_imgs_parts)
 
         js_final = (
             js_block.replace("%DATA_URI%", data_uri)
@@ -1363,6 +1663,11 @@ class MorilleVisualizer:
             .replace("%CELL_SIZE%", str(config.CELL_SIZE))
             .replace("%CMAP_STOPS_JSON%", cmap_stops_json)
             .replace("%N_HOTSPOTS%", str(n_hotspots))
+            .replace("%SPECIES_RADIOS%", species_radios)
+            .replace("%SPECIES_LIST_JSON%", species_list_json)
+            .replace("%SPECIES_EMOJIS_JSON%", species_emojis_json)
+            .replace("%PRIMARY_SPECIES_JSON%", primary_species_json)
+            .replace("%SPECIES_DATA_IMGS%", species_data_imgs)
         )
 
         folium_map.get_root().html.add_child(  # type: ignore[attr-defined]
@@ -1530,58 +1835,77 @@ class MorilleVisualizer:
     # Hotspots
     # ──────────────────────────────────────────────────────
     def _add_hotspot_markers(self, folium_map: folium.Map) -> None:
-        if not self.hotspots:
-            self._hotspot_count_on_map = 0
-            return
+        """v2.6.0 : crée 1 FeatureGroup par espèce. La 1ère est visible
+        par défaut, les autres masquées (toggle JS bascule entre elles)."""
+        self._hotspot_count_on_map = 0
+        self._hotspot_groups: dict[str, folium.FeatureGroup] = {}
 
-        hg = folium.FeatureGroup(name="🎯 Hotspots à prospecter")
-        n_total = min(len(self.hotspots), self.max_hotspot_markers)
-
-        for rank, h in enumerate(self.hotspots[:n_total]):
-            lon, lat = self._l93_to_wgs84(h["x_l93"], h["y_l93"])
-            ms: float = float(h.get("mean_score", 0.0))
-
-            color = (
-                "darkgreen" if ms >= 0.75
-                else ("green" if ms >= 0.60 else "orange")
+        for sp_idx, species in enumerate(self.species_list):
+            sp_hotspots = self.hotspots_by_species.get(species, [])
+            sp_params = config.SPECIES_PARAMS.get(
+                species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
             )
-            icon_name = (
-                "star" if ms >= 0.75
-                else ("ok-sign" if ms >= 0.60 else "question-sign")
+            sp_emoji = sp_params.get("emoji", "🍄")
+            sp_common = sp_params.get("common_name", species)
+
+            show_default = (sp_idx == 0)
+            hg = folium.FeatureGroup(
+                name=f"🎯 Hotspots {sp_common}",
+                show=show_default,
             )
 
-            popup_lines: list[str] = [
-                f"<b>Hotspot #{h.get('id', '?')}</b><br>",
-                f"Score moyen : <b>{ms:.3f}</b><br>",
-                f"Surface : {h.get('size_m2', 0):.0f} m²<br>",
-            ]
-            if h.get("altitude") is not None:
-                popup_lines.append(f"Altitude : {h['altitude']:.0f} m<br>")
-            if h.get("mean_slope") is not None:
-                popup_lines.append(
-                    f"Pente moy. : {h['mean_slope']:.1f}°<br>",
+            if not sp_hotspots:
+                hg.add_to(folium_map)
+                self._hotspot_groups[species] = hg
+                continue
+
+            n_total = min(len(sp_hotspots), self.max_hotspot_markers)
+            for rank, h in enumerate(sp_hotspots[:n_total]):
+                lon, lat = self._l93_to_wgs84(h["x_l93"], h["y_l93"])
+                ms: float = float(h.get("mean_score", 0.0))
+
+                color = (
+                    "darkgreen" if ms >= 0.75
+                    else ("green" if ms >= 0.60 else "orange")
                 )
-            if h.get("dominant_tree"):
-                popup_lines.append(
-                    f"Essence dom. : {h['dominant_tree']}<br>",
+                icon_name = (
+                    "star" if ms >= 0.75
+                    else ("ok-sign" if ms >= 0.60 else "question-sign")
                 )
-            if h.get("geology"):
-                popup_lines.append(f"Géologie : {h['geology']}<br>")
 
-            marker = folium.Marker(
-                location=[lat, lon],
-                popup=folium.Popup("".join(popup_lines), max_width=300),
-                tooltip=f"🍄 Score : {ms:.2f}",
-                icon=folium.Icon(color=color, icon=icon_name),
-            )
-            marker.options["className"] = (
-                f"cartom-hotspot cartom-rank-{rank}"
-            )
-            marker.add_to(hg)
+                popup_lines: list[str] = [
+                    f"<b>{sp_emoji} {sp_common} — Hotspot #{h.get('id', '?')}</b><br>",
+                    f"Score moyen : <b>{ms:.3f}</b><br>",
+                    f"Surface : {h.get('size_m2', 0):.0f} m²<br>",
+                ]
+                if h.get("altitude") is not None:
+                    popup_lines.append(f"Altitude : {h['altitude']:.0f} m<br>")
+                if h.get("mean_slope") is not None:
+                    popup_lines.append(
+                        f"Pente moy. : {h['mean_slope']:.1f}°<br>",
+                    )
+                if h.get("dominant_tree"):
+                    popup_lines.append(
+                        f"Essence dom. : {h['dominant_tree']}<br>",
+                    )
+                if h.get("geology"):
+                    popup_lines.append(f"Géologie : {h['geology']}<br>")
 
-        hg.add_to(folium_map)
-        self._hotspot_count_on_map = n_total
-        logger.info("✅ Hotspots affichés : %d", n_total)
+                marker = folium.Marker(
+                    location=[lat, lon],
+                    popup=folium.Popup("".join(popup_lines), max_width=300),
+                    tooltip=f"{sp_emoji} Score : {ms:.2f}",
+                    icon=folium.Icon(color=color, icon=icon_name),
+                )
+                marker.options["className"] = (
+                    f"cartom-hotspot cartom-rank-{rank} cartom-species-{species}"
+                )
+                marker.add_to(hg)
+
+            hg.add_to(folium_map)
+            self._hotspot_groups[species] = hg
+            self._hotspot_count_on_map += n_total
+            logger.info("✅ Hotspots [%s] : %d markers", species, n_total)
 
     # ──────────────────────────────────────────────────────
     # Landmarks
@@ -1654,6 +1978,7 @@ class MorilleVisualizer:
             tuple[str, str, bool, float, int, str]
         ] = []
         data_uri: str = ""
+        data_uris_by_species: dict[str, str] = {}
 
         with ThreadPoolExecutor(
             max_workers=max(1, n_workers),
@@ -1667,8 +1992,11 @@ class MorilleVisualizer:
                 fut = pool.submit(render_fn)
                 future_to_idx[fut] = (idx, name, show, opa, zi, msg)
 
-            # Soumettre le data PNG et le slope PNG
-            data_future = pool.submit(self._build_data_png_bytes)
+            # Soumettre 1 data PNG par espèce (v2.6.0) + slope PNG global
+            data_futures: dict[str, Any] = {
+                sp: pool.submit(self._build_data_png_bytes, sp)
+                for sp in self.species_list
+            }
             slope_future = pool.submit(self._build_slope_png_bytes)
 
             # Collecter les overlays (ordre de complétion)
@@ -1685,9 +2013,11 @@ class MorilleVisualizer:
             for idx in sorted(indexed_results):
                 overlay_results.append(indexed_results[idx])
 
-            # Data PNG + Slope PNG
-            data_png_bytes = data_future.result()
-            data_uri = self._png_to_data_uri(data_png_bytes)
+            # Data PNGs par espèce + Slope PNG
+            for sp, fut in data_futures.items():
+                data_uris_by_species[sp] = self._png_to_data_uri(fut.result())
+            data_uri = data_uris_by_species[self.primary_species]
+            data_png_bytes = b""  # legacy var unused
             slope_uri = self._png_to_data_uri(slope_future.result())
 
         logger.info(
@@ -1733,7 +2063,8 @@ class MorilleVisualizer:
         folium.LayerControl(collapsed=False, position="topright").add_to(m)
 
         # ── Contrôles interactifs (JS + data PNG) ──
-        self._add_interactive_controls(m, data_uri, slope_uri)
+        self._add_interactive_controls(m, data_uri, slope_uri,
+                                        data_uris_by_species=data_uris_by_species)
 
         m.fit_bounds(self._bounds)
 
@@ -1757,12 +2088,21 @@ class MorilleVisualizer:
     # ══════════════════════════════════════════════════════
     def export_geotiff(
         self,
-        output: str | Path = "output/morilles_probability.tif",
+        output: str | Path = "output/esculenta_probability.tif",
+        *,
+        species: str | None = None,
     ) -> Path:
+        """Export GeoTIFF de la probabilité.
+
+        v2.6.0 : species kwarg sélectionne le raster à exporter.
+        Si None, utilise l'espèce primaire (1ère du dict models).
+        """
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
 
-        score: np.ndarray = self._final_score.copy()
+        sp = species or self.primary_species
+        score_src = self._final_score_by_species.get(sp, self._final_score)
+        score: np.ndarray = score_src.copy()
         nodata_mask: np.ndarray = np.asarray(~np.isfinite(score))
         score[nodata_mask] = _NODATA
 
@@ -1771,6 +2111,11 @@ class MorilleVisualizer:
             self._xmax_l93, self._ymax_l93,
             self.grid.nx, self.grid.ny,
         )
+
+        sp_params = config.SPECIES_PARAMS.get(
+            sp, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+        )
+        sp_common = sp_params.get("common_name", sp)
 
         try:
             with rasterio.open(
@@ -1788,12 +2133,13 @@ class MorilleVisualizer:
             ) as dst:
                 dst.write(score.astype(np.float32), 1)
                 dst.update_tags(
-                    DESCRIPTION="Cartomorilles — probabilité morilles",
+                    DESCRIPTION=f"Cartomorilles — probabilité {sp_common} ({sp})",
+                    SPECIES=sp,
                     CELL_SIZE=str(config.CELL_SIZE),
                     CRS="EPSG:2154",
                     NODATA=str(_NODATA),
                 )
-            logger.info("✅ GeoTIFF : %s", output)
+            logger.info("✅ GeoTIFF [%s] : %s", sp, output)
         except OSError:
             logger.exception("Impossible d'écrire le GeoTIFF")
             raise
@@ -1805,17 +2151,23 @@ class MorilleVisualizer:
     # ══════════════════════════════════════════════════════
     def export_gpkg_grid(
         self,
-        output: str | Path = "output/morilles_grid.gpkg",
+        output: str | Path = "output/esculenta_grid.gpkg",
         threshold: float = 0.15,
+        *,
+        species: str | None = None,
     ) -> Path:
-        """Export GeoPackage vectorisé (numpy batch)."""
+        """Export GeoPackage vectorisé (numpy batch).
+
+        v2.6.0 : species kwarg sélectionne le raster source.
+        """
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
-        logger.info("Export GeoPackage (seuil=%.2f)…", threshold)
+        sp = species or self.primary_species
+        logger.info("Export GeoPackage [%s] (seuil=%.2f)…", sp, threshold)
 
-        score: np.ndarray = self._final_score
-        prob_classes: np.ndarray = self._prob_classes
-        elim_mask: np.ndarray = self._elim_mask
+        score: np.ndarray = self._final_score_by_species.get(sp, self._final_score)
+        prob_classes: np.ndarray = self._prob_classes_by_species.get(sp, self._prob_classes)
+        elim_mask: np.ndarray = self._elim_mask_by_species.get(sp, self._elim_mask)
         half = config.CELL_SIZE / 2.0
         labels = list(config.PROBABILITY_LABELS)
 
