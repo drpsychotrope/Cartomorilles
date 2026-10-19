@@ -804,12 +804,15 @@ def display_species_summary(
     *,
     threshold: float,
     n_show: int,
+    inside: np.ndarray | None = None,
 ) -> None:
     """Top hotspots d'une espèce puis sa concordance terrain.
 
     Le rang (n°1, n°2…) est celui du CSV et le numéro du marqueur sur la
     carte, comme dans son popup « hotspot n°1 » (hotspots triés par score
-    décroissant)."""
+    décroissant). `inside` (masque aligné sur `hotspots`) écarte, comme la
+    carte, les hotspots hors de la zone étudiée (D39) ; les rangs gardent
+    alors leurs trous."""
     logger.info("")
     if not hotspots:
         logger.info(
@@ -817,13 +820,22 @@ def display_species_summary(
             _species_label(species), _fr_num(threshold, 2),
         )
     else:
-        n = min(max(n_show, 0), len(hotspots))
-        logger.info(
-            "%s — %s hotspots (score ≥ %s)%s",
-            _species_label(species), _fr_num(len(hotspots)),
-            _fr_num(threshold, 2), f", top {n} :" if n else "",
+        ranked = [
+            (rank, h) for rank, h in enumerate(hotspots, 1)
+            if inside is None or bool(inside[rank - 1])
+        ]
+        n_out = len(hotspots) - len(ranked)
+        out = (
+            f" ; {_fr_num(n_out)} hors zone étudiée écarté"
+            f"{'s' if n_out > 1 else ''}" if n_out else ""
         )
-        for rank, h in enumerate(hotspots[:n], 1):
+        n = min(max(n_show, 0), len(ranked))
+        logger.info(
+            "%s — %s hotspots (score ≥ %s%s)%s",
+            _species_label(species), _fr_num(len(hotspots)),
+            _fr_num(threshold, 2), out, f", top {n} :" if n else "",
+        )
+        for rank, h in ranked[:n]:
             pt = hotspot_to_export_dict(h)
             logger.info("   n°%-2d %s", rank, _hotspot_facts(h))
             logger.info(
@@ -1867,6 +1879,7 @@ def main(args: argparse.Namespace) -> int:
         display_species_summary(
             sp, hotspots_by_species[sp], concordance_by_species[sp],
             threshold=args.hotspot_threshold, n_show=args.console_hotspots,
+            inside=viz.inside_study_area(hotspots_by_species[sp]),
         )
 
     display_outputs(output_dir, [*produced, log_path])
