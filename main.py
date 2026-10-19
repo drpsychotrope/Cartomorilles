@@ -766,8 +766,9 @@ def display_species_summary(
 ) -> None:
     """Top hotspots d'une espèce puis sa concordance terrain.
 
-    Le rang (#1, #2…) est celui du CSV et le numéro du marqueur sur la
-    carte (hotspots triés par score décroissant)."""
+    Le rang (n°1, n°2…) est celui du CSV et le numéro du marqueur sur la
+    carte, comme dans son popup « hotspot n°1 » (hotspots triés par score
+    décroissant)."""
     logger.info("")
     if not hotspots:
         logger.info(
@@ -783,9 +784,9 @@ def display_species_summary(
         )
         for rank, h in enumerate(hotspots[:n], 1):
             pt = hotspot_to_export_dict(h)
-            logger.info("   #%-2d %s", rank, _hotspot_facts(h))
+            logger.info("   n°%-2d %s", rank, _hotspot_facts(h))
             logger.info(
-                "       %.5f, %.5f · %s",
+                "        %.5f, %.5f · %s",
                 pt["lat"], pt["lon"], pt["google_maps"],
             )
 

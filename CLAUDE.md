@@ -45,7 +45,7 @@ Key flags: `--cell-size` (default auto → 50 m), `--species` (default `esculent
 
 Outputs go to `output/` (`--output-dir`): `cartomorilles.html` (one map, species toggle), `{species}_probability.tif` (+ `morilles_probability.tif`, a copy of the esculenta one), `{species}_hotspots.csv`, `rapport_{species}.json`, `cartomorilles.log`, and optionally `{species}_grid.gpkg` (`--export-vector`). The end-of-run summary lists only the files written by that run.
 
-Console (D38): by default only the `[1/4]…[4/4]` step lines, warnings and the final summary (weather factor, top hotspots and field-check concordance per species, files written, `file://` link to the map). Everything else — module INFO/DEBUG, weights table, per-criterion stats, per-checkpoint validation, weather report — goes to `cartomorilles.log` (or to the screen with `--verbose`). A message the user must see in a normal run is logged by `main.py` (logger `cartomorilles`) or is a WARNING; module progress/stat lines stay at INFO/DEBUG.
+Console (D41): by default only the `[1/4]…[4/4]` step lines, warnings and the final summary (weather factor, top hotspots and field-check concordance per species, files written, `file://` link to the map). Everything else — module INFO/DEBUG, weights table, per-criterion stats, per-checkpoint validation, weather report — goes to `cartomorilles.log` (or to the screen with `--verbose`). A message the user must see in a normal run is logged by `main.py` (logger `cartomorilles`) or is a WARNING; module progress/stat lines stay at INFO/DEBUG.
 
 ## Pipeline Architecture
 
@@ -105,7 +105,7 @@ These decisions are documented in `decisions.md` — do not reverse them without
 | **D28** | Landcover `_resample_to_grid()` uses inverse L93→WGS84 mapping with Mercator Y correction (not naive ndizoom) |
 | **D29** | Folium overlays are reprojected to **EPSG:3857** (Web Mercator), not EPSG:4326 — Leaflet stretches ImageOverlay linearly in Mercator space, so pixels must be evenly spaced in Mercator Y |
 | **D37** | Folium map = one JS-rendered probability layer (per-species score PNG + shared terrain PNG), one collapsible sidebar (species, class legend-as-filter, opacity, top-N numbered hotspots from JSON, layers, weather) — no floating panels, no LayerControl; overlays at grid resolution; diagnostic overlays only with `--debug-layers` |
-| **D38** | Concise console: the console handler shows only the `cartomorilles` logger (main.py) at INFO+ and WARNING+ from every module (`_ConsoleFilter`); module INFO/DEBUG go to `cartomorilles.log`, `--verbose` shows everything. Hotspots are referred to by rank (#1 = CSV rank = map marker number), never by cluster id |
+| **D41** | Concise console: the console handler shows only the `cartomorilles` logger (main.py) at INFO+ and WARNING+ from every module (`_ConsoleFilter`); module INFO/DEBUG go to `cartomorilles.log`, `--verbose` shows everything. Hotspots are referred to by rank (n°1 = CSV rank = map marker number, as in the marker popup), never by cluster id |
 
 ## Session / Branch Workflow
 

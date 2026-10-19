@@ -86,7 +86,7 @@ Garde-fous : avertissement à 50 M cellules (TWI > 5 min), limite dure à 200 M 
 Par défaut, la console n'affiche que les étapes `[1/4]`…`[4/4]`, les avertissements et un résumé :
 
 - la météo du jour et le facteur appliqué aux scores (×0,4 à ×1,0), ou son indisponibilité ;
-- pour chaque espèce : les meilleurs hotspots (rang = numéro du marqueur sur la carte et du CSV, surface en ha, coordonnées, lien Google Maps) et la concordance avec les points de contrôle terrain ;
+- pour chaque espèce : les meilleurs hotspots (n°1, n°2… = rang du CSV et numéro du marqueur sur la carte, surface en ha, coordonnées, lien Google Maps) et la concordance avec les points de contrôle terrain ;
 - les fichiers écrits par ce run et le lien `file://` vers la carte.
 
 Le détail (tableau des poids, statistiques par critère, validation point par point, rapport météo 7 jours…) va dans `cartomorilles.log`, ou à l'écran avec `--verbose`.
