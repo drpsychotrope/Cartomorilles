@@ -922,15 +922,22 @@ _BASEMAPS_DICT: dict[str, dict[str, Any]] = {
         "name": "IGN Plan v2",
         "max_zoom": 18,
     },
-    "IGN Scan25": {
+    # Remplace « IGN Scan25 » (GEOGRAPHICALGRIDSYSTEMS.MAPS : HTTP 400 sans
+    # clé d'API). Ombrage BD ALTI 25 m sans clé : noir semi-transparent, donc
+    # relief gris sur le fond neutre de Leaflet. Style imposé par le service.
+    "IGN Estompage": {
         "tiles": (
-            f"{_GEOPF_BASE}"
-            "&LAYER=GEOGRAPHICALGRIDSYSTEMS.MAPS"
-            "&FORMAT=image/jpeg"
+            "https://data.geopf.fr/wmts?"
+            "SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0"
+            "&STYLE=estompage_grayscale&TILEMATRIXSET=PM"
+            "&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}"
+            "&LAYER=ELEVATION.ELEVATIONGRIDCOVERAGE.SHADOW"
+            "&FORMAT=image/png"
         ),
         "attr": "© IGN - Géoplateforme",
-        "name": "IGN Scan25 (topo)",
-        "max_zoom": 16,
+        "name": "IGN Estompage (relief)",
+        "max_zoom": 18,
+        "max_native_zoom": 15,   # pas de tuiles au-delà : agrandies
     },
     "IGN Photographies aériennes": {
         "tiles": (

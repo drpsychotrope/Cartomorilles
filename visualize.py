@@ -1717,6 +1717,9 @@ class MorilleVisualizer:
                     attr=cfg.get("attr", ""),
                     name=label,
                     max_zoom=cfg.get("max_zoom", 18),
+                    # Zoom maximal des tuiles servies ; au-delà, Leaflet
+                    # agrandit au lieu d'afficher des cases vides
+                    max_native_zoom=cfg.get("max_native_zoom"),
                     show=is_default,
                     control=False,
                 )
