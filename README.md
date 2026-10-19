@@ -6,7 +6,7 @@ Il combine analyse de terrain (MNT), essences forestières (BD Forêt v2), géol
 
 - **CRS** : EPSG:2154 (Lambert-93)
 - **Emprise** : Isère département élargi — 107,4 × 131,2 km (~14 091 km²)
-- **Maille par défaut** : 20 m → ~35,2 M cellules (auto-scale selon l'emprise)
+- **Maille** : automatique selon l'emprise — 50 m pour le département (~5,6 M cellules) ; `--cell-size` pour la forcer
 - **Python** : 3.12+
 - **Version** : 2.5.4 (multi-espèces esculenta + edulis)
 
@@ -36,10 +36,13 @@ Hydrographie et zones urbaines sont récupérées via WFS IGN à défaut de fich
 ## Démarrage rapide
 
 ```bash
-# Run par défaut (auto cell-size, les deux espèces, météo J+0)
+# Run par défaut (maille auto, les deux espèces, météo J+0)
 python main.py
 
-# Test rapide dev (maille 25 m, logs DEBUG)
+# Idem, puis ouvrir la carte dans le navigateur
+python main.py --open
+
+# Test rapide dev (maille 25 m, tout le détail DEBUG à l'écran)
 python main.py --cell-size 25 --verbose
 
 # Dry-run : valider les données sans calculer
@@ -59,21 +62,34 @@ python main.py --discover-wfs
 
 | Flag | Défaut | Rôle |
 |---|---|---|
-| `--cell-size` | auto | Taille de cellule (m) |
+| `--cell-size` | auto (50 m) | Taille de cellule (m) |
 | `--species` | `esculenta edulis` | Espèces à modéliser |
 | `--hotspot-threshold` | `0.60` | Seuil de score des hotspots |
 | `--smoothing-sigma` | `0.5` | Sigma du lissage gaussien |
 | `--urban-buffer` | `10` | Buffer (m) autour de l'urbain |
 | `--no-urban` / `--no-landcover` / `--no-weather` | off | Désactiver un masque/modulation |
 | `--landcover` | off | Forcer landcover sur grande emprise |
-| `--max-hotspots` | `8` | Hotspots affichés en console |
 | `--seed` | `42` | Reproductibilité |
 | `--output-dir` | `output/` | Répertoire de sortie |
+| `--open` | off | Ouvrir la carte dans le navigateur en fin de run |
+| `--console-hotspots` | `5` | Hotspots listés par espèce dans le résumé console (ancien nom : `--max-hotspots`) ; n'affecte ni la carte ni le CSV |
+| `--map-hotspots` | `20` | Hotspots numérotés affichés à l'ouverture de la carte (réglable ensuite dans le panneau) |
 | `--export-vector` | off | Export GPKG (volumineux) |
 | `--debug-layers` | off | Ajouter à la carte les couches de diagnostic (zones exclues, TWI brut) |
+| `-v` / `--verbose` | off | Tout le détail (DEBUG) à l'écran |
 | `--force` | off | Ignorer les avertissements (poids, taille grille) |
 
 Garde-fous : avertissement à 50 M cellules (TWI > 5 min), limite dure à 200 M sans `--force`.
+
+### Sortie console
+
+Par défaut, la console n'affiche que les étapes `[1/4]`…`[4/4]`, les avertissements et un résumé :
+
+- la météo du jour et le facteur appliqué aux scores (×0,4 à ×1,0), ou son indisponibilité ;
+- pour chaque espèce : les meilleurs hotspots (rang = numéro du marqueur sur la carte et du CSV, surface en ha, coordonnées, lien Google Maps) et la concordance avec les points de contrôle terrain ;
+- les fichiers écrits par ce run et le lien `file://` vers la carte.
+
+Le détail (tableau des poids, statistiques par critère, validation point par point, rapport météo 7 jours…) va dans `cartomorilles.log`, ou à l'écran avec `--verbose`.
 
 ---
 
@@ -121,11 +137,11 @@ Modules d'appui : `weather.py` (modulation météo J+0), `landcover_detector.py`
 | slope | 0.05 | | geology_contact | 0.01 |
 
 Post-traitement :
-1. **Masques éliminatoires** (score → 0) : granite/basalte/grès, altitude extrême, cœur urbain, pente > 45°, espèces infranchissables, engorgement (TWI).
+1. **Masques éliminatoires** (score → 0), par espèce : urbain et proximité urbaine (< 15 m), plans d'eau, NoData du MNT, géologie éliminatoire (morille : granite, gneiss, siliceux ; cèpe : aucune), pente > 45°, altitude hors plage (morille 100–1 400 m, cèpe 200–2 200 m), engorgement (TWI).
 2. **Pénalité de monotonie** (terrain uniforme).
-3. **Pénalité calc-dry** (chênaies/buis xérothermophiles).
-4. **Lissage gaussien spatial** (sigma configurable).
-5. **Modulation météo** multiplicative (J+0, sauf `--no-weather`).
+3. **Pénalité calc-dry** (chênaies/buis xérothermophiles, morille seulement).
+4. **Lissage gaussien spatial** (sigma configurable, défaut 0,5).
+5. **Modulation météo** multiplicative : scores × (0,4 + 0,6 × score météo du jour Meteoblue), sauf `--no-weather` ou API indisponible — signalée dans le résumé console et dans `rapport_{species}.json`.
 6. **Classification en 6 classes** : Nul / Très faible / Faible / Moyen / Bon / Excellent (seuils 0,15 · 0,30 · 0,45 · 0,60 · 0,75).
 
 La sortie est validée contre des points de contrôle terrain par espèce (taux de concordance reporté en fin de run).
@@ -144,4 +160,4 @@ Les choix de conception (algorithme TWI, champ géologie, planchers de score, re
 
 ---
 
-🍄 *Bonne chasse aux morilles !*
+🍄 *Bonne prospection !*

@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**CARTOMORILLES** is a probabilistic spatial multicriteria model for mapping favorable zones for morel mushroom (*Morchella*) foraging in Isère (France). It combines DEM terrain analysis, forest species data (BD Forêt v2), geology (BDCharm-50), hydrology, and OSM-derived landcover into a weighted score grid at 10–100m resolution.
+**CARTOMORILLES** is a probabilistic spatial multicriteria model for mapping favorable zones for mushroom foraging in Isère (France) — two species, modelled in one run: morel (*Morchella esculenta*, `esculenta`) and porcini (*Boletus edulis*, `edulis`), with per-species parameters in `config.SPECIES_PARAMS`. It combines DEM terrain analysis, forest species data (BD Forêt v2), geology (BDCharm-50), hydrology, OSM-derived landcover and the day's weather (Meteoblue) into a weighted score grid.
 
 - **CRS**: EPSG:2154 (Lambert-93), covering Isère department bbox (~14 091 km², 107.4×131.2 km)
-- **Default grid**: 20m cells → ~35.2M cells
+- **Grid**: cell size chosen automatically from the bbox area (`config.CELL_SIZE_AUTO_THRESHOLDS`) → **50 m** for the department (~5.6M cells); `--cell-size` overrides it (`config.CELL_SIZE` = 20 m is only the config default, replaced at runtime)
 - **DEM**: 6-tile Copernicus merge (N44-45 × E004-006)
 - **Python**: 3.12+
 
@@ -16,10 +16,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 pip install -r requirements.txt
 
-# Default run (auto cell-size, default data paths)
+# Default run (both species, auto cell-size, default data paths, weather J+0)
 python main.py
 
-# Quick development test (25m cells, verbose)
+# Same, then open the map in the browser
+python main.py --open
+
+# One species only
+python main.py --species esculenta
+
+# Quick development test (25m cells, full DEBUG output on screen)
 python main.py --cell-size 25 --verbose
 
 # Dry-run: validate data without computing
@@ -35,23 +41,27 @@ python main.py --cell-size 10 --hotspot-threshold 0.65 --output-dir ./results --
 python main.py --discover-wfs
 ```
 
-Key flags: `--cell-size`, `--hotspot-threshold` (default 0.60), `--smoothing-sigma` (default 1.0), `--urban-buffer`, `--no-urban`, `--no-landcover`, `--landcover`, `--max-hotspots` (default 8), `--seed` (default 42), `--force` (bypass grid size/weight warnings), `--debug-layers` (diagnostic overlays in the HTML map).
+Key flags: `--cell-size` (default auto → 50 m), `--species` (default `esculenta edulis`), `--hotspot-threshold` (default 0.60), `--smoothing-sigma` (default 0.5), `--urban-buffer`, `--no-urban`, `--no-landcover`, `--landcover`, `--no-weather`, `--seed` (default 42), `--force` (bypass grid size/weight warnings), `--open` (open the map at the end), `--console-hotspots` (hotspots listed per species in the end-of-run summary, default 5; console only — `--max-hotspots` is its old name), `--map-hotspots` (numbered hotspots shown when the map opens, default 20), `--debug-layers` (diagnostic overlays in the HTML map), `-v/--verbose` (full DEBUG output on screen).
 
-Outputs go to `output/`: `carte_morilles.html`, `morilles_probability.tif`, `hotspots.csv`, `cartomorilles.log`, and optionally `morilles_grid.gpkg`.
+Outputs go to `output/` (`--output-dir`): `cartomorilles.html` (one map, species toggle), `{species}_probability.tif` (+ `morilles_probability.tif`, a copy of the esculenta one), `{species}_hotspots.csv`, `rapport_{species}.json`, `cartomorilles.log`, and optionally `{species}_grid.gpkg` (`--export-vector`). The end-of-run summary lists only the files written by that run.
+
+Console (D38): by default only the `[1/4]…[4/4]` step lines, warnings and the final summary (weather factor, top hotspots and field-check concordance per species, files written, `file://` link to the map). Everything else — module INFO/DEBUG, weights table, per-criterion stats, per-checkpoint validation, weather report — goes to `cartomorilles.log` (or to the screen with `--verbose`). A message the user must see in a normal run is logged by `main.py` (logger `cartomorilles`) or is a WARNING; module progress/stat lines stay at INFO/DEBUG.
 
 ## Pipeline Architecture
 
 ```
 data_loader.py          → ingest DEM, shapefiles, WFS/OSM data
     ↓
-grid_builder.py         → build spatial grid, compute 11 criteria scores
+grid_builder.py         → build spatial grid, compute 14 criteria scores
     ↓
 species_enricher.py     → enrich tree species scores (BD Forêt v2 + IFN altitude zones)
     ↓
-scoring.py              → weighted aggregation, eliminatory masks, hotspot detection
+scoring.py              → per species: weighted aggregation, eliminatory masks, hotspot detection
     ↓
-visualize.py            → Folium HTML map, GeoTIFF, GeoPackage, hotspot CSV
+visualize.py            → Folium HTML map (all species), GeoTIFF, GeoPackage
 ```
+
+`main.py` runs the four steps, recomputes the 6 species-aware criteria (`grid.recompute_species_scores`) and scores each species in turn, applies the weather factor, writes the per-species CSV/JSON reports and prints the summary.
 
 `_accel.py` provides transparent GPU/CPU dispatch and parallel rasterization — callers never import cupy directly.
 
@@ -59,16 +69,17 @@ visualize.py            → Folium HTML map, GeoTIFF, GeoPackage, hotspot CSV
 
 ## Key Configuration (`config.py`)
 
-All thresholds, scoring weights, tree species scores, geology scores, and spatial bounds live in `config.py`. The **`WEIGHTS`** dict (11 criteria, sum ≈ 1.0) is the primary tuning surface. Changing it invalidates cached rasters only if the lookup hash changes (MD5-keyed cache — D23).
+All thresholds, scoring weights, tree species scores, geology scores, and spatial bounds live in `config.py`. The **`WEIGHTS`** dict (14 criteria, sum ≈ 1.0) is the primary tuning surface; `SPECIES_PARAMS` holds the per-species tree/geology scores, altitude/slope/aspect/TWI optima and eliminatory limits. Changing them invalidates cached rasters only if the lookup hash changes (MD5-keyed cache — D23).
 
 ## Scoring Model
 
-`scoring.py` aggregates 11 criteria via weighted sum, then applies:
-1. **Eliminatory masks** (7 boolean): granite/basalt/sandstone, altitude extremes, urban core, slope >45°, impassable species, waterlogged (TWI > threshold) → score = 0
+`scoring.py` aggregates 14 criteria via weighted sum, per species, then applies:
+1. **Eliminatory masks** (8 boolean) → score = 0: urban, water bodies, DEM NoData, eliminatory geology (esculenta: granite, gneiss, siliceous; edulis: none), slope > 45°, altitude outside the species range (esculenta 100–1400 m, edulis 200–2200 m), waterlogged (TWI > species threshold), urban proximity (< 15 m)
 2. **Monotony penalty** — uniform terrain discount
-3. **Calc-dry penalty**
-4. **Gaussian spatial smoothing** (sigma configurable)
-5. **6-class probability classification**: Nul / Très faible / Faible / Moyen / Bon / Excellent (thresholds: 0.15, 0.30, 0.45, 0.60, 0.75)
+3. **Calc-dry penalty** (esculenta only)
+4. **Gaussian spatial smoothing** (sigma configurable, default 0.5)
+5. **Weather factor** (`main.py`): scores × (0.4 + 0.6 × Meteoblue score for today), skipped with `--no-weather` or when the API is unavailable — reported in the console summary and in `rapport_{species}.json` (`config.weather_factor`)
+6. **6-class probability classification**: Nul / Très faible / Faible / Moyen / Bon / Excellent (thresholds: 0.15, 0.30, 0.45, 0.60, 0.75)
 
 ## Architectural Decisions to Respect
 
@@ -94,6 +105,7 @@ These decisions are documented in `decisions.md` — do not reverse them without
 | **D28** | Landcover `_resample_to_grid()` uses inverse L93→WGS84 mapping with Mercator Y correction (not naive ndizoom) |
 | **D29** | Folium overlays are reprojected to **EPSG:3857** (Web Mercator), not EPSG:4326 — Leaflet stretches ImageOverlay linearly in Mercator space, so pixels must be evenly spaced in Mercator Y |
 | **D37** | Folium map = one JS-rendered probability layer (per-species score PNG + shared terrain PNG), one collapsible sidebar (species, class legend-as-filter, opacity, top-N numbered hotspots from JSON, layers, weather) — no floating panels, no LayerControl; overlays at grid resolution; diagnostic overlays only with `--debug-layers` |
+| **D38** | Concise console: the console handler shows only the `cartomorilles` logger (main.py) at INFO+ and WARNING+ from every module (`_ConsoleFilter`); module INFO/DEBUG go to `cartomorilles.log`, `--verbose` shows everything. Hotspots are referred to by rank (#1 = CSV rank = map marker number), never by cluster id |
 
 ## Session / Branch Workflow
 

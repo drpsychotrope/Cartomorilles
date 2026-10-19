@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-🍄 CARTOMORILLES — Modèle de probabilité de présence de morilles
-   Zone : Isère (38) — emprise limitée par données disponibles
-   DEM Copernicus N45_E005 ∩ BD Forêt v2 ∩ Géologie BDCharm-50
+🍄 CARTOMORILLES — Cartes de probabilité de présence de champignons
+   Morille (Morchella esculenta) et cèpe (Boletus edulis) — Isère (38),
+   département élargi (107×131 km, Lambert-93).
 
-   Analyse multicritère spatialisée avec maillage configurable (défaut 10×10m).
-   Sources : IGN BD Forêt v2, BD Topo, BRGM BDCharm-50, MNT, OSM landcover.
-   Enrichissement essences : BD Forêt TFV + IFN 1997 régional × altitude.
+   Analyse multicritère spatialisée : 14 critères pondérés par espèce,
+   masques éliminatoires, lissage, modulation météo du jour (Meteoblue).
+   Maille automatique selon l'emprise : 50 m pour le département
+   (~5,6 M cellules) ; --cell-size pour la forcer.
+   Sources : MNT Copernicus, IGN BD Forêt v2, BRGM BDCharm-50, IFN 1997
+   (enrichissement essences), WFS IGN / OSM (hydrographie, urbain).
 
 Usage :
-    python main.py                              # Mode auto
-    python main.py --dem mnt.tif                # Avec MNT local
+    python main.py                              # Deux espèces, maille auto
+    python main.py --open                       # Idem + ouvre la carte
+    python main.py --species esculenta          # Morille seule
     python main.py --dry-run                    # Vérif données seulement
     python main.py --cell-size 25 --verbose     # Test rapide, logs détaillés
+
+Console : étapes [1/4]…[4/4] puis résumé — fichiers produits, lien vers
+la carte, top hotspots et concordance terrain de chaque espèce. Le détail
+complet va dans <output-dir>/cartomorilles.log (à l'écran avec --verbose).
 
 v2.4.0 — Extension emprise Isère 38 (74.5×98.8 km, ×18.4 vs v2.3)
          DEM Copernicus 30m, CELL_SIZE 10m, géologie geologie_38/
@@ -31,17 +39,23 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import logging
+import re
 import signal
 import sys
 import time
+import webbrowser
+from bisect import bisect_right
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
+import requests
 
 import config
 from config import (
@@ -53,6 +67,8 @@ from config import (
     CONFIG_VERSION,
     GEOLOGY_SCORES,
     N_SCORING_GRIDS,
+    PROBABILITY_LABELS,
+    PROBABILITY_THRESHOLDS,
     SCORE_THRESHOLD_HIGH,
     SCORE_THRESHOLD_MEDIUM,
     SLOPE_MAX,
@@ -68,7 +84,7 @@ from data_loader import DataLoader
 from grid_builder import GridBuilder
 from scoring import MorilleScoring
 from species_enricher import SpeciesEnricher
-from utils import TO_L93, TO_WGS84, compute_array_stats, hotspot_to_export_dict
+from utils import TO_L93, compute_array_stats, hotspot_to_export_dict
 from visualize import MorilleVisualizer
 from weather import WeatherChecker
 
@@ -98,6 +114,15 @@ _ZONE_LABEL = f"Isère 38 — {_ZONE_DX_KM:.0f}×{_ZONE_DY_KM:.0f} km"
 # ── Garde mémoire (cellules max sans --force) ─────────────────
 _MAX_CELLS = 200_000_000  # 200M — protège contre cell_size=5m accidentel
 _WARN_CELLS = 50_000_000  # 50M — avertit sur temps de calcul TWI D8
+
+# ── Météo : les scores des espèces sont multipliés par un facteur qui
+#    va de _WEATHER_FACTOR_MIN (jour très défavorable) à 1,0 (jour idéal),
+#    linéaire en score météo J+0 ─────────────────────────────────
+_WEATHER_FACTOR_MIN = 0.4
+
+# ── Résumé console / carte ────────────────────────────────────
+_CONSOLE_HOTSPOTS_DEFAULT = 5   # hotspots listés par espèce en fin de run
+_MAP_HOTSPOTS_DEFAULT = 20      # marqueurs numérotés à l'ouverture de la carte
 
 # Points de contrôle terrain — MORILLE (prospection réelle mars 2026)
 # v2.3.1 : châtaignier corrigé — plus éliminatoire
@@ -259,8 +284,48 @@ def _purge_cache() -> None:
 # ═══════════════════════════════════════════════════════════════
 
 
-def setup_logging(output_dir: Path, verbose: bool = False) -> None:
-    """Configure le logging : console (INFO ou DEBUG) + fichier (DEBUG)."""
+class _ConsoleFilter(logging.Filter):
+    """Console concise : les messages du pipeline (logger « cartomorilles »
+    de main.py) et les avertissements de tous les modules. Le détail des
+    modules (INFO/DEBUG) ne va que dans le fichier log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING or record.name == logger.name
+
+
+class _ConsoleFormatter(logging.Formatter):
+    """Message seul, sans horodatage ; ⚠️ / ❌ devant les avertissements
+    qui n'ont pas déjà leur pictogramme."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        body = text.lstrip()
+        if record.levelno < logging.WARNING or not body[:1].isalnum():
+            return text
+        mark = "❌" if record.levelno >= logging.ERROR else "⚠️ "
+        return f"{text[: len(text) - len(body)]}{mark} {body}"
+
+
+def _ensure_utf8_stdout() -> None:
+    """Sortie redirigée (fichier, pipe) sous Windows : cp1252 ne sait pas
+    écrire les pictogrammes de la console et de --help → UTF-8."""
+    stream = sys.stdout
+    if (
+        isinstance(stream, io.TextIOWrapper)
+        and stream.encoding.lower().replace("-", "") != "utf8"
+    ):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+def setup_logging(output_dir: Path, verbose: bool = False) -> Path:
+    """Configure le logging et retourne le chemin du fichier log.
+
+    Console : étapes et résumé seulement (_ConsoleFilter), ou tout le
+    détail DEBUG horodaté avec --verbose. Fichier : détail DEBUG complet.
+    """
     root = logging.getLogger("cartomorilles")
     root.setLevel(logging.DEBUG)
 
@@ -272,18 +337,84 @@ def setup_logging(output_dir: Path, verbose: bool = False) -> None:
         datefmt="%H:%M:%S",
     )
 
+    _ensure_utf8_stdout()
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
-    console_handler.setFormatter(fmt)
+    if verbose:
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(fmt)
+    else:
+        console_handler.setLevel(logging.INFO)
+        console_handler.addFilter(_ConsoleFilter())
+        console_handler.setFormatter(_ConsoleFormatter("%(message)s"))
     root.addHandler(console_handler)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(
-        output_dir / "cartomorilles.log", mode="w", encoding="utf-8",
-    )
+    log_path = output_dir / "cartomorilles.log"
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
+    return log_path
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FORMATAGE CONSOLE (mêmes conventions que la carte HTML)
+# ═══════════════════════════════════════════════════════════════
+
+
+def _fr_num(value: float, decimals: int = 0) -> str:
+    """Nombre à la française (espace des milliers, virgule décimale),
+    arrondi au demi supérieur comme le toLocaleString('fr-FR') de la carte."""
+    q = Decimal(str(value)).quantize(
+        Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP,
+    )
+    return f"{q:,.{decimals}f}".replace(",", " ").replace(".", ",")
+
+
+def _fr_duration(seconds: float) -> str:
+    """12,3 s · 4 min 05 s."""
+    if seconds < 60:
+        return f"{_fr_num(round(seconds, 1), 1)} s"
+    minutes, sec = divmod(int(round(seconds)), 60)
+    return f"{minutes} min {sec:02d} s"
+
+
+def _fr_size(n_bytes: int) -> str:
+    """Taille de fichier : 820 ko · 21,8 Mo."""
+    if n_bytes < 1024 * 1024:
+        return f"{_fr_num(max(min(n_bytes, 1), round(n_bytes / 1024)))} ko"
+    return f"{_fr_num(round(n_bytes / 1024 / 1024, 1), 1)} Mo"
+
+
+def _fr_area(size_m2: float) -> str:
+    """Surface d'un hotspot, arrondie comme dans son popup sur la carte."""
+    ha = round(size_m2 / 10_000.0, 2)
+    if ha >= 10:
+        return f"{_fr_num(ha)} ha"
+    if ha >= 1:
+        return f"{_fr_num(ha, 1)} ha"
+    return f"{_fr_num(ha * 10_000)} m²"
+
+
+def _display_label(value: Any) -> str | None:
+    """Clé canonique (« pin_sylvestre ») → libellé (« Pin sylvestre »),
+    None si inconnue."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"unknown", "inconnu", "none", "nan", "?"}:
+        return None
+    text = text.replace("_", " ")
+    return text[:1].upper() + text[1:]
+
+
+def _species_label(species: str) -> str:
+    """« 🍄 Morille (esculenta) »."""
+    params = config.SPECIES_PARAMS.get(species, {})
+    return (
+        f"{params.get('emoji', '🍄')} "
+        f"{params.get('common_name', species)} ({species})"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -296,6 +427,7 @@ def _resolve_data_path(
     default: str | None,
     label: str,
     glob_pattern: str | None,
+    level: int = logging.DEBUG,
 ) -> str | None:
     """Résout un chemin de données : CLI > défaut > glob récursif.
 
@@ -307,12 +439,13 @@ def _resolve_data_path(
     label : nom humain pour le logging.
     glob_pattern : pattern glob fallback dans data/ et sous-dossiers
                    (None = pas de glob).
+    level : niveau de log des chemins trouvés (INFO en --dry-run).
     """
     # 1. Argument CLI explicite
     if cli_arg is not None:
         p = Path(cli_arg)
         if p.exists():
-            logger.info("   ✅ %s (CLI) : %s", label, p)
+            logger.log(level, "   ✅ %s (CLI) : %s", label, p)
             return str(p)
         logger.warning("   ❌ %s (CLI) introuvable : %s", label, p)
 
@@ -320,7 +453,7 @@ def _resolve_data_path(
     if default is not None:
         dp = Path(default)
         if dp.exists():
-            logger.info("   ✅ %s : %s", label, dp.name)
+            logger.log(level, "   ✅ %s : %s", label, dp.name)
             return str(dp)
     else:
         dp = None
@@ -330,11 +463,13 @@ def _resolve_data_path(
         candidates = sorted(_DATA_DIR.rglob(glob_pattern))
         if candidates:
             chosen = candidates[0]
-            logger.info("   ✅ %s (glob) : %s", label, chosen.name)
+            logger.log(level, "   ✅ %s (glob) : %s", label, chosen.name)
             return str(chosen)
 
     if default is None and glob_pattern is None:
-        logger.info("   ℹ️ %s : aucun défaut local (géré par loader)", label)
+        logger.log(
+            level, "   ℹ️ %s : aucun défaut local (géré par loader)", label,
+        )
     else:
         logger.warning(
             "   ❌ %s introuvable (défaut=%s, glob=%s)",
@@ -361,15 +496,15 @@ def _auto_cell_size(area_km2: float) -> float:
     return CELL_SIZE_AUTO_FALLBACK
 
 def validate_weights() -> bool:
-    """Vérifie la somme des poids et affiche le détail."""
+    """Vérifie la somme des poids (détail dans le log)."""
     total = sum(WEIGHTS.values())
     ok = abs(total - 1.0) < 0.01
 
-    logger.info("Pondérations du modèle :")
+    logger.debug("Pondérations du modèle :")
     for key, val in sorted(WEIGHTS.items(), key=lambda x: -x[1]):
-        logger.info("  %-25s %.2f", key, val)
-    logger.info("  %s ────", "─" * 25)
-    logger.info(
+        logger.debug("  %-25s %.2f", key, val)
+    logger.debug("  %s ────", "─" * 25)
+    logger.debug(
         "  %-25s %.2f  %s", "TOTAL", total, "✅" if ok else "⚠️ ≠ 1.0",
     )
 
@@ -405,15 +540,17 @@ def summarize_data(
     landcover_data: dict[str, Any] | None,
     enricher_stats: dict[str, Any] | None = None,
     geology_source: str | None = None,
+    level: int = logging.DEBUG,
 ) -> None:
-    """Affiche un tableau récapitulatif des données chargées."""
-    logger.info("")
-    logger.info("─" * 55)
-    logger.info("📋 Résumé des données chargées :")
+    """Tableau récapitulatif des données chargées (log ; console en
+    --dry-run via level=INFO)."""
+    logger.log(level, "")
+    logger.log(level, "─" * 55)
+    logger.log(level, "📋 Résumé des données chargées :")
 
     alt = dem_data["data"]
-    logger.info(
-        "   MNT       : %d×%dpx, alt %.0f–%.0fm",
+    logger.log(
+        level, "   MNT       : %d×%dpx, alt %.0f–%.0fm",
         alt.shape[1], alt.shape[0],
         np.nanmin(alt), np.nanmax(alt),
     )
@@ -430,24 +567,24 @@ def summarize_data(
             if hasattr(gdf, "columns") and "source" in gdf.columns:
                 sources = gdf["source"].unique()
                 src = f" ({', '.join(str(s) for s in sources[:3])})"
-            logger.info("   %-10s: %5d entités%s", name, len(gdf), src)
+            logger.log(level, "   %-10s: %5d entités%s", name, len(gdf), src)
         else:
-            logger.info("   %-10s: ❌ (absente ou vide)", name)
+            logger.log(level, "   %-10s: ❌ (absente ou vide)", name)
 
     if geology_source:
-        logger.info("   Géo source: %s", geology_source)
+        logger.log(level, "   Géo source: %s", geology_source)
 
     lc = "✅ analyse couleur OSM" if landcover_data else "❌"
-    logger.info("   Landcover : %s", lc)
+    logger.log(level, "   Landcover : %s", lc)
 
     if enricher_stats:
-        logger.info(
-            "   Essences  : %s → %d polygones",
+        logger.log(
+            level, "   Essences  : %s → %d polygones",
             enricher_stats.get("source", "?"),
             enricher_stats.get("bd_foret_polygons", 0),
         )
 
-    logger.info("─" * 55)
+    logger.log(level, "─" * 55)
 
 
 def compute_statistics(
@@ -484,24 +621,24 @@ def compute_statistics(
 
 
 def display_statistics(stats: dict[str, Any]) -> None:
-    """Affiche les statistiques en console/log."""
-    logger.info("")
-    logger.info("📊 Statistiques du score final :")
-    logger.info(
+    """Statistiques du score final d'une espèce (log)."""
+    logger.debug("")
+    logger.debug("📊 Statistiques du score final [%s] :", stats.get("species", "?"))
+    logger.debug(
         "   Min=%.3f  Max=%.3f  Moy=%.3f  Méd=%.3f  σ=%.3f",
         stats["score_min"], stats["score_max"],
         stats["score_mean"], stats["score_median"],
         stats["score_std"],
     )
-    logger.info(
+    logger.debug(
         "   🟢 Élevée  (≥0.7)     : %8s cellules (%.1f%%)",
         f"{stats['n_high']:,}", stats["pct_high"],
     )
-    logger.info(
+    logger.debug(
         "   🟡 Moyenne (0.4–0.7)  : %8s cellules (%.1f%%)",
         f"{stats['n_medium']:,}", stats["pct_medium"],
     )
-    logger.info(
+    logger.debug(
         "   ⚪ Faible  (<0.4)     : %8s cellules",
         f"{stats['n_low']:,}",
     )
@@ -512,13 +649,21 @@ def display_statistics(stats: dict[str, Any]) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 
+class TerrainConcordance(NamedTuple):
+    """Accord du modèle avec les points de contrôle terrain d'une espèce."""
+
+    rate: float      # 0–1
+    n_ok: int        # points dans la tolérance
+    n_points: int    # points évalués (dans la grille)
+
+
 def validate_against_terrain(
     model: MorilleScoring,
     checkpoints: tuple[dict[str, Any], ...] | None = None,
-) -> float | None:
+) -> TerrainConcordance | None:
     """
-    Compare le score modèle aux observations de terrain.
-    Retourne un taux de concordance (0–1) ou None si impossible.
+    Compare le score modèle aux observations de terrain (détail par point
+    dans le log). Retourne la concordance, ou None si impossible.
 
     v2.6.0 : checkpoints species-aware — fallback sur les checkpoints de
     l'espèce du modèle (TERRAIN_CHECKPOINTS_BY_SPECIES[model.species]).
@@ -537,8 +682,8 @@ def validate_against_terrain(
         scores: np.ndarray = _scores
 
         concordance_list: list[float] = []
-        logger.info("")
-        logger.info("📍 Validation croisée terrain [%s] :", model.species)
+        logger.debug("")
+        logger.debug("📍 Validation croisée terrain [%s] :", model.species)
 
         for pt in checkpoints:
             x, y = TO_L93.transform(pt["lon"], pt["lat"])
@@ -562,7 +707,7 @@ def validate_against_terrain(
                 symbol = "✅" if ok else "❌"
                 concordance_list.append(1.0 if ok else 0.0)
 
-                logger.info(
+                logger.debug(
                     "   %s %-40s attendu=%.2f modèle=%.2f Δ=%.2f",
                     symbol, pt["name"], expected, predicted, diff,
                 )
@@ -570,14 +715,13 @@ def validate_against_terrain(
                 logger.debug("   ⚠️  %s hors grille", pt["name"])
 
         if concordance_list:
-            rate = sum(concordance_list) / len(concordance_list)
-            logger.info(
+            n_ok = sum(1 for c in concordance_list if c)
+            rate = n_ok / len(concordance_list)
+            logger.debug(
                 "   Concordance : %.0f%% (%d/%d points)",
-                rate * 100,
-                sum(1 for c in concordance_list if c),
-                len(concordance_list),
+                rate * 100, n_ok, len(concordance_list),
             )
-            return rate
+            return TerrainConcordance(rate, n_ok, len(concordance_list))
 
     except Exception as e:
         logger.debug("Validation terrain impossible : %s", e)
@@ -586,46 +730,81 @@ def validate_against_terrain(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  AFFICHAGE HOTSPOTS
+#  RÉSUMÉ PAR ESPÈCE (hotspots + concordance terrain)
 # ═══════════════════════════════════════════════════════════════
 
 
-def display_hotspots(
-    hotspots: list[dict[str, Any]], max_display: int = 8,
+def _hotspot_facts(h: dict[str, Any]) -> str:
+    """Score et classe, surface, altitude, pente, essence et géologie d'un
+    hotspot, avec les arrondis de son popup sur la carte."""
+    score = round(float(h.get("mean_score", 0.0)), 3)
+    label = PROBABILITY_LABELS[bisect_right(PROBABILITY_THRESHOLDS, score)]
+    parts: list[str] = [
+        f"score {_fr_num(score, 2)} ({label})",
+        _fr_area(float(h.get("size_m2", 0.0))),
+    ]
+    alt = h.get("altitude")
+    if alt is not None and np.isfinite(alt):
+        parts.append(f"alt. {int(round(float(alt)))} m")
+    slope = h.get("mean_slope")
+    if slope is not None and np.isfinite(slope):
+        parts.append(f"pente {_fr_num(round(float(slope), 1))}°")
+    for key in ("dominant_species", "dominant_geology"):
+        text = _display_label(h.get(key))
+        if text:
+            parts.append(text)
+    return " · ".join(parts)
+
+
+def display_species_summary(
+    species: str,
+    hotspots: list[dict[str, Any]],
+    concordance: TerrainConcordance | None,
+    *,
+    threshold: float,
+    n_show: int,
 ) -> None:
-    """Affiche les meilleurs hotspots avec coordonnées GPS et lien Maps."""
+    """Top hotspots d'une espèce puis sa concordance terrain.
+
+    Le rang (#1, #2…) est celui du CSV et le numéro du marqueur sur la
+    carte (hotspots triés par score décroissant)."""
+    logger.info("")
     if not hotspots:
-        logger.warning("Aucun hotspot détecté au-dessus du seuil.")
-        return
-
-    n_show = min(max_display, len(hotspots))
-    logger.info(
-        "\n🎯 Top %d hotspots (sur %d détectés) :", n_show, len(hotspots),
-    )
-
-    for h in hotspots[:n_show]:
-        lon, lat = TO_WGS84.transform(h["x_l93"], h["y_l93"])
-
-        parts: list[str] = [
-            f"Score {h['mean_score']:.2f}",
-            f"{h['size_m2']:.0f}m²",
-        ]
-        if h.get("altitude") is not None:
-            parts.append(f"alt={h['altitude']:.0f}m")
-        if h.get("mean_slope") is not None:
-            parts.append(f"pente={h['mean_slope']:.0f}°")
-        if h.get("dominant_species"):
-            parts.append(f"🌳 {h['dominant_species']}")
-        if h.get("dominant_geology"):
-            parts.append(f"🪨 {h['dominant_geology']}")
-        if h.get("compactness") is not None:
-            parts.append(f"compact={h['compactness']:.2f}")
-
-        logger.info("   #%d — %s", h["id"], ", ".join(parts))
-        logger.info("         📍 %.5f°N, %.5f°E", lat, lon)
         logger.info(
-            "         🔗 https://www.google.com/maps?q=%.5f,%.5f", lat, lon,
+            "%s — aucun hotspot au-dessus du seuil %s",
+            _species_label(species), _fr_num(threshold, 2),
         )
+    else:
+        n = min(max(n_show, 0), len(hotspots))
+        logger.info(
+            "%s — %s hotspots (score ≥ %s)%s",
+            _species_label(species), _fr_num(len(hotspots)),
+            _fr_num(threshold, 2), f", top {n} :" if n else "",
+        )
+        for rank, h in enumerate(hotspots[:n], 1):
+            pt = hotspot_to_export_dict(h)
+            logger.info("   #%-2d %s", rank, _hotspot_facts(h))
+            logger.info(
+                "       %.5f, %.5f · %s",
+                pt["lat"], pt["lon"], pt["google_maps"],
+            )
+
+    if concordance is None:
+        return
+    if concordance.rate >= 0.8:
+        level, mark, verdict = logging.INFO, "✅", "bonne"
+    elif concordance.rate >= 0.5:
+        level, mark, verdict = (
+            logging.INFO, "⚠️ ", "moyenne, recalibrer les poids ?",
+        )
+    else:
+        level, mark, verdict = logging.WARNING, "❌", "faible, modèle à revoir"
+    logger.log(
+        level,
+        "   %s Concordance terrain : %s %% (%d/%d points de contrôle) — %s",
+        mark, _fr_num(concordance.rate * 100), concordance.n_ok,
+        concordance.n_points, verdict,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -679,7 +858,7 @@ def save_hotspots_csv(
         writer.writeheader()
         writer.writerows(rows)
 
-    logger.info("📍 Hotspots CSV : %s (%d lignes)", csv_path, len(rows))
+    logger.debug("📍 Hotspots CSV : %s (%d lignes)", csv_path, len(rows))
     return csv_path
 
 
@@ -735,8 +914,88 @@ def save_report(
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False, default=str)
 
-    logger.info("📝 Rapport sauvegardé [%s] : %s", species, report_path)
+    logger.debug("📝 Rapport sauvegardé [%s] : %s", species, report_path)
     return report_path
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MÉTÉO & RÉSUMÉ DE FIN DE RUN
+# ═══════════════════════════════════════════════════════════════
+
+
+def _weather_multiplier(day_score: float) -> float:
+    """Facteur appliqué aux scores des espèces selon la météo du jour."""
+    s = min(max(float(day_score), 0.0), 1.0)
+    return float(
+        np.float32(_WEATHER_FACTOR_MIN + (1.0 - _WEATHER_FACTOR_MIN) * s),
+    )
+
+
+def _weather_failure_reason(exc: BaseException) -> str:
+    """Cause courte d'un échec météo, sans l'URL (elle contient la clé API)."""
+    if isinstance(exc, requests.Timeout):
+        return "délai dépassé"
+    if isinstance(exc, requests.ConnectionError):
+        return "pas de connexion"
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return f"HTTP {exc.response.status_code}"
+    if isinstance(exc, RuntimeError):
+        return str(exc)[:80]
+    return type(exc).__name__
+
+
+def _layer_label(gdf: Any, name: str) -> str | None:
+    """Nom d'une couche chargée pour la ligne de fin d'étape 1 (None si
+    absente) ; signale une couche de substitution synthétique."""
+    if gdf is None or len(gdf) == 0:
+        return None
+    if (
+        hasattr(gdf, "columns")
+        and "source" in gdf.columns
+        and bool((gdf["source"] == "synthetic").all())
+    ):
+        return f"{name} synthétique ⚠️"
+    return name
+
+
+# Mentions affichées à côté de certains fichiers du résumé
+_OUTPUT_NOTES: dict[str, str] = {
+    "morilles_probability.tif": "copie de esculenta_probability.tif",
+    "cartomorilles.log": "journal détaillé",
+}
+
+
+def display_outputs(output_dir: Path, files: list[Path]) -> None:
+    """Fichiers écrits par ce run — pas ceux qu'un run précédent a laissés
+    dans le répertoire de sortie."""
+    present = [f for f in dict.fromkeys(files) if f.is_file()]
+    if not present:
+        return
+    sizes = [f.stat().st_size for f in present]
+    width = max(len(f.name) for f in present)
+    logger.info("")
+    logger.info(
+        "📁 Fichiers produits dans %s (%s) :", output_dir, _fr_size(sum(sizes)),
+    )
+    for f, size in zip(present, sizes):
+        note = _OUTPUT_NOTES.get(f.name)
+        logger.info(
+            "   %-*s %9s%s", width, f.name, _fr_size(size),
+            f"   {note}" if note else "",
+        )
+
+
+def _open_in_browser(uri: str) -> None:
+    """--open : ouvre la carte dans le navigateur par défaut."""
+    try:
+        opened = webbrowser.open(uri)
+    except webbrowser.Error as exc:
+        logger.debug("webbrowser : %s", exc)
+        opened = False
+    if not opened:
+        logger.warning(
+            "Navigateur introuvable — ouvrez la carte à la main : %s", uri,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -772,7 +1031,7 @@ def main(args: argparse.Namespace) -> int:
     """
     Pipeline principal Cartomorilles.
 
-    Ordre (v2.4.0) :
+    Ordre (v2.6.0) :
       1. Chargement données
          a. DEM (Copernicus 30m)
          b. BD Forêt v2 → SpeciesEnricher (essences + TFV + IFN régional)
@@ -788,8 +1047,8 @@ def main(args: argparse.Namespace) -> int:
          f. score_canopy_openness / score_ground_cover / score_disturbance
          g. apply_water_mask
          h. apply_landcover_mask
-      3. Scoring multicritère
-      4. Exports
+      3. Scoring multicritère — une passe par espèce, modulation météo J+0
+      4. Exports, puis résumé console (fichiers, carte, hotspots par espèce)
 
     Returns:
         0 = succès, 1 = erreur config, 2 = erreur données
@@ -798,11 +1057,17 @@ def main(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
 
     # ── Logging ────────────────────────────────────────────────
-    setup_logging(output_dir, verbose=args.verbose)
+    log_path = setup_logging(output_dir, verbose=args.verbose)
+    # Détail chemins/données : à l'écran en --dry-run, sinon dans le log
+    detail = logging.INFO if args.dry_run else logging.DEBUG
+
+    species_list: list[str] = list(getattr(args, "species", ["esculenta"]))
+    species_names = ", ".join(
+        str(config.get_species_params(sp)["common_name"]) for sp in species_list
+    )
 
     logger.info("=" * 60)
-    logger.info("🍄 CARTOMORILLES v%s", VERSION)
-    logger.info("   Zone : %s", _ZONE_LABEL)
+    logger.info("🍄 CARTOMORILLES v%s — %s", VERSION, _ZONE_LABEL)
     logger.info("=" * 60)
 
     # ── Purge cache (conditionnel) ────────────────────────────
@@ -812,7 +1077,7 @@ def main(args: argparse.Namespace) -> int:
     # ── Reproductibilité ──────────────────────────────────────
     seed: int = args.seed
     np.random.seed(seed)  # type: ignore[arg-type]
-    logger.info("🎲 Seed : %d", seed)
+    logger.debug("🎲 Seed : %d", seed)
 
     # ── Résolution auto-scale ─────────────────────────────────
     bbox = BBOX
@@ -824,12 +1089,13 @@ def main(args: argparse.Namespace) -> int:
     else:
         cell_size = _auto_cell_size(emprise_km2)
     if cell_size != CELL_SIZE:
-        import config as _cfg
-        _cfg.CELL_SIZE = cell_size  # type: ignore[misc]
-        logger.info(
-            "📐 Auto-scale : %.0f km² → résolution %.0fm "
-            "(défaut %.0fm, --cell-size pour forcer)",
-            emprise_km2, cell_size, CELL_SIZE,
+        config.CELL_SIZE = cell_size  # type: ignore[misc]
+        logger.debug(
+            "📐 Maille %.0fm (%s, emprise %.0f km²) au lieu du défaut "
+            "config %.0fm",
+            cell_size,
+            "auto-scale" if args.cell_size is None else "--cell-size",
+            emprise_km2, CELL_SIZE,
         )
 
     # ── Validation config ─────────────────────────────────────
@@ -843,11 +1109,17 @@ def main(args: argparse.Namespace) -> int:
 
     # ── Estimation grille ─────────────────────────────────────
     est = estimate_grid_size(cell_size)
-    logger.info(
+    logger.debug(
         "📐 Grille estimée : %d×%d = %s cellules  "
         "(%.1f km², ~%.0f Mo RAM)",
         est["nx"], est["ny"], f"{est['n_cells']:,}",
         est["area_km2"], est["mem_estimate_mb"],
+    )
+    logger.info(
+        "   Maille %s m (%s) · %s cellules · %s",
+        _fr_num(cell_size, 0 if float(cell_size).is_integer() else 1),
+        "auto" if args.cell_size is None else "--cell-size",
+        _fr_num(est["n_cells"]), species_names,
     )
 
     if est["n_cells"] > _MAX_CELLS and not args.force:
@@ -874,7 +1146,14 @@ def main(args: argparse.Namespace) -> int:
             "https://geoservices.brgm.fr/geologie",
         ):
             if hasattr(loader, "discover_wfs_layers"):
-                loader.discover_wfs_layers(url)  # type: ignore[attr-defined]
+                found = loader.discover_wfs_layers(url)  # type: ignore[attr-defined]
+                logger.info("")
+                logger.info(
+                    "🔍 %s — %d couches pertinentes%s :", url, len(found),
+                    " (30 premières)" if len(found) > 30 else "",
+                )
+                for line in found[:30]:
+                    logger.info(line)
             else:
                 logger.warning(
                     "DataLoader n'a pas de méthode discover_wfs_layers",
@@ -885,29 +1164,30 @@ def main(args: argparse.Namespace) -> int:
     #  ÉTAPE 1 — CHARGEMENT DES DONNÉES
     # ══════════════════════════════════════════════════════════
 
-    logger.info("\n📂 [1/4] Chargement des données...")
+    logger.info("")
+    logger.info("📂 [1/4] Chargement des données…")
     t0 = time.time()
 
     loader = DataLoader()
 
     # ── 1a. Résolution des chemins ────────────────────────────
-    logger.info("   Résolution des chemins de données :")
+    logger.log(detail, "   Résolution des chemins de données :")
     # DEM : pas de glob (une tuile unique ne couvre pas le bbox élargi) —
     # load_dem() merge les 6 tuiles Copernicus locales si filepath=None.
     dem_path = _resolve_data_path(
-        args.dem, _DEFAULT_DEM, "DEM", None,
+        args.dem, _DEFAULT_DEM, "DEM", None, detail,
     )
     bd_foret_path = _resolve_data_path(
         args.bd_foret, _DEFAULT_BD_FORET, "BD Forêt",
-        "FORMATION_VEGETALE.shp",
+        "FORMATION_VEGETALE.shp", detail,
     )
     geology_path = _resolve_data_path(
         args.geology, _DEFAULT_GEOLOGY, "Géologie",
-        "*S_FGEOL*2154.shp",
+        "*S_FGEOL*2154.shp", detail,
     )
     regions_path = _resolve_data_path(
         args.regions, _DEFAULT_REGIONS, "Régions IFN",
-        "rfifn250_l93.shp",
+        "rfifn250_l93.shp", detail,
     )
 
     # ── 1b. MNT ───────────────────────────────────────────────
@@ -934,16 +1214,21 @@ def main(args: argparse.Namespace) -> int:
                 n_known / max(len(forest_gdf), 1) * 100, 1,
             ),
         }
-        logger.info(
+        logger.log(
+            detail,
             "   🌳 BD Forêt v2 : %d polygones, "
             "%d essences connues (%.1f%%)",
             len(forest_gdf), n_known,
             enricher_load_stats["species_known_pct"],
         )
+        forest_label = "BD Forêt v2"
     else:
-        logger.info("   🌳 BD Forêt v2 indisponible → fallback WFS/fichier")
+        logger.warning(
+            "   🌳 BD Forêt v2 indisponible → couche forêt WFS/fichier",
+        )
         forest_gdf = loader.load_forest(args.forest)
         enricher_load_stats = {"source": "wfs_fallback"}
+        forest_label = "forêt WFS/fichier"
 
     # ── 1d. Géologie — BDCharm-50 prioritaire ────────────────
     geology_source: str = "unknown"
@@ -960,7 +1245,8 @@ def main(args: argparse.Namespace) -> int:
                 n_resolved = int(
                     (geology_gdf["geology_canonical"] != "unknown").sum(),
                 )
-            logger.info(
+            logger.log(
+                detail,
                 "   🪨 Géologie BDCharm-50 : %d polygones, "
                 "%d résolus (%.1f%%)",
                 n_geo, n_resolved,
@@ -982,6 +1268,10 @@ def main(args: argparse.Namespace) -> int:
             and (geology_gdf["source"] == "wfs_brgm").any()
             else "synthetic"
         )
+    geology_label = {
+        "bdcharm50": "géologie BDCharm-50",
+        "wfs_brgm": "géologie WFS BRGM",
+    }.get(geology_source, "géologie")
 
     # ── 1d'. Contacts géologiques linéaires (L_FGEOL) ────────
     geo_lines_gdf = loader.load_geology_lines()
@@ -993,17 +1283,18 @@ def main(args: argparse.Namespace) -> int:
     if not args.no_urban:
         urban_gdf = loader.load_urban(args.urban)
     else:
-        logger.info("ℹ️  Masque urbain désactivé (--no-urban)")
+        logger.log(detail, "   ℹ️  Masque urbain désactivé (--no-urban)")
 
     # ── 1f. Détection landcover par couleur OSM ───────────────
     landcover_data: dict[str, Any] | None = None
     area_km2 = est["area_km2"]
 
     if args.no_landcover:
-        logger.info("ℹ️  Landcover désactivé (--no-landcover)")
+        logger.log(detail, "   ℹ️  Landcover désactivé (--no-landcover)")
     elif not args.landcover and area_km2 > LANDCOVER_AUTO_MAX_KM2:
-        logger.info(
-            "ℹ️  Landcover auto-skip : %.0f km² > %.0f km² "
+        logger.log(
+            detail,
+            "   ℹ️  Landcover auto-skip : %.0f km² > %.0f km² "
             "(utiliser --landcover pour forcer)",
             area_km2, LANDCOVER_AUTO_MAX_KM2,
         )
@@ -1019,8 +1310,6 @@ def main(args: argparse.Namespace) -> int:
             logger.warning("Landcover — erreur réseau : %s", e)
         except Exception as e:
             logger.warning("Landcover échoué : %s", e)
-
-    logger.info("   ⏱️  Chargement : %.1fs", time.time() - t0)
 
     # ── Validation MNT (obligatoire) ──────────────────────────
     if dem_data is None or dem_data.get("data") is None:
@@ -1043,30 +1332,46 @@ def main(args: argparse.Namespace) -> int:
             logger.error("❌ Trop de NoData (>30%%). Vérifiez le MNT.")
             return 2
 
+    loaded = [
+        "MNT", forest_label,
+        _layer_label(geology_gdf, geology_label),
+        _layer_label(hydro_gdf, "hydrographie"),
+        _layer_label(urban_gdf, "urbain"),
+        "occupation du sol OSM" if landcover_data else None,
+    ]
+    logger.info(
+        "   ✓ %s — %s",
+        " · ".join(x for x in loaded if x), _fr_duration(time.time() - t0),
+    )
+
     # Résumé
     summarize_data(
         dem_data, forest_gdf, geology_gdf,
         hydro_gdf, urban_gdf, landcover_data,
         enricher_load_stats if enricher_load_stats else None,
         geology_source=geology_source,
+        level=detail,
     )
 
     # ── Dry run ───────────────────────────────────────────────
     if args.dry_run:
+        logger.info("")
         logger.info(
-            "\n🔍 Mode --dry-run : données vérifiées, "
-            "arrêt avant calcul du modèle.",
+            "🔍 --dry-run : données vérifiées en %s, "
+            "arrêt avant le calcul du modèle.",
+            _fr_duration(time.time() - t_start),
         )
-        logger.info("   (durée : %.1fs)", time.time() - t_start)
         return 0
 
     # ══════════════════════════════════════════════════════════
     #  ÉTAPE 2 — CONSTRUCTION DE LA GRILLE & SCORES PAR CRITÈRE
     # ══════════════════════════════════════════════════════════
 
+    logger.info("")
     logger.info(
-        "\n📐 [2/4] Construction grille %.0f×%.0fm...",
-        cell_size, cell_size,
+        "📐 [2/4] Grille %s m et %d critères…",
+        _fr_num(cell_size, 0 if float(cell_size).is_integer() else 1),
+        len(WEIGHTS),
     )
     t0 = time.time()
 
@@ -1076,7 +1381,7 @@ def main(args: argparse.Namespace) -> int:
     grid.compute_terrain(dem_data)
 
     # ── 2b. Scores terrain ────────────────────────────────────
-    logger.info("   ▸ Altitude, pente, rugosité, exposition...")
+    logger.debug("   ▸ Altitude, pente, rugosité, exposition...")
     grid.score_altitude()
     grid.score_slope()
     grid.score_terrain_roughness()
@@ -1085,22 +1390,22 @@ def main(args: argparse.Namespace) -> int:
     grid.score_twi()
 
     # ── 2c. Scores écologiques (données vectorielles) ─────────
-    logger.info("   ▸ Distance eau...")
+    logger.debug("   ▸ Distance eau...")
     grid.score_distance_water(hydro_gdf)
 
-    logger.info("   ▸ Essences forestières...")
+    logger.debug("   ▸ Essences forestières...")
     grid.score_tree_species(forest_gdf)
 
-    logger.info("   ▸ Géologie (%s)...", geology_source)
+    logger.debug("   ▸ Géologie (%s)...", geology_source)
     grid.score_geology(geology_gdf)
 
     # ── 2c'. Enrichissement essences (niveaux B+C+D) ─────────
-    logger.info("   ▸ Enrichissement essences (IFN 1997 × altitude)...")
+    logger.debug("   ▸ Enrichissement essences (IFN 1997 × altitude)...")
     enricher.enrich_grid_scores(
         grid, forest_gdf=forest_gdf, geology_gdf=geology_gdf,
     )
     enrich_stats = enricher.get_stats(grid)
-    logger.info(
+    logger.debug(
         "   ▸ Essences : %d/%d connues (%.1f%%), "
         "%d inconnues restantes",
         enrich_stats.get("species_known", 0),
@@ -1110,16 +1415,19 @@ def main(args: argparse.Namespace) -> int:
     )
 
     # ── 2d. Masque urbain (AVANT micro-habitats) ─────────────
-    logger.info("   ▸ Application masque urbain...")
+    logger.debug("   ▸ Application masque urbain...")
     urban_buffer: int = args.urban_buffer if not args.no_urban else 0
     grid.apply_urban_mask(urban_gdf, buffer_m=urban_buffer)
 
     # ── 2d'. Score proximité urbaine (EDT sur masque urbain) ──
-    logger.info("   ▸ Score proximité urbaine...")
+    logger.debug("   ▸ Score proximité urbaine...")
     grid.score_urban_proximity()
 
     # ── 2e. Scores micro-habitat ──────────────────────────────
-    logger.info("   ▸ Lisière forestière, contacts géologiques, ouverture canopée, couvert sol, perturbation...")
+    logger.debug(
+        "   ▸ Lisière forestière, contacts géologiques, ouverture canopée, "
+        "couvert sol, perturbation...",
+    )
     grid.score_forest_edge_distance()
     grid.score_geology_contact_distance(geo_lines_gdf)
     grid.score_canopy_openness()
@@ -1127,63 +1435,90 @@ def main(args: argparse.Namespace) -> int:
     grid.score_disturbance()
 
     # ── 2f. Masque plans d'eau (scores eau → 0) ──────────────
-    logger.info("   ▸ Application masque plans d'eau...")
+    logger.debug("   ▸ Application masque plans d'eau...")
     grid.apply_water_mask()
 
     # ── 2g. Modulation landcover (APRÈS tous les scores) ──────
-    logger.info("   ▸ Application masque landcover (×green_score)...")
+    logger.debug("   ▸ Application masque landcover (×green_score)...")
     grid.apply_landcover_mask(landcover_data)
 
     n_cells = grid.scores["altitude"].size
     logger.info(
-        "   ⏱️  Grille : %.1fs — %s cellules (%.1f km²)",
-        time.time() - t0,
-        f"{n_cells:,}",
-        n_cells * cell_size**2 / 1e6,
+        "   ✓ %s cellules (%s km²) — %s",
+        _fr_num(n_cells), _fr_num(round(n_cells * cell_size**2 / 1e6)),
+        _fr_duration(time.time() - t0),
     )
 
     # ══════════════════════════════════════════════════════════
     #  ÉTAPE 3 — MODÈLE MULTICRITÈRE (multi-espèces v2.6.0)
     # ══════════════════════════════════════════════════════════
 
-    species_list: list[str] = list(getattr(args, "species", ["esculenta"]))
-    logger.info(
-        "\n🧮 [3/4] Calcul du modèle multicritère [espèces: %s]...",
-        ", ".join(species_list),
-    )
+    logger.info("")
+    logger.info("🧮 [3/4] Modèle multicritère — %s…", species_names)
     t0 = time.time()
 
-    # ── Niveau météo (calculé 1× pour toutes espèces) ──
+    # ── Météo J+0 (calculée 1× pour toutes espèces) ──
     weather_days: list[Any] | None = None
     weather_factor: float = 1.0
-    if not getattr(args, "no_weather", False):
+    if getattr(args, "no_weather", False):
+        weather_status = "disabled"
+        weather_summary = [
+            "🌤️  Météo désactivée (--no-weather) — scores non modulés",
+        ]
+        logger.debug("🌤️  Météo désactivée (--no-weather)")
+    else:
+        days: list[Any] = []
+        reason = "aucune prévision"
         try:
-            _checker = WeatherChecker()
-            _days = _checker.evaluate()
-            if _days:
-                weather_days = _days
-                _today = _days[0]
-                weather_factor = float(np.float32(0.4 + 0.6 * _today.score))
-                logger.info(
-                    "🌤️  Météo J+0 : %s  (score=%.2f → ×%.2f)",
-                    _today.label, _today.score, weather_factor,
-                )
-                logger.info(WeatherChecker.format_report(_days))
-        except Exception as _exc:
-            logger.debug("Météo indisponible, skip : %s", _exc)
+            days = WeatherChecker().evaluate()
+        except Exception as exc:
+            reason = _weather_failure_reason(exc)
+            logger.debug(
+                "Météo indisponible : %s",
+                re.sub(r"apikey=[^&\s'\"]+", "apikey=***", repr(exc)),
+            )
+        if days:
+            weather_days = days
+            today = days[0]
+            weather_factor = _weather_multiplier(today.score)
+            weather_status = "modulated"
+            weather_summary = [
+                f"🌤️  Météo du jour : {today.label} "
+                f"({_fr_num(today.score, 2)}) → scores des espèces "
+                f"multipliés par {_fr_num(weather_factor, 2)}",
+                f"    (facteur de {_fr_num(_WEATHER_FACTOR_MIN, 1)} à 1,0 "
+                f"selon la météo ; --no-weather pour l'ignorer)",
+            ]
+            logger.info(
+                "   🌤️  Météo du jour : %s (%s) → scores ×%s",
+                today.label, _fr_num(today.score, 2),
+                _fr_num(weather_factor, 2),
+            )
+            logger.debug(WeatherChecker.format_report(days))
+        else:
+            weather_status = "unavailable"
+            weather_summary = [
+                f"🌤️  Météo indisponible ({reason}) — scores non modulés",
+            ]
+            logger.info(
+                "   🌤️  Météo indisponible (%s) — scores non modulés", reason,
+            )
 
     # ── Boucle scoring par espèce ──
     models: dict[str, MorilleScoring] = {}
     hotspots_by_species: dict[str, list[dict[str, Any]]] = {}
     stats_by_species: dict[str, dict[str, Any]] = {}
-    concordance_by_species: dict[str, float | None] = {}
+    concordance_by_species: dict[str, TerrainConcordance | None] = {}
 
     for sp_idx, species in enumerate(species_list):
         sp_t0 = time.time()
-        logger.info("")
-        logger.info("─" * 70)
-        logger.info("🍄 PASS %d/%d — species=%s", sp_idx + 1, len(species_list), species)
-        logger.info("─" * 70)
+        logger.debug("")
+        logger.debug("─" * 70)
+        logger.debug(
+            "🍄 PASS %d/%d — species=%s",
+            sp_idx + 1, len(species_list), species,
+        )
+        logger.debug("─" * 70)
 
         # Recompute des 6 critères species-aware (grid.scores écrasé in-place)
         # 1ère itération esculenta : redondant avec score_* initiaux mais cache hit ~0s
@@ -1215,36 +1550,33 @@ def main(args: argparse.Namespace) -> int:
         sp_stats["n_hotspots"] = len(sp_hotspots)
         sp_stats["species"] = species
         stats_by_species[species] = sp_stats
-
-        logger.info("   📊 Stats [%s]:", species)
         display_statistics(sp_stats)
 
         # ── Validation terrain par espèce ──
-        sp_conc = validate_against_terrain(sp_model)
-        concordance_by_species[species] = sp_conc
+        concordance_by_species[species] = validate_against_terrain(sp_model)
 
         models[species] = sp_model
-        logger.info("   ⏱️  [%s] : %.1fs", species, time.time() - sp_t0)
+        logger.info(
+            "   ✓ %s : %s hotspots — %s",
+            _species_label(species), _fr_num(len(sp_hotspots)),
+            _fr_duration(time.time() - sp_t0),
+        )
 
-    logger.info("")
-    logger.info("   ⏱️  Scoring TOTAL (%d espèces) : %.1fs",
-                len(species_list), time.time() - t0)
-
-    # ── Variables compat single-species (premier species = défaut affichage) ──
-    primary_species: str = species_list[0]
-    model: MorilleScoring = models[primary_species]
-    hotspots: list[dict[str, Any]] = hotspots_by_species[primary_species]
-    stats: dict[str, Any] = stats_by_species[primary_species]
-    concordance: float | None = concordance_by_species[primary_species]
-    final = model.final_score
-    assert final is not None
+    logger.debug(
+        "   ⏱️  Scoring TOTAL (%d espèces) : %.1fs",
+        len(species_list), time.time() - t0,
+    )
 
     # ══════════════════════════════════════════════════════════
     #  ÉTAPE 4 — EXPORTS
     # ══════════════════════════════════════════════════════════
 
-    logger.info("\n🗺️  [4/4] Génération des exports...")
+    logger.info("")
+    logger.info("🗺️  [4/4] Exports — carte, GeoTIFF, CSV, rapports…")
     t0 = time.time()
+
+    # Fichiers écrits par CE run (le résumé ignore ceux d'un run précédent)
+    produced: list[Path] = []
 
     # Récupérer les observations iNaturalist depuis l'enrichisseur
     _inat_obs = getattr(enricher, "inat_observations", None) or []
@@ -1260,32 +1592,33 @@ def main(args: argparse.Namespace) -> int:
         inat_observations=_inat_obs,
         weather_days=weather_days,
         debug_layers=args.debug_layers,
+        default_hotspots_shown=args.map_hotspots,
     )
     # Carte Folium HTML — UN SEUL fichier multi-espèces avec toggle
-    html_path = str(output_dir / "cartomorilles.html")
-    _cleanup_files.append(html_path)
-    viz.create_folium_map(html_path)
+    html_path = output_dir / "cartomorilles.html"
+    _cleanup_files.append(str(html_path))
+    produced.append(viz.create_folium_map(html_path))
 
     # GeoTIFF raster — UN par espèce
     for sp in species_list:
         try:
-            tif_path = str(output_dir / f"{sp}_probability.tif")
-            _cleanup_files.append(tif_path)
-            viz.export_geotiff(tif_path, species=sp)
+            tif_path = output_dir / f"{sp}_probability.tif"
+            _cleanup_files.append(str(tif_path))
+            produced.append(viz.export_geotiff(tif_path, species=sp))
         except (IOError, OSError) as e:
             logger.warning("GeoTIFF [%s] I/O échoué : %s", sp, e)
         except Exception as e:
             logger.warning("GeoTIFF [%s] échoué : %s", sp, e)
 
-    # Alias compat morilles_probability.tif (esculenta)
-    if "esculenta" in species_list:
+    # Alias compat morilles_probability.tif (esculenta de CE run uniquement)
+    src = output_dir / "esculenta_probability.tif"
+    if src in produced:
         try:
             import shutil
-            src = output_dir / "esculenta_probability.tif"
             dst = output_dir / "morilles_probability.tif"
-            if src.exists():
-                shutil.copy2(src, dst)
-                _cleanup_files.append(str(dst))
+            shutil.copy2(src, dst)
+            _cleanup_files.append(str(dst))
+            produced.append(dst)
         except Exception as e:
             logger.debug("Alias morilles_probability.tif non créé : %s", e)
 
@@ -1293,15 +1626,15 @@ def main(args: argparse.Namespace) -> int:
     if args.export_vector:
         for sp in species_list:
             try:
-                gpkg_path = str(output_dir / f"{sp}_grid.gpkg")
-                _cleanup_files.append(gpkg_path)
-                viz.export_gpkg_grid(gpkg_path, threshold=0.3, species=sp)
+                gpkg_path = output_dir / f"{sp}_grid.gpkg"
+                _cleanup_files.append(str(gpkg_path))
+                produced.append(
+                    viz.export_gpkg_grid(gpkg_path, threshold=0.3, species=sp),
+                )
             except (IOError, OSError) as e:
                 logger.warning("GPKG [%s] I/O échoué : %s", sp, e)
             except Exception as e:
                 logger.warning("GPKG [%s] échoué : %s", sp, e)
-
-    logger.info("   ⏱️  Export : %.1fs", time.time() - t0)
 
     # ══════════════════════════════════════════════════════════
     #  RAPPORT & CONFIG SNAPSHOT
@@ -1315,6 +1648,8 @@ def main(args: argparse.Namespace) -> int:
         "urban_buffer_m": urban_buffer if not args.no_urban else None,
         "no_urban": args.no_urban,
         "no_landcover": args.no_landcover,
+        "weather": weather_status,
+        "weather_factor": round(weather_factor, 4),
         "weights": dict(WEIGHTS),
         "tree_scores": dict(TREE_SCORES),
         "geology_scores": dict(GEOLOGY_SCORES),
@@ -1335,8 +1670,6 @@ def main(args: argparse.Namespace) -> int:
 
     # ── Rapport JSON par espèce + CSV hotspots par espèce ──
     for sp in species_list:
-        sp_stats = stats_by_species[sp]
-        sp_hotspots = hotspots_by_species[sp]
         sp_conc = concordance_by_species[sp]
         # Snapshot enrichi avec params espèce
         sp_snapshot = dict(config_snapshot)
@@ -1348,13 +1681,17 @@ def main(args: argparse.Namespace) -> int:
                 else v)
             for k, v in config.SPECIES_PARAMS[sp].items()
         }
-        save_report(
-            output_dir, sp_stats, sp_hotspots,
-            sp_snapshot, duration, sp_conc,
+        produced.append(save_report(
+            output_dir, stats_by_species[sp], hotspots_by_species[sp],
+            sp_snapshot, duration, sp_conc.rate if sp_conc else None,
             enrichment_stats=full_enrich_stats,
             species=sp,
+        ))
+        produced.append(
+            save_hotspots_csv(output_dir, hotspots_by_species[sp], species=sp),
         )
-        save_hotspots_csv(output_dir, sp_hotspots, species=sp)
+
+    logger.info("   ✓ %s", _fr_duration(time.time() - t0))
 
     # ══════════════════════════════════════════════════════════
     #  RÉSUMÉ FINAL
@@ -1362,44 +1699,30 @@ def main(args: argparse.Namespace) -> int:
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("✅ CARTOMORILLES v%s — Terminé en %.1fs", VERSION, duration)
+    logger.info("✅ Terminé en %s", _fr_duration(time.time() - t_start))
     logger.info("=" * 60)
+    for line in weather_summary:
+        logger.info(line)
 
-    # Fichiers générés
-    logger.info("\n📁 Fichiers générés :")
-    total_size = 0.0
-    for f in sorted(output_dir.iterdir()):
-        if f.is_file():
-            size_mb = f.stat().st_size / 1024 / 1024
-            total_size += size_mb
-            logger.info("   📄 %-45s (%.1f Mo)", f.name, size_mb)
-    logger.info("   %s ──────", "─" * 45)
-    logger.info("   Total : %.1f Mo", total_size)
+    # Top hotspots + concordance terrain, pour chaque espèce
+    for sp in species_list:
+        display_species_summary(
+            sp, hotspots_by_species[sp], concordance_by_species[sp],
+            threshold=args.hotspot_threshold, n_show=args.console_hotspots,
+        )
 
-    # Hotspots
-    display_hotspots(hotspots, max_display=args.max_hotspots)
+    display_outputs(output_dir, [*produced, log_path])
 
-    # Concordance terrain
-    if concordance is not None:
-        if concordance >= 0.8:
-            logger.info(
-                "\n✅ Bonne concordance terrain : %.0f%%",
-                concordance * 100,
-            )
-        elif concordance >= 0.5:
-            logger.info(
-                "\n⚠️  Concordance terrain moyenne : %.0f%% "
-                "— recalibrer les poids ?",
-                concordance * 100,
-            )
-        else:
-            logger.warning(
-                "\n❌ Concordance terrain faible : %.0f%% "
-                "— modèle à revoir !",
-                concordance * 100,
-            )
+    map_uri = html_path.resolve().as_uri()
+    logger.info("")
+    if args.open:
+        logger.info("🗺️  Carte : %s", map_uri)
+        _open_in_browser(map_uri)
+    else:
+        logger.info("🗺️  Carte : %s  (--open pour l'ouvrir)", map_uri)
 
-    logger.info("\n🍄 Bonne chasse aux morilles !\n")
+    logger.info("")
+    logger.info("🍄 Bonne prospection !")
 
     _cleanup_files.clear()
 
@@ -1413,21 +1736,38 @@ def main(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """Construit le parser d'arguments CLI."""
+    area_km2 = _ZONE_DX_KM * _ZONE_DY_KM
+    auto_cell = _auto_cell_size(area_km2)
+    auto_cells_m = estimate_grid_size(auto_cell)["n_cells"] / 1e6
     parser = argparse.ArgumentParser(
         prog="cartomorilles",
         description=(
-            "🍄 Cartomorilles — Modèle de probabilité "
-            "de présence de morilles"
+            "🍄 Cartomorilles — cartes de probabilité de présence de la\n"
+            "morille (Morchella esculenta) et du cèpe (Boletus edulis) en\n"
+            "Isère : carte HTML interactive, GeoTIFF, CSV des hotspots et\n"
+            "rapport JSON par espèce."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Zone : {_ZONE_LABEL} | Maille : {CELL_SIZE:.0f}m
+Zone : {_ZONE_LABEL} ({_fr_num(area_km2)} km²)
+Maille : automatique selon l'emprise — {auto_cell:.0f} m ici
+         (~{_fr_num(auto_cells_m, 1)} M cellules) ; --cell-size pour la forcer
+Sorties (--output-dir) : cartomorilles.html (toutes espèces),
+         {{espèce}}_probability.tif, {{espèce}}_hotspots.csv,
+         rapport_{{espèce}}.json, cartomorilles.log (journal détaillé)
+Console : étapes [1/4]…[4/4] puis résumé ; --verbose pour tout le détail
 
 Exemples d'utilisation :
 
-  # Mode auto (BD Forêt v2 + BDCharm-50 + IFN enrichissement)
+  # Les deux espèces, maille auto, météo du jour
   python main.py
+
+  # Idem, puis ouvrir la carte dans le navigateur
+  python main.py --open
+
+  # Morille seule, 10 hotspots listés en fin de run
+  python main.py --species esculenta --console-hotspots 10
 
   # Avec MNT local (GeoTIFF)
   python main.py --dem data/mnt_local.tif
@@ -1523,8 +1863,11 @@ Exemples d'utilisation :
     # ── Paramètres modèle ──
     model_group = parser.add_argument_group("🧮 Paramètres du modèle")
     model_group.add_argument(
-        "--cell-size", type=float, default=None,
-        help="Taille de cellule en mètres (auto-scale si omis).",
+        "--cell-size", type=float, default=None, metavar="M",
+        help=(
+            "Taille de cellule en mètres (défaut : automatique selon "
+            f"l'emprise — {auto_cell:.0f} m pour la zone)."
+        ),
     )
     model_group.add_argument(
         "--hotspot-threshold", type=float, default=0.60, metavar="T",
@@ -1544,8 +1887,11 @@ Exemples d'utilisation :
         choices=list(SUPPORTED_SPECIES),
         metavar="SPECIES",
         help=(
-            "Espèces à modéliser (défaut: toutes — esculenta + edulis pour "
-            "dual-render avec toggle UI). Choix : %s." % ", ".join(SUPPORTED_SPECIES)
+            "Espèces à modéliser (défaut : toutes, avec bascule d'espèce "
+            "sur la carte). Choix : %s." % ", ".join(
+                f"{sp} ({config.get_species_params(sp)['common_name'].lower()})"
+                for sp in SUPPORTED_SPECIES
+            )
         ),
     )
 
@@ -1560,8 +1906,31 @@ Exemples d'utilisation :
         help="Exporter la grille en GPKG vecteur (volumineux).",
     )
     output_group.add_argument(
-        "--max-hotspots", type=int, default=8, metavar="N",
-        help="Nombre maximum de hotspots à afficher (défaut: 8).",
+        "--open", action="store_true",
+        help="Ouvrir la carte dans le navigateur à la fin du run.",
+    )
+    output_group.add_argument(
+        "--console-hotspots", type=int, default=_CONSOLE_HOTSPOTS_DEFAULT,
+        metavar="N",
+        help=(
+            "Hotspots listés par espèce dans le résumé de fin de run "
+            "(défaut : %(default)s ; 0 = aucun). N'affecte ni la détection, "
+            "ni la carte, ni le CSV (qui contient tous les hotspots)."
+        ),
+    )
+    # Ancien nom de --console-hotspots, gardé pour les scripts existants
+    output_group.add_argument(
+        "--max-hotspots", type=int, dest="console_hotspots",
+        default=argparse.SUPPRESS, help=argparse.SUPPRESS,
+    )
+    output_group.add_argument(
+        "--map-hotspots", type=int, default=_MAP_HOTSPOTS_DEFAULT,
+        metavar="N",
+        help=(
+            "Hotspots numérotés affichés à l'ouverture de la carte, par "
+            "espèce (défaut : %(default)s ; réglable ensuite dans le "
+            "panneau)."
+        ),
     )
     output_group.add_argument(
         "--debug-layers", action="store_true",
@@ -1590,12 +1959,19 @@ Exemples d'utilisation :
         help="Ignorer les avertissements (poids, taille grille...).",
     )
     special_group.add_argument(
-        "--verbose", action="store_true",
-        help="Activer les logs de niveau DEBUG.",
+        "-v", "--verbose", action="store_true",
+        help=(
+            "Afficher tout le détail (DEBUG, horodaté) à l'écran — par "
+            "défaut, seulement les étapes, les avertissements et le résumé ; "
+            "le détail va toujours dans cartomorilles.log."
+        ),
     )
     special_group.add_argument(
         "--no-weather", action="store_true", dest="no_weather",
-        help="Désactiver la modulation météo (mode hors-ligne).",
+        help=(
+            "Ne pas moduler les scores par la météo du jour (sinon facteur "
+            f"{_WEATHER_FACTOR_MIN:.1f} à 1.0 selon Meteoblue ; utile hors ligne)."
+        ),
     )
 
     return parser
@@ -1606,8 +1982,14 @@ Exemples d'utilisation :
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    _ensure_utf8_stdout()
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.console_hotspots < 0:
+        parser.error("--console-hotspots doit être ≥ 0")
+    if args.map_hotspots < 1:
+        parser.error("--map-hotspots doit être ≥ 1")
 
     if args.no_urban and hasattr(args, "urban_buffer"):
         args.urban_buffer = 0
