@@ -1004,7 +1004,7 @@ def save_hotspots_gpx(
 
     ET.indent(root)
     ET.ElementTree(root).write(gpx_path, encoding="utf-8", xml_declaration=True)
-    logger.info("🧭 Hotspots GPX : %s (%d points)", gpx_path, len(best))
+    logger.debug("🧭 Hotspots GPX : %s (%d points)", gpx_path, len(best))
     return gpx_path
 
 
