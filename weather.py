@@ -5,7 +5,8 @@ usage non commercial. Au point MAP_CENTER : 14 jours d'historique
 (``past_days``) + 7 jours de prévision. Le sol (température vers 10 cm,
 humidité 3–9 cm) vient des variables horaires, moyennées par jour ; son
 réchauffement sur 7 jours multiplie le score du jour (×0,5–1), ce qui
-sépare le printemps de l'automne (D42).
+sépare le printemps de l'automne (D42). Chaque jour reçoit la classe de
+la carte : les 6 classes ``config.PROBABILITY_*`` (D44).
 """
 
 from __future__ import annotations
@@ -22,7 +23,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import numpy as np
 import requests
 
-from config import ALTITUDE_OPTIMAL, MAP_CENTER
+from config import (
+    ALTITUDE_OPTIMAL,
+    MAP_CENTER,
+    PROBABILITY_LABELS,
+    PROBABILITY_THRESHOLDS,
+)
 
 logger = logging.getLogger("cartomorilles.weather")
 
@@ -102,13 +108,9 @@ _BURST_BONUS: float = 0.12           # bonus score jour standard
 _BURST_BONUS_INTENSE: float = 0.20   # bonus score choc marqué
 _BURST_BONUS_THERMAL: float = 0.06   # bonus supplémentaire si réchauffement
 
-_PROSPECTING_LABELS = MappingProxyType({
-    4: "🟢 Excellent",
-    3: "🟡 Bon",
-    2: "🟠 Moyen",
-    1: "🔴 Défavorable",
-    0: "⛔ Très défavorable",
-})
+# Classes du jour = celles de la carte (D44) ; « favorable » = Bon et +
+_GOOD_LEVEL: int = PROBABILITY_LABELS.index("Bon")
+_LABEL_WIDTH: int = max(len(s) for s in PROBABILITY_LABELS)
 
 _JOURS_FR = (
     "lundi", "mardi", "mercredi", "jeudi",
@@ -243,8 +245,8 @@ class ProspectingDay:
     date: str
     date_fr: str
     score: float
-    level: int
-    label: str
+    level: int    # classe : index dans config.PROBABILITY_LABELS
+    label: str    # config.PROBABILITY_LABELS[level]
     details: tuple[str, ...]
     forecast: DayForecast
     burst: BurstSignal | None
@@ -389,14 +391,16 @@ class WeatherChecker:
                 delta = f"{warming:+.1f}".replace(".", ",")
                 details.append(f"{trend} ({delta}°C en 7 j → ×{mult})")
 
+            # Classe du score arrondi : celle que la carte recalculerait
+            score = round(score, 3)
             level = self._score_to_level(score)
-            label = _PROSPECTING_LABELS[level]
+            label = PROBABILITY_LABELS[level]
             date_fr = _format_date_fr(fc.date)
             results.append(
                 ProspectingDay(
                     date=fc.date,
                     date_fr=date_fr,
-                    score=round(score, 3),
+                    score=score,
                     level=level,
                     label=label,
                     details=tuple(details),
@@ -413,12 +417,12 @@ class WeatherChecker:
                 "; ".join(details),
             )
 
-        excellent = sum(1 for r in results if r.level >= 3)
+        favorable = sum(1 for r in results if r.level >= _GOOD_LEVEL)
         bursts = sum(1 for r in results if r.burst is not None)
         logger.info(
-            "📊 Prospection : %d/%d jours favorables (bon+), "
+            "📊 Prospection : %d/%d jours favorables (Bon ou Excellent), "
             "%d signaux fructification",
-            excellent,
+            favorable,
             len(results),
             bursts,
         )
@@ -438,7 +442,8 @@ class WeatherChecker:
             fc = d.forecast
             burst_tag = " 🍄" if d.burst else ""
             lines.append(
-                f"  {d.date_fr:<22s}  {d.label}{burst_tag:<22s}  "
+                f"  {d.date_fr:<22s}  "
+                f"{d.label:<{_LABEL_WIDTH}s}{burst_tag:<3s}  "
                 f"score={d.score:.2f}  "
                 f"T={_num(fc.temperature_min)}/{_num(fc.temperature_max)}°C  "
                 f"P={_num(fc.precipitation)}mm  "
@@ -469,7 +474,7 @@ class WeatherChecker:
                 )
             lines.append("")
 
-        best = [d for d in days if d.level >= 3]
+        best = [d for d in days if d.level >= _GOOD_LEVEL]
         if best:
             lines.append(
                 f"  🍄 Meilleurs jours : "
@@ -803,15 +808,8 @@ class WeatherChecker:
 
     @staticmethod
     def _score_to_level(score: float) -> int:
-        if score >= 0.75:
-            return 4
-        if score >= 0.55:
-            return 3
-        if score >= 0.40:
-            return 2
-        if score >= 0.25:
-            return 1
-        return 0
+        """Classe de la carte : index dans config.PROBABILITY_LABELS."""
+        return int(np.digitize(score, PROBABILITY_THRESHOLDS))
 
     # ------------------------------------------------------------------
     # API / cache

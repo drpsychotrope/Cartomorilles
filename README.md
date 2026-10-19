@@ -160,7 +160,7 @@ Post-traitement :
 2. **Pénalité de monotonie** (terrain uniforme).
 3. **Pénalité calc-dry** (chênaies/buis xérothermophiles, morille seulement).
 4. **Lissage gaussien spatial** (sigma configurable, défaut 0,5).
-5. **Modulation météo** multiplicative : scores × (0,4 + 0,6 × score météo du jour Meteoblue), sauf `--no-weather` ou API indisponible — signalée dans le résumé console et dans `rapport_{species}.json`.
+5. **Modulation météo** multiplicative : scores × (0,4 + 0,6 × score météo du jour Open-Meteo), sauf `--no-weather` ou API indisponible — signalée dans le résumé console et dans `rapport_{species}.json`.
 6. **Classification en 6 classes** : Nul / Très faible / Faible / Moyen / Bon / Excellent (seuils 0,15 · 0,30 · 0,45 · 0,60 · 0,75).
 
 La sortie est validée contre des points de contrôle terrain par espèce (taux de concordance reporté en fin de run).

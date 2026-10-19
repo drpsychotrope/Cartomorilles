@@ -1171,6 +1171,8 @@ class MorilleVisualizer:
         .cs-wx .wx-bad   { color: #5f5f5f; }
         .cs-wx .wx-burst { color: #0b5394; margin-top: 4px; font-weight: 600; }
         .cs-wx .wx-best  { margin-top: 4px; }
+        .cs-wx .wx-credit { margin-top: 6px; font-size: 11px; color: #4a554a; }
+        .cs-wx .wx-credit a { color: #1a5fb4; }
         .cs-readout {
             position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
             z-index: 1001; max-width: calc(100% - 20px); padding: 5px 12px;
@@ -2101,8 +2103,9 @@ class MorilleVisualizer:
     # ──────────────────────────────────────────────────────
     def _weather_section_html(self) -> str:
         """Section météo du panneau ('' sans données). Même échelle que la
-        carte : la classe du jour est recalculée depuis le score avec
-        config.PROBABILITY_* (weather.py garde ses propres 5 niveaux)."""
+        carte : weather.py classe chaque jour dans les 6 classes
+        config.PROBABILITY_* (D44). Crédit Open-Meteo exigé par la licence
+        CC BY 4.0 des données (D42)."""
         if not self._weather_days:
             return ""
 
@@ -2113,8 +2116,8 @@ class MorilleVisualizer:
         best_score = -1.0
         for d in self._weather_days:
             score = float(d.score)
-            level = int(np.digitize(score, config.PROBABILITY_THRESHOLDS))
-            label = html.escape(config.PROBABILITY_LABELS[level])
+            level = int(d.level)
+            label = html.escape(str(d.label))
             date_str = html.escape(str(d.date_fr))
             # Icône : favorable (Bon et +), moyen, défavorable
             if level >= good:
@@ -2157,11 +2160,20 @@ class MorilleVisualizer:
                 f"</div>"
             )
 
+        credit_html = (
+            '<div class="wx-credit">Données météo : '
+            '<a href="https://open-meteo.com/" target="_blank" '
+            'rel="noopener">Open-Meteo.com</a> '
+            '(<a href="https://creativecommons.org/licenses/by/4.0/" '
+            'target="_blank" rel="noopener">CC BY 4.0</a>)'
+            "</div>"
+        )
+
         logger.info("✅ Panneau météo : %d jours affichés", len(self._weather_days))
         return (
             '<section class="cs-section cs-wx">'
             "<h2>Météo pour les morilles</h2>"
-            f"<table>{rows}</table>{burst_html}{best_html}"
+            f"<table>{rows}</table>{burst_html}{best_html}{credit_html}"
             "</section>"
         )
 

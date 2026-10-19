@@ -5,7 +5,7 @@
    département élargi (107×131 km, Lambert-93).
 
    Analyse multicritère spatialisée : 14 critères pondérés par espèce,
-   masques éliminatoires, lissage, modulation météo du jour (Meteoblue).
+   masques éliminatoires, lissage, modulation météo du jour (Open-Meteo).
    Maille automatique selon l'emprise : 50 m pour le département
    (~5,6 M cellules) ; --cell-size pour la forcer.
    Sources : MNT Copernicus, IGN BD Forêt v2, BRGM BDCharm-50, IFN 1997
@@ -42,7 +42,6 @@ import csv
 import io
 import json
 import logging
-import re
 import signal
 import sys
 import time
@@ -1090,7 +1089,7 @@ def _weather_multiplier(day_score: float) -> float:
 
 
 def _weather_failure_reason(exc: BaseException) -> str:
-    """Cause courte d'un échec météo, sans l'URL (elle contient la clé API)."""
+    """Cause courte d'un échec météo, pour le résumé console."""
     if isinstance(exc, requests.Timeout):
         return "délai dépassé"
     if isinstance(exc, requests.ConnectionError):
@@ -1631,10 +1630,7 @@ def main(args: argparse.Namespace) -> int:
             days = WeatherChecker().evaluate()
         except Exception as exc:
             reason = _weather_failure_reason(exc)
-            logger.debug(
-                "Météo indisponible : %s",
-                re.sub(r"apikey=[^&\s'\"]+", "apikey=***", repr(exc)),
-            )
+            logger.debug("Météo indisponible : %r", exc)
         if days:
             weather_days = days
             today = days[0]
@@ -2145,7 +2141,7 @@ Exemples d'utilisation :
         "--no-weather", action="store_true", dest="no_weather",
         help=(
             "Ne pas moduler les scores par la météo du jour (sinon facteur "
-            f"{_WEATHER_FACTOR_MIN:.1f} à 1.0 selon Meteoblue ; utile hors ligne)."
+            f"{_WEATHER_FACTOR_MIN:.1f} à 1.0 selon Open-Meteo ; utile hors ligne)."
         ),
     )
 
