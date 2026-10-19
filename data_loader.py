@@ -1577,10 +1577,15 @@ class DataLoader:
                      source, total, n, 100 * total / n)
 
         if total < n:
+            # Limite connue des données (filons, faciès rares) → score
+            # « unknown » ; pas un avertissement à chaque run.
             unresolv = gdf.loc[~resolved, "DESCR"].value_counts().head(10)
-            logger.warning("  Non résolues (%d) :", n - total)
+            logger.info(
+                "  Non résolues (%d) → score « unknown » — top 10 en DEBUG",
+                n - total,
+            )
             for val, cnt in unresolv.items():
-                logger.warning("    [%d] %r", cnt, val)
+                logger.debug("    [%d] %r", cnt, val)
 
         return gdf
 
