@@ -676,8 +676,9 @@ class MorilleVisualizer:
             },
         }
 
-    def _inside_study_area(self, hotspots: list[dict[str, Any]]) -> np.ndarray:
-        """Hotspots (centroïdes L93) situés dans l'emprise d'étude."""
+    def inside_study_area(self, hotspots: list[dict[str, Any]]) -> np.ndarray:
+        """Hotspots (centroïdes L93) situés dans l'emprise d'étude — même
+        filtre pour la carte et l'export GPX de main.py."""
         if self._study_area is None or not hotspots:
             return np.ones(len(hotspots), dtype=bool)
         xs = np.array([float(h["x_l93"]) for h in hotspots])
@@ -999,7 +1000,7 @@ class MorilleVisualizer:
         )
         n_out = {
             sp: int(np.count_nonzero(
-                ~self._inside_study_area(self.hotspots_by_species.get(sp, [])),
+                ~self.inside_study_area(self.hotspots_by_species.get(sp, [])),
             ))
             for sp in self.species_list
         }
@@ -2174,7 +2175,7 @@ class MorilleVisualizer:
         payload: dict[str, list[dict[str, Any]]] = {}
         for species in self.species_list:
             sp_hotspots = self.hotspots_by_species.get(species, [])
-            inside = self._inside_study_area(sp_hotspots)
+            inside = self.inside_study_area(sp_hotspots)
             records: list[dict[str, Any]] = []
             for rank, h in enumerate(sp_hotspots, 1):
                 if len(records) >= self.max_hotspot_markers:

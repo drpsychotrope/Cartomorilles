@@ -37,7 +37,6 @@ import signal
 import sys
 import time
 import xml.etree.ElementTree as ET
-from bisect import bisect_right
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
@@ -760,19 +759,25 @@ def save_hotspots_gpx(
     hotspots: list[dict[str, Any]],
     species: str = "esculenta",
     max_waypoints: int = GPX_MAX_WAYPOINTS,
+    inside: np.ndarray | None = None,
 ) -> Path:
     """Exporte les meilleurs hotspots en GPX 1.1 (un waypoint chacun) pour
     les applis GPS — `{species}_hotspots.gpx`, à côté du CSV.
 
     Le waypoint « Morille n°3 » est le hotspot n°3 de la carte et du CSV.
+    `inside` (masque booléen aligné sur `hotspots`) écarte, comme la carte,
+    les hotspots hors de la zone étudiée (D39) ; les numéros restent ceux
+    du CSV.
     """
     gpx_path = output_dir / f"{species}_hotspots.gpx"
-    common = str(
-        config.SPECIES_PARAMS.get(species, {}).get("common_name", species),
+    common = str(config.get_species_params(species).get("common_name", species))
+    keep = (
+        np.ones(len(hotspots), dtype=bool) if inside is None
+        else np.asarray(inside, dtype=bool)
     )
-    labels = list(config.PROBABILITY_LABELS)
-    thresholds = [float(t) for t in config.PROBABILITY_THRESHOLDS]
-    best = hotspots[:max_waypoints]
+    ranked = [(rank, h) for rank, h in enumerate(hotspots, 1) if keep[rank - 1]]
+    best = ranked[:max_waypoints]
+    n_out = len(hotspots) - len(ranked)
 
     def tag(name: str) -> str:
         return f"{{{_GPX_NS}}}{name}"
@@ -784,18 +789,20 @@ def save_hotspots_gpx(
     meta = ET.SubElement(root, tag("metadata"))
     ET.SubElement(meta, tag("name")).text = (
         f"Cartomorilles — {common} : meilleurs hotspots "
-        f"({len(best)} sur {len(hotspots)})"
+        f"({len(best)} sur {len(ranked)})"
     )
     ET.SubElement(meta, tag("desc")).text = (
         "Triés par score moyen décroissant ; numéros identiques à la "
         "carte HTML et au CSV."
+        + (f" {n_out} hotspot(s) hors zone étudiée écarté(s), comme sur la "
+           "carte." if n_out else "")
     )
     ET.SubElement(meta, tag("time")).text = (
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     )
 
     # Ordre des enfants imposé par le schéma GPX 1.1 : ele, name, desc, type
-    for rank, h in enumerate(best, 1):
+    for rank, h in best:
         e = hotspot_to_export_dict(h, rank=rank)
         wpt = ET.SubElement(
             root, tag("wpt"), {"lat": f"{e['lat']:.5f}", "lon": f"{e['lon']:.5f}"},
@@ -807,8 +814,7 @@ def save_hotspots_gpx(
 
         score = float(h.get("mean_score", 0.0))
         facts = [
-            f"Score moyen {_fr_decimal(score, 2)} "
-            f"({labels[bisect_right(thresholds, score)]})",
+            f"Score moyen {_fr_decimal(score, 2)} ({_score_class(score)})",
             _area_text(float(h.get("size_m2", 0.0))),
         ]
         slope = h.get("mean_slope")
@@ -1509,7 +1515,10 @@ def main(args: argparse.Namespace) -> int:
         )
         save_hotspots_csv(output_dir, sp_hotspots, species=sp)
         try:
-            save_hotspots_gpx(output_dir, sp_hotspots, species=sp)
+            save_hotspots_gpx(
+                output_dir, sp_hotspots, species=sp,
+                inside=viz.inside_study_area(sp_hotspots),
+            )
         except OSError as e:
             logger.warning("GPX [%s] échoué : %s", sp, e)
 

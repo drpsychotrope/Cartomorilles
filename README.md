@@ -82,7 +82,7 @@ Garde-fous : avertissement à 50 M cellules (TWI > 5 min), limite dure à 200 M 
 - `cartomorilles.html` — carte interactive : panneau latéral (espèce, légende-filtre par classe, opacité, hotspots numérotés, fonds et couches, météo), lecture du score au survol ou au toucher, popup du point touché (coordonnées à copier, liens *Itinéraire* et *Google Maps*) et bouton *Me localiser*
 - `{species}_probability.tif` — raster GeoTIFF par espèce (+ alias `morilles_probability.tif`)
 - `{species}_hotspots.csv` — hotspots triés par score, avec lien Google Maps
-- `{species}_hotspots.gpx` — les 20 meilleurs hotspots en waypoints GPX pour les applis GPS (« Morille n°3 » = hotspot n°3 de la carte et du CSV)
+- `{species}_hotspots.gpx` — les 20 meilleurs hotspots de la zone étudiée, en waypoints GPX pour les applis GPS (« Morille n°3 » = hotspot n°3 de la carte et du CSV)
 - `rapport_{species}.json` — rapport complet et reproductible (config, stats, validation terrain)
 - `cartomorilles.log` — journal détaillé
 - `{species}_grid.gpkg` — grille vecteur (avec `--export-vector`)
@@ -93,14 +93,14 @@ Garde-fous : avertissement à 50 M cellules (TWI > 5 min), limite dure à 200 M 
 - **Pour un usage sans réseau fiable**, importer `{species}_hotspots.gpx` dans une appli GPS à cartes hors ligne (OsmAnd, Organic Maps, IGNrando', Locus Map, Garmin…).
 - **Ce que la carte HTML contient** : scores, pente et altitude (images intégrées), hotspots, cours d'eau, observations iNaturalist. **Ce qu'elle va chercher sur Internet** :
   - les fonds de carte (IGN Géoplateforme `data.geopf.fr`, OpenStreetMap, Esri, OpenTopoMap) ;
-  - les bibliothèques que Folium charge depuis des CDN : Leaflet, Bootstrap 5, Font Awesome et leaflet-measure (`cdn.jsdelivr.net`), jQuery (`code.jquery.com`), Leaflet.awesome-markers (`cdnjs.cloudflare.com`), glyphicons Bootstrap 3 (`netdna.bootstrapcdn.com`, ancien CDN MaxCDN, encore en service).
+  - les bibliothèques que Folium charge d'office depuis des CDN : Leaflet, Bootstrap 5, Font Awesome et leaflet-measure (`cdn.jsdelivr.net`), jQuery (`code.jquery.com`), Leaflet.awesome-markers (`cdnjs.cloudflare.com`), glyphicons Bootstrap 3 (`netdna.bootstrapcdn.com`, ancien CDN MaxCDN, encore en service).
 - **Hors ligne, selon ce qui manque** (vérifié en rendant ces hôtes injoignables) :
 
   | Indisponible | Effet |
   |---|---|
   | Fonds de carte | Fond gris hors des tuiles déjà en cache ; probabilité, hotspots, lecture, popups et localisation fonctionnent |
-  | `netdna.bootstrapcdn.com` | Points de repère sans pictogramme ; tout le reste fonctionne |
-  | `cdnjs.cloudflare.com` | Le script Folium s'arrête aux points de repère : repères et outil de mesure absents, vue de départ non recadrée ; probabilité, hotspots, lecture et localisation fonctionnent |
+  | `netdna.bootstrapcdn.com`, `cdnjs.cloudflare.com` | Aucun effet : ces bibliothèques ne servent plus à la carte (repères dessinés sans icône Folium) |
+  | `code.jquery.com` | Folium construit ses popups avec jQuery : son script s'arrête à la première observation iNaturalist. Observations, points de repère et outil de mesure manquent, la vue de départ n'est pas recadrée ; probabilité, hotspots, lecture, popup du point et localisation fonctionnent |
   | Tout (`cdn.jsdelivr.net` compris) | Pas de carte : Leaflet manque, le bandeau du bas affiche « Carte indisponible hors ligne » |
 
   Ouvrir la carte une fois en ligne avant de partir, en parcourant les zones et zooms utiles, laisse ces fichiers dans le cache du navigateur. Ce n'est pas garanti : le navigateur, surtout sur mobile, peut vider ce cache.
