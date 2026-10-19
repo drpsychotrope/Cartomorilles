@@ -115,7 +115,12 @@ def occurrences_by_species(
     """Occurrences par espèce : iNaturalist (pour INAT_SPECIES) puis GBIF,
     sans les doublons iNaturalist de GBIF."""
     species = list(species_list)
-    inat = inat_occurrences(inat_observations)
+    # La requête iNaturalist « Morchella » ramène aussi Verpa bohemica
+    # (synonyme Morchella bohemica) : hors genre, pas une morille.
+    inat = [
+        o for o in inat_occurrences(inat_observations)
+        if o["taxon"].split()[0] == "Morchella"
+    ]
     gbif = fetch_gbif_occurrences(species, bbox_wgs84, cache_dir=cache_dir)
     return {
         sp: (inat if sp == INAT_SPECIES else [])
