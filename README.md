@@ -160,4 +160,4 @@ Les choix de conception (algorithme TWI, champ géologie, planchers de score, re
 
 ---
 
-🍄 *Bonne prospection !*
+🧺 *Bonne prospection !*

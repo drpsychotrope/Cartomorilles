@@ -409,11 +409,12 @@ def _display_label(value: Any) -> str | None:
 
 
 def _species_label(species: str) -> str:
-    """« 🍄 Morille (esculenta) »."""
+    """« Morille (Morchella esculenta) » — sans emoji d'espèce : 🍄 est
+    l'amanite tue-mouches, 🌰 une châtaigne (essence du modèle)."""
     params = config.SPECIES_PARAMS.get(species, {})
     return (
-        f"{params.get('emoji', '🍄')} "
-        f"{params.get('common_name', species)} ({species})"
+        f"{params.get('common_name', species)} "
+        f"({params.get('scientific_name', species)})"
     )
 
 
@@ -1723,7 +1724,7 @@ def main(args: argparse.Namespace) -> int:
         logger.info("🗺️  Carte : %s  (--open pour l'ouvrir)", map_uri)
 
     logger.info("")
-    logger.info("🍄 Bonne prospection !")
+    logger.info("🧺 Bonne prospection !")
 
     _cleanup_files.clear()
 
