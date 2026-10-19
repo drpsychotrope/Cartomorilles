@@ -1,9 +1,1 @@
-{
-  "weather.py": {
-    "filename": "weather.py",
-    "session_name": "weather",
-    "lock_type": "exclusive",
-    "locked_at": "2026-03-26T13:02:57.970614+00:00",
-    "file_hash_at_lock": "d41d8cd98f"
-  }
-}
+{}

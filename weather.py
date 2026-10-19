@@ -1,12 +1,20 @@
-"""weather.py — Alertes météo pour prospection morilles (Meteoblue)."""
+"""weather.py — Alertes météo pour prospection morilles (Open-Meteo).
+
+Source : API Open-Meteo ``/v1/forecast`` (https://open-meteo.com), sans clé,
+usage non commercial. Au point MAP_CENTER : 14 jours d'historique
+(``past_days``) + 7 jours de prévision. Le sol (température vers 10 cm,
+humidité 3–9 cm) vient des variables horaires, moyennées par jour ; son
+réchauffement sur 7 jours multiplie le score du jour (×0,5–1), ce qui
+sépare le printemps de l'automne (D42).
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
-import os
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 
@@ -21,11 +29,28 @@ logger = logging.getLogger("cartomorilles.weather")
 # Constantes
 # ---------------------------------------------------------------------------
 
-_METEOBLUE_BASE_URL = "https://my.meteoblue.com/packages/basic-day"
-_API_KEY_ENV = "METEOBLUE_API_KEY"
-_API_KEY_DEFAULT = "QEIkHCy5dvuctmA7"
+_OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+_TIMEZONE = "Europe/Paris"
+_PAST_DAYS: int = 14       # historique : pluie J-3..J-1, choc hydrique, réchauffement du sol
+_FORECAST_DAYS: int = 7    # aujourd'hui → J+6
+_DAILY_VARS: tuple[str, ...] = (
+    "temperature_2m_max",
+    "temperature_2m_min",
+    "temperature_2m_mean",
+    "precipitation_sum",
+    "precipitation_probability_max",
+    "relative_humidity_2m_mean",
+    "wind_speed_10m_mean",
+)
+_HOURLY_VARS: tuple[str, ...] = (
+    "soil_temperature_6cm",
+    "soil_temperature_18cm",
+    "soil_moisture_3_to_9cm",
+)
 
 _CACHE_DIR = Path("data")
+_CACHE_FILE = "openmeteo_cache.json"
+_CACHE_SOURCE = "open-meteo"
 _CACHE_MAX_AGE_S = 3600  # 1 h
 
 # Seuils prospection morilles
@@ -37,6 +62,29 @@ _PRECIP_DAY_MAX: float = 5.0
 _HUMIDITY_OPTIMAL: tuple[float, float] = (60.0, 90.0)
 _WIND_OPTIMAL: float = 15.0
 _WIND_MAX: float = 25.0
+
+# Sol (moyennes journalières des valeurs horaires)
+_SOIL_DEPTH_CM: float = 10.0                 # profondeur des relevés publiés (5–10 cm)
+_SOIL_TEMP_OPTIMAL: tuple[float, float] = (8.0, 12.0)
+_SOIL_TEMP_RANGE: tuple[float, float] = (4.0, 18.0)
+_SOIL_WARMING_WINDOW: int = 7                # jours : J-6..J contre J-13..J-7
+_SOIL_WARMING_FULL: float = 1.5              # °C d'écart : +1,5 → ×1 ; −1,5 → ×plancher
+_SOIL_WARMING_FLOOR: float = 0.5             # facteur quand le sol refroidit (automne)
+_SOIL_MOISTURE_OPTIMAL: tuple[float, float] = (0.20, 0.40)  # m³/m³, 3–9 cm
+_SOIL_MOISTURE_DRY: float = 0.10             # m³/m³ → score plancher 0,1
+_SOIL_MOISTURE_WET: float = 0.50             # m³/m³ → score plancher 0,5 (sol saturé)
+
+# Poids du score du jour (somme = 1) ; le réchauffement du sol est un facteur
+_WEIGHTS = MappingProxyType({
+    "soil_temperature": 0.30,
+    "soil_moisture": 0.15,
+    "temperature": 0.15,
+    "frost": 0.15,
+    "precip_day": 0.10,
+    "precip_recent": 0.05,
+    "humidity": 0.05,
+    "wind": 0.05,
+})
 
 # Choc hydrique → explosion de fructification
 _BURST_RAIN_WINDOW: int = 3          # jours de pluie à observer
@@ -78,6 +126,55 @@ def _format_date_fr(iso_date: str) -> str:
     return f"{_JOURS_FR[d.weekday()]} {d.day} {_MOIS_FR[d.month]}"
 
 
+def _local_today(utc_offset_s: float) -> str:
+    """Date du jour (ISO) dans le fuseau de la réponse Open-Meteo."""
+    now = datetime.now(tz=timezone.utc) + timedelta(seconds=utc_offset_s)
+    return now.date().isoformat()
+
+
+def _age_text(fetched_at: float) -> str:
+    """Âge d'un horodatage UTC : 'il y a 3 h' / 'il y a 2 j'."""
+    age_h = (datetime.now(tz=timezone.utc).timestamp() - fetched_at) / 3600
+    if age_h < 48:
+        return f"il y a {age_h:.0f} h"
+    return f"il y a {age_h / 24:.0f} j"
+
+
+def _trapezoid(x: float, rlo: float, lo: float, hi: float, rhi: float) -> float:
+    """1 sur [lo, hi], 0 hors ]rlo, rhi[, linéaire entre les deux."""
+    if lo <= x <= hi:
+        return 1.0
+    if x <= rlo or x >= rhi:
+        return 0.0
+    if x < lo:
+        return (x - rlo) / (lo - rlo)
+    return (rhi - x) / (rhi - hi)
+
+
+def _soil_temperature_10cm(
+    t6: float | None, t18: float | None
+) -> float | None:
+    """Température du sol à 10 cm, interpolée entre 6 et 18 cm."""
+    if t6 is None:
+        return t18
+    if t18 is None:
+        return t6
+    return t6 + (t18 - t6) * (_SOIL_DEPTH_CM - 6.0) / (18.0 - 6.0)
+
+
+def _daily_means(hourly: dict[str, object], key: str) -> dict[str, float]:
+    """Moyenne journalière d'une variable horaire : {'AAAA-MM-JJ': valeur}."""
+    times = hourly.get("time")
+    values = hourly.get(key)
+    if not isinstance(times, list) or not isinstance(values, list):
+        return {}
+    by_day: dict[str, list[float]] = {}
+    for t, v in zip(times, values):
+        if v is not None:
+            by_day.setdefault(str(t)[:10], []).append(float(v))
+    return {d: float(np.mean(vs)) for d, vs in by_day.items()}
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -85,7 +182,7 @@ def _format_date_fr(iso_date: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class DayForecast:
-    """Prévision journalière Meteoblue."""
+    """Journée Open-Meteo (passée ou prévue) au point MAP_CENTER."""
 
     date: str
     temperature_max: float
@@ -95,7 +192,8 @@ class DayForecast:
     precipitation_probability: float
     relativehumidity_mean: float
     windspeed_mean: float
-    predictability: float
+    soil_temperature: float | None   # °C vers 10 cm (interpolé 6/18 cm)
+    soil_moisture: float | None      # m³/m³, 3–9 cm
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,60 +227,105 @@ class ProspectingDay:
 
 
 class WeatherChecker:
-    """Check météo locale pour prospection morilles via Meteoblue."""
+    """Check météo locale pour prospection morilles via Open-Meteo (sans clé)."""
 
     def __init__(
         self,
-        api_key: str | None = None,
         lat: float | None = None,
         lon: float | None = None,
         cache_dir: Path | None = None,
+        offline: bool = False,
     ) -> None:
-        self._api_key = (
-            api_key
-            or os.environ.get(_API_KEY_ENV)
-            or _API_KEY_DEFAULT
-        )
         self._lat = lat if lat is not None else float(MAP_CENTER["lat"])
         self._lon = lon if lon is not None else float(MAP_CENTER["lon"])
-        self._cache_file = (cache_dir or _CACHE_DIR) / "weather_cache.json"
-        self._forecasts: list[DayForecast] = []
+        self._cache_file = (cache_dir or _CACHE_DIR) / _CACHE_FILE
+        self._offline = offline
+        self._series: list[DayForecast] = []     # historique + prévisions
+        self._today_idx: int = 0
+        self._forecasts: list[DayForecast] = []  # aujourd'hui → J+6
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
 
     def fetch(self, use_cache: bool = True) -> list[DayForecast]:
-        """Récupère les prévisions 7 jours."""
-        if use_cache:
-            cached = self._load_cache()
-            if cached is not None:
-                self._forecasts = cached
-                logger.info(
-                    "✅ Météo : cache valide (%d jours)", len(cached)
-                )
-                return cached
+        """
+        Récupère l'historique et les prévisions ; renvoie les jours
+        à partir d'aujourd'hui.
 
-        raw = self._fetch_api()
-        self._forecasts = self._parse_response(raw)
+        Ordre : cache de moins d'une heure → API Open-Meteo → hors ligne,
+        dernier cache tant qu'il couvre aujourd'hui. ``offline=True``
+        n'appelle jamais le réseau.
+        """
+        cached = self._load_cache()
+
+        if self._offline:
+            if cached is None:
+                raise RuntimeError("Météo hors ligne : aucun cache Open-Meteo")
+            self._use(cached[1])
+            logger.info(
+                "✅ Météo hors ligne : cache %s (%d jours)",
+                _age_text(cached[0]),
+                len(self._forecasts),
+            )
+            return self._forecasts
+
+        if use_cache and cached is not None:
+            age = datetime.now(tz=timezone.utc).timestamp() - cached[0]
+            if age > _CACHE_MAX_AGE_S:
+                logger.debug("   Cache météo expiré (%.0fs)", age)
+            else:
+                try:
+                    self._use(cached[1])
+                except RuntimeError as exc:
+                    logger.debug("   Cache météo écarté : %s", exc)
+                else:
+                    logger.info(
+                        "✅ Météo : cache valide (%d jours)",
+                        len(self._forecasts),
+                    )
+                    return self._forecasts
+
+        try:
+            raw = self._fetch_api()
+        except (requests.RequestException, RuntimeError) as exc:
+            if cached is None:
+                raise
+            try:
+                self._use(cached[1])
+            except RuntimeError:
+                raise exc from None
+            logger.warning(
+                "⚠️ Météo hors ligne (%s) : prévisions du cache %s",
+                type(exc).__name__,
+                _age_text(cached[0]),
+            )
+            return self._forecasts
+
+        self._use(raw)
         self._save_cache(raw)
         logger.info(
-            "✅ Météo : %d jours récupérés via API", len(self._forecasts)
+            "✅ Météo : %d jours récupérés via Open-Meteo "
+            "(+%d jours d'historique)",
+            len(self._forecasts),
+            self._today_idx,
         )
         return self._forecasts
 
     def evaluate(self) -> list[ProspectingDay]:
-        """Évalue chaque jour pour la prospection morilles."""
+        """Évalue chaque jour (aujourd'hui → J+6) pour la prospection morilles."""
         if not self._forecasts:
             self.fetch()
 
         results: list[ProspectingDay] = []
+        series = self._series
 
-        for i, fc in enumerate(self._forecasts):
-            score, details = self._score_day(fc, i, self._forecasts)
+        for i in range(self._today_idx, len(series)):
+            fc = series[i]
+            score, details = self._score_day(fc, i, series)
 
             # Détection choc hydrique → fructification
-            burst = self._detect_burst(fc, i, self._forecasts)
+            burst = self._detect_burst(fc, i, series)
             if burst is not None:
                 score = float(np.clip(score + burst.bonus, 0.0, 1.0))
                 details.append(
@@ -194,6 +337,21 @@ class WeatherChecker:
                     details.append(
                         f"🌡️ Réchauffement +{burst.temp_delta:.0f}°C"
                     )
+
+            # Réchauffement du sol sur 7 jours : printemps ×1, automne ×0,5
+            warming = self._soil_warming(i, series)
+            if warming is not None:
+                factor = self._soil_warming_factor(warming)
+                score *= factor
+                if warming >= 0.5:
+                    trend = "Sol qui se réchauffe"
+                elif warming <= -0.5:
+                    trend = "Sol qui se refroidit"
+                else:
+                    trend = "Sol stable"
+                delta = f"{warming:+.1f}".replace(".", ",")
+                mult = f"{factor:.2f}".replace(".", ",")
+                details.append(f"{trend} ({delta}°C en 7 j → ×{mult})")
 
             level = self._score_to_level(score)
             label = _PROSPECTING_LABELS[level]
@@ -247,7 +405,8 @@ class WeatherChecker:
                 f"T={fc.temperature_min:.0f}/{fc.temperature_max:.0f}°C  "
                 f"P={fc.precipitation:.0f}mm  "
                 f"H={fc.relativehumidity_mean:.0f}%  "
-                f"V={fc.windspeed_mean:.0f}km/h"
+                f"V={fc.windspeed_mean:.0f}km/h  "
+                f"{WeatherChecker._soil_text(fc)}"
             )
             if d.details:
                 lines.append(
@@ -282,6 +441,21 @@ class WeatherChecker:
             lines.append("  ⚠️ Aucun jour favorable cette semaine")
         lines.append("")
         return "\n".join(lines)
+
+    @staticmethod
+    def _soil_text(fc: DayForecast) -> str:
+        """'Sol=9°C/36%' (température vers 10 cm / eau 3–9 cm)."""
+        temp = (
+            f"{fc.soil_temperature:.0f}°C"
+            if fc.soil_temperature is not None
+            else "n/d"
+        )
+        water = (
+            f"{fc.soil_moisture * 100:.0f}%"
+            if fc.soil_moisture is not None
+            else "n/d"
+        )
+        return f"Sol={temp}/{water}"
 
     # ------------------------------------------------------------------
     # Détection explosion de fructification
@@ -374,48 +548,82 @@ class WeatherChecker:
         components: list[tuple[float, float]] = []
         details: list[str] = []
 
-        # 1. Température jour (poids 0.25)
+        # 1. Température du sol vers 10 cm — pousse vers 8–12 °C
+        if fc.soil_temperature is not None:
+            st_score = self._score_soil_temperature(fc.soil_temperature)
+            components.append((st_score, _WEIGHTS["soil_temperature"]))
+            if st_score >= 0.8:
+                details.append(
+                    f"Sol idéal ({fc.soil_temperature:.0f}°C à 10 cm)"
+                )
+            elif st_score < 0.3:
+                word = (
+                    "froid"
+                    if fc.soil_temperature < _SOIL_TEMP_OPTIMAL[0]
+                    else "chaud"
+                )
+                details.append(
+                    f"Sol {word} ({fc.soil_temperature:.0f}°C à 10 cm)"
+                )
+
+        # 2. Humidité du sol 3–9 cm
+        if fc.soil_moisture is not None:
+            components.append(
+                (self._score_soil_moisture(fc.soil_moisture),
+                 _WEIGHTS["soil_moisture"])
+            )
+            lo, hi = _SOIL_MOISTURE_OPTIMAL
+            if fc.soil_moisture < lo:
+                details.append(
+                    f"Sol sec ({fc.soil_moisture * 100:.0f}% d'eau)"
+                )
+            elif fc.soil_moisture > hi:
+                details.append(
+                    f"Sol détrempé ({fc.soil_moisture * 100:.0f}% d'eau)"
+                )
+
+        # 3. Température de l'air
         t_score = self._score_temperature(fc.temperature_mean)
-        components.append((t_score, 0.25))
+        components.append((t_score, _WEIGHTS["temperature"]))
         if t_score < 0.3:
             details.append(f"T° défavorable ({fc.temperature_mean:.0f}°C)")
         elif t_score >= 0.8:
             details.append(f"T° idéale ({fc.temperature_mean:.0f}°C)")
 
-        # 2. Gel nocturne (poids 0.20)
+        # 4. Gel nocturne
         frost_score = self._score_frost(fc.temperature_min)
-        components.append((frost_score, 0.20))
+        components.append((frost_score, _WEIGHTS["frost"]))
         if frost_score < 0.5:
             details.append(
                 f"⚠️ Gel nocturne ({fc.temperature_min:.0f}°C)"
             )
 
-        # 3. Précipitations jour — sec = mieux (poids 0.15)
+        # 5. Précipitations jour — sec = mieux
         precip_score = self._score_precip_day(fc.precipitation)
-        components.append((precip_score, 0.15))
+        components.append((precip_score, _WEIGHTS["precip_day"]))
         if fc.precipitation > _PRECIP_DAY_MAX:
             details.append(f"Pluie forte ({fc.precipitation:.0f}mm)")
 
-        # 4. Précipitations récentes J-3..J-1 — humidité sol (poids 0.20)
+        # 6. Précipitations récentes J-3..J-1 (historique inclus)
         recent_precip = self._recent_precipitation(idx, all_fc)
         recent_score = self._score_recent_precip(recent_precip)
-        components.append((recent_score, 0.20))
+        components.append((recent_score, _WEIGHTS["precip_recent"]))
         if recent_score >= 0.7:
-            details.append(f"Sol humide ({recent_precip:.0f}mm J-3)")
+            details.append(f"Pluie récente ({recent_precip:.0f}mm J-3)")
         elif recent_score < 0.3:
-            details.append(f"Sol sec ({recent_precip:.0f}mm J-3)")
+            details.append(f"Peu de pluie ({recent_precip:.0f}mm J-3)")
 
-        # 5. Humidité relative (poids 0.10)
+        # 7. Humidité relative
         hum_score = self._score_humidity(fc.relativehumidity_mean)
-        components.append((hum_score, 0.10))
+        components.append((hum_score, _WEIGHTS["humidity"]))
 
-        # 6. Vent (poids 0.10)
+        # 8. Vent
         wind_score = self._score_wind(fc.windspeed_mean)
-        components.append((wind_score, 0.10))
+        components.append((wind_score, _WEIGHTS["wind"]))
         if fc.windspeed_mean > _WIND_MAX:
             details.append(f"Vent fort ({fc.windspeed_mean:.0f}km/h)")
 
-        # Composite pondéré
+        # Composite pondéré (sol absent → poids renormalisés)
         total_w = sum(w for _, w in components)
         composite = (
             sum(s * w for s, w in components) / total_w
@@ -431,15 +639,52 @@ class WeatherChecker:
 
     @staticmethod
     def _score_temperature(t_mean: float) -> float:
-        lo, hi = _TEMP_OPTIMAL
         rlo, rhi = _TEMP_RANGE
-        if lo <= t_mean <= hi:
+        lo, hi = _TEMP_OPTIMAL
+        return _trapezoid(t_mean, rlo, lo, hi, rhi)
+
+    @staticmethod
+    def _score_soil_temperature(t_soil: float) -> float:
+        rlo, rhi = _SOIL_TEMP_RANGE
+        lo, hi = _SOIL_TEMP_OPTIMAL
+        return _trapezoid(t_soil, rlo, lo, hi, rhi)
+
+    @staticmethod
+    def _soil_warming(idx: int, all_fc: list[DayForecast]) -> float | None:
+        """Écart (°C) entre le sol moyen de J-6..J et celui de J-13..J-7."""
+        n = _SOIL_WARMING_WINDOW
+        if idx < 2 * n - 1:
+            return None
+        recent = [
+            d.soil_temperature for d in all_fc[idx - n + 1:idx + 1]
+            if d.soil_temperature is not None
+        ]
+        before = [
+            d.soil_temperature for d in all_fc[idx - 2 * n + 1:idx - n + 1]
+            if d.soil_temperature is not None
+        ]
+        if len(recent) < n or len(before) < n:
+            return None
+        return float(np.mean(recent) - np.mean(before))
+
+    @staticmethod
+    def _soil_warming_factor(delta: float) -> float:
+        """Facteur [plancher, 1] : +1,5 °C en 7 j → ×1 ; −1,5 °C → ×0,5."""
+        s = float(
+            np.clip(0.5 + delta / (2.0 * _SOIL_WARMING_FULL), 0.0, 1.0)
+        )
+        return _SOIL_WARMING_FLOOR + (1.0 - _SOIL_WARMING_FLOOR) * s
+
+    @staticmethod
+    def _score_soil_moisture(theta: float) -> float:
+        lo, hi = _SOIL_MOISTURE_OPTIMAL
+        if lo <= theta <= hi:
             return 1.0
-        if t_mean < rlo or t_mean > rhi:
-            return 0.0
-        if t_mean < lo:
-            return float(np.clip((t_mean - rlo) / (lo - rlo), 0.0, 1.0))
-        return float(np.clip((rhi - t_mean) / (rhi - hi), 0.0, 1.0))
+        if theta < lo:
+            t = (theta - _SOIL_MOISTURE_DRY) / (lo - _SOIL_MOISTURE_DRY)
+            return float(np.clip(0.1 + 0.9 * t, 0.1, 1.0))
+        t = (theta - hi) / (_SOIL_MOISTURE_WET - hi)
+        return float(np.clip(1.0 - 0.5 * t, 0.5, 1.0))
 
     @staticmethod
     def _score_frost(t_min: float) -> float:
@@ -518,95 +763,140 @@ class WeatherChecker:
     # API / cache
     # ------------------------------------------------------------------
 
-    def _fetch_api(self) -> dict[str, object]:
-        """Appel Meteoblue basic-day."""
-        params: dict[str, object] = {
-            "apikey": self._api_key,
-            "lat": self._lat,
-            "lon": self._lon,
-            "format": "json",
-            "timeformat": "iso8601",
+    def _params(self) -> dict[str, str | float | int]:
+        """Paramètres de la requête (aucune clé : usage non commercial)."""
+        return {
+            "latitude": self._lat,
+            "longitude": self._lon,
+            "timezone": _TIMEZONE,
+            "past_days": _PAST_DAYS,
+            "forecast_days": _FORECAST_DAYS,
+            "daily": ",".join(_DAILY_VARS),
+            "hourly": ",".join(_HOURLY_VARS),
         }
+
+    def _fetch_api(self) -> dict[str, object]:
+        """Appel Open-Meteo /v1/forecast."""
         logger.info(
-            "🌤️  Meteoblue API → lat=%.4f lon=%.4f",
+            "🌤️  Open-Meteo → lat=%.4f lon=%.4f",
             self._lat,
             self._lon,
         )
         resp = requests.get(
-            _METEOBLUE_BASE_URL,
-            params=params,  # type: ignore[arg-type]
+            _OPEN_METEO_URL,
+            params=self._params(),
             timeout=15,
         )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        # Erreur de paramètre : HTTP 400 + {"error": true, "reason": "..."}
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(f"Open-Meteo : {data.get('reason', 'erreur')}")
         resp.raise_for_status()
-        data: dict[str, object] = resp.json()
-
-        if "error" in data:
-            msg = data.get("error_message", str(data["error"]))
-            raise RuntimeError(f"Meteoblue API error: {msg}")
-
+        if not isinstance(data, dict):
+            raise RuntimeError("Open-Meteo : réponse illisible")
         return data
+
+    def _use(self, raw: dict[str, object]) -> None:
+        """Range la série et repère aujourd'hui (RuntimeError s'il manque)."""
+        series = self._parse_response(raw)
+        offset = raw.get("utc_offset_seconds")
+        today = _local_today(
+            float(offset) if isinstance(offset, (int, float)) else 0.0
+        )
+        dates = [d.date for d in series]
+        if today not in dates:
+            raise RuntimeError(
+                f"Météo : pas de données pour aujourd'hui ({today})"
+            )
+        self._series = series
+        self._today_idx = dates.index(today)
+        self._forecasts = series[self._today_idx:]
 
     @staticmethod
     def _parse_response(raw: dict[str, object]) -> list[DayForecast]:
-        """Parse la réponse Meteoblue basic-day."""
-        dd = raw.get("data_day")
+        """Parse la réponse Open-Meteo : journalier + sol horaire."""
+        dd = raw.get("daily")
         if not isinstance(dd, dict):
-            raise KeyError("Réponse Meteoblue sans 'data_day'")
+            raise KeyError("Réponse Open-Meteo sans 'daily'")
 
-        times = dd["time"]
-        assert isinstance(times, list)
-        n = len(times)
+        times = dd.get("time")
+        if not isinstance(times, list):
+            raise KeyError("Réponse Open-Meteo sans 'daily.time'")
 
-        def _f(key: str, i: int, default: float = 80.0) -> float:
+        def _f(key: str, i: int, default: float) -> float:
             seq = dd.get(key)
-            if isinstance(seq, list) and i < len(seq):
+            if isinstance(seq, list) and i < len(seq) and seq[i] is not None:
                 return float(seq[i])
             return default
 
+        hourly_raw = raw.get("hourly")
+        hourly = hourly_raw if isinstance(hourly_raw, dict) else {}
+        soil_t6 = _daily_means(hourly, "soil_temperature_6cm")
+        soil_t18 = _daily_means(hourly, "soil_temperature_18cm")
+        soil_water = _daily_means(hourly, "soil_moisture_3_to_9cm")
+
         forecasts: list[DayForecast] = []
-        for i in range(n):
+        for i, t in enumerate(times):
+            day = str(t)[:10]
             forecasts.append(
                 DayForecast(
-                    date=str(times[i])[:10],
-                    temperature_max=_f("temperature_max", i, 15.0),
-                    temperature_min=_f("temperature_min", i, 5.0),
-                    temperature_mean=_f("temperature_mean", i, 10.0),
-                    precipitation=_f("precipitation", i, 0.0),
+                    date=day,
+                    temperature_max=_f("temperature_2m_max", i, 15.0),
+                    temperature_min=_f("temperature_2m_min", i, 5.0),
+                    temperature_mean=_f("temperature_2m_mean", i, 10.0),
+                    precipitation=_f("precipitation_sum", i, 0.0),
                     precipitation_probability=_f(
-                        "precipitation_probability", i, 50.0
+                        "precipitation_probability_max", i, 50.0
                     ),
                     relativehumidity_mean=_f(
-                        "relativehumidity_mean", i, 70.0
+                        "relative_humidity_2m_mean", i, 70.0
                     ),
-                    windspeed_mean=_f("windspeed_mean", i, 10.0),
-                    predictability=_f("predictability", i, 80.0),
+                    windspeed_mean=_f("wind_speed_10m_mean", i, 10.0),
+                    soil_temperature=_soil_temperature_10cm(
+                        soil_t6.get(day), soil_t18.get(day)
+                    ),
+                    soil_moisture=soil_water.get(day),
                 )
             )
 
         return forecasts
 
-    def _load_cache(self) -> list[DayForecast] | None:
+    def _load_cache(self) -> tuple[float, dict[str, object]] | None:
+        """(horodatage, réponse) du cache s'il vaut pour ce point, sinon None."""
         if not self._cache_file.exists():
             return None
         try:
-            raw = json.loads(
+            payload = json.loads(
                 self._cache_file.read_text(encoding="utf-8")
             )
-            ts = raw.get("fetched_at", 0)
-            age = datetime.now(tz=timezone.utc).timestamp() - ts
-            if age > _CACHE_MAX_AGE_S:
-                logger.debug("   Cache météo expiré (%.0fs)", age)
+            if (
+                payload.get("source") != _CACHE_SOURCE
+                or payload.get("params") != self._params()
+            ):
+                logger.debug(
+                    "   Cache météo ignoré (autre point ou autres variables)"
+                )
                 return None
-            return self._parse_response(raw["data"])
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            data = payload["data"]
+            if not isinstance(data, dict):
+                raise TypeError("'data' n'est pas un objet")
+            self._parse_response(data)  # lève si la réponse est mal formée
+            return float(payload["fetched_at"]), data
+        except (
+            json.JSONDecodeError, KeyError, TypeError, ValueError,
+            AttributeError,
+        ) as exc:
             logger.warning("⚠️ Cache météo corrompu : %s", exc)
             return None
 
     def _save_cache(self, raw: dict[str, object]) -> None:
         payload = {
+            "source": _CACHE_SOURCE,
             "fetched_at": datetime.now(tz=timezone.utc).timestamp(),
-            "lat": self._lat,
-            "lon": self._lon,
+            "params": self._params(),
             "data": raw,
         }
         try:
@@ -630,12 +920,12 @@ class WeatherChecker:
 
 
 def check_weather(
-    api_key: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
+    offline: bool = False,
 ) -> list[ProspectingDay]:
     """Fetch + évalue + log le rapport prospection."""
-    checker = WeatherChecker(api_key=api_key, lat=lat, lon=lon)
+    checker = WeatherChecker(lat=lat, lon=lon, offline=offline)
     checker.fetch()
     days = checker.evaluate()
     report = WeatherChecker.format_report(days)
@@ -644,5 +934,13 @@ def check_weather(
 
 
 if __name__ == "__main__":
+    _parser = argparse.ArgumentParser(
+        description="Alertes météo prospection morilles (Open-Meteo)."
+    )
+    _parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Sans réseau : dernier cache, s'il couvre aujourd'hui.",
+    )
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    check_weather()
+    check_weather(offline=_parser.parse_args().offline)
