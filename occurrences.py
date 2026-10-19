@@ -1,22 +1,32 @@
 """
-gbif.py — Occurrences GBIF des espèces modélisées (morille, cèpe).
+occurrences.py — Occurrences naturalistes des espèces modélisées.
 
-API publique sans clé (https://www.gbif.org/developer/summary) :
-  1. species/match      → taxonKey (genre Morchella, Boletus edulis)
-  2. occurrence/search  → occurrences dans config.BBOX_WGS84, pages de 300
-  3. dataset/{key}      → titre du jeu de données, affiché comme source
+Sources, réunies au même format (une liste par espèce du modèle) :
+  - iNaturalist : observations de morilles récupérées par species_enricher
+    (inat_occurrences) ;
+  - GBIF, API publique sans clé (https://www.gbif.org/developer/summary) :
+    species/match → taxonKey (genre Morchella, Boletus edulis),
+    occurrence/search dans config.BBOX_WGS84 (pages de 300), dataset/{key}
+    → titre du jeu de données, affiché comme source.
 
-Cache JSON par espèce dans data/cache (TTL 7 jours, comme iNaturalist).
-Hors ligne : le dernier cache est réutilisé même périmé ; sans cache, la
-liste est vide et le pipeline continue sans ces occurrences.
+Cache GBIF JSON par espèce dans data/cache (TTL 7 jours, comme
+iNaturalist). Hors ligne : le dernier cache est repris même périmé ; sans
+cache, la liste est vide et le pipeline continue.
 
 GBIF agrège aussi les observations iNaturalist « research grade » (jeu
-50c9509d…). drop_inaturalist_duplicates() retire celles déjà récupérées
-par l'API iNaturalist (species_enricher), sur l'identifiant d'observation.
+50c9509d…) : drop_inaturalist_duplicates() retire celles déjà récupérées
+par l'API iNaturalist, sur l'identifiant d'observation.
+
+Format d'une occurrence : {"id", "source" ("inaturalist" | "gbif"), "lat",
+"lng", "taxon", "date" (ISO partiel AAAA, AAAA-MM ou AAAA-MM-JJ ; "" si
+inconnue), "uncertainty_m" (None si non renseignée), "generalized"
+(coordonnées floutées), "dataset", "inat_id" (None hors iNaturalist),
+"quality" (qualité iNaturalist, None sinon)}.
 
 La plupart des données naturalistes françaises (SINP, MycoflAURA) sont
-diffusées au centre d'une maille de 5 km : précision ± 2,8 km
-(coordinateUncertaintyInMeters), conservée dans chaque occurrence.
+diffusées au centre d'une maille de 5 km : précision ± 2,8 km. Seules les
+occurrences précises (≤ PRECISE_MAX_M, non floutées) servent au contrôle
+du modèle (occurrence_check) ; la carte les distingue des autres.
 """
 
 from __future__ import annotations
@@ -31,17 +41,43 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
 
+import numpy as np
 import requests
+from affine import Affine
 
 import config
+from utils import TO_L93
 
-logger = logging.getLogger("cartomorilles.gbif")
+logger = logging.getLogger("cartomorilles.occurrences")
 
-__all__ = ["fetch_gbif_occurrences", "drop_inaturalist_duplicates"]
+__all__ = [
+    "INAT_SPECIES",
+    "PRECISE_MAX_M",
+    "SOURCES",
+    "occurrences_by_species",
+    "fetch_gbif_occurrences",
+    "inat_occurrences",
+    "drop_inaturalist_duplicates",
+    "is_precise",
+    "occurrence_check",
+]
 
 # ═══════════════════════════════════════════════════════════════════
 # CONSTANTES
 # ═══════════════════════════════════════════════════════════════════
+
+# Espèce du modèle des observations iNaturalist de species_enricher
+# (requête genre Morchella)
+INAT_SPECIES: Final[str] = "esculenta"
+# Occurrence « précise » : position connue à ± 250 m au plus, non floutée
+PRECISE_MAX_M: Final[float] = 250.0
+# Sources distinguées par le contrôle du modèle (et leurs libellés)
+SOURCES: Final[dict[str, str]] = {
+    "inaturalist": "iNaturalist",
+    "gbif": "GBIF hors iNaturalist",
+}
+# Première classe comptée comme favorable dans le contrôle du modèle
+_GOOD_LABEL: Final[str] = "Bon"
 
 _API: Final[str] = "https://api.gbif.org/v1"
 _USER_AGENT: Final[str] = "Cartomorilles (favorabilite morille et cepe, Isere)"
@@ -69,6 +105,25 @@ _DEFAULT_TITLE: Final[str] = "jeu de données GBIF"
 # API PUBLIQUE
 # ═══════════════════════════════════════════════════════════════════
 
+def occurrences_by_species(
+    species_list: Iterable[str],
+    inat_observations: Iterable[Mapping[str, Any]] = (),
+    *,
+    bbox_wgs84: Mapping[str, float] = config.BBOX_WGS84,
+    cache_dir: Path | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Occurrences par espèce : iNaturalist (pour INAT_SPECIES) puis GBIF,
+    sans les doublons iNaturalist de GBIF."""
+    species = list(species_list)
+    inat = inat_occurrences(inat_observations)
+    gbif = fetch_gbif_occurrences(species, bbox_wgs84, cache_dir=cache_dir)
+    return {
+        sp: (inat if sp == INAT_SPECIES else [])
+        + drop_inaturalist_duplicates(gbif.get(sp, []), inat)
+        for sp in species
+    }
+
+
 def fetch_gbif_occurrences(
     species_list: Iterable[str],
     bbox_wgs84: Mapping[str, float] = config.BBOX_WGS84,
@@ -77,12 +132,8 @@ def fetch_gbif_occurrences(
 ) -> dict[str, list[dict[str, Any]]]:
     """Occurrences GBIF par espèce du modèle, dans la BBOX.
 
-    Retourne {espèce: [occurrence, …]}. Chaque occurrence :
-    {"id" (gbifID), "lat", "lng", "taxon", "date" (ISO partiel : AAAA,
-    AAAA-MM ou AAAA-MM-JJ, "" si inconnue), "uncertainty_m" (None si non
-    renseignée), "generalized" (coordonnées floutées par le producteur),
-    "dataset" (titre du jeu), "inat_id" (None hors iNaturalist)}.
-
+    Retourne {espèce: [occurrence, …]} (format du module ; les occurrences
+    du jeu iNaturalist ont source="inaturalist").
     Espèce sans taxon GBIF défini, API indisponible sans cache : [].
     """
     cache_dir = cache_dir or Path("data/cache")
@@ -103,18 +154,45 @@ def fetch_gbif_occurrences(
     return out
 
 
-def drop_inaturalist_duplicates(
-    occurrences: list[dict[str, Any]],
-    inat_observations: Iterable[Mapping[str, Any]],
+def inat_occurrences(
+    observations: Iterable[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Retire les occurrences GBIF venues d'iNaturalist dont l'observation
-    figure déjà dans `inat_observations` (même identifiant iNaturalist)."""
-    known: set[int] = set()
-    for obs in inat_observations:
+    """Observations iNaturalist de species_enricher au format du module."""
+    out: list[dict[str, Any]] = []
+    for obs in observations:
         try:
-            known.add(int(str(obs["id"])))
+            inat_id = int(str(obs["id"]))
+            lat = float(str(obs["lat"]))
+            lng = float(str(obs["lng"]))
         except (KeyError, ValueError):
             continue
+        accuracy = obs.get("accuracy_m")
+        out.append({
+            "id": inat_id,
+            "source": "inaturalist",
+            "lat": round(lat, 6),
+            "lng": round(lng, 6),
+            # Cache iNaturalist antérieur au schéma 2 : pas de taxon
+            "taxon": str(obs.get("taxon_name") or "Morchella"),
+            "date": str(obs.get("observed_on") or ""),
+            "uncertainty_m": (
+                float(str(accuracy)) if accuracy is not None else None
+            ),
+            "generalized": bool(obs.get("obscured")),
+            "dataset": "iNaturalist",
+            "inat_id": inat_id,
+            "quality": str(obs.get("quality_grade") or "") or None,
+        })
+    return out
+
+
+def drop_inaturalist_duplicates(
+    occurrences: list[dict[str, Any]],
+    inat: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Retire de `occurrences` (GBIF) les observations iNaturalist déjà
+    présentes dans `inat` (même identifiant iNaturalist)."""
+    known = {o["inat_id"] for o in inat if o.get("inat_id") is not None}
     kept = [o for o in occurrences if o.get("inat_id") not in known]
     n_dup = len(occurrences) - len(kept)
     if n_dup:
@@ -123,6 +201,89 @@ def drop_inaturalist_duplicates(
             n_dup,
         )
     return kept
+
+
+def is_precise(occurrence: Mapping[str, Any]) -> bool:
+    """Position connue à PRECISE_MAX_M près au plus, et non floutée."""
+    uncertainty = occurrence.get("uncertainty_m")
+    return (
+        uncertainty is not None
+        and float(uncertainty) <= PRECISE_MAX_M
+        and not occurrence.get("generalized")
+    )
+
+
+def occurrence_check(
+    score: np.ndarray,
+    transform: Affine,
+    occurrences: Iterable[Mapping[str, Any]],
+    *,
+    study_mask: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Part des occurrences précises en classe Bon ou Excellent, par
+    source, comparée à la part de la surface étudiée dans ces classes.
+
+    score : score final (ny, nx), NaN hors données ; transform : affine
+    Lambert-93 de la grille ; study_mask : cellules de l'emprise d'étude
+    (None : toute la grille). Une occurrence compte si elle est précise et
+    tombe dans une cellule valide de l'emprise.
+
+    Retourne {"classes", "threshold", "precise_max_m", "area_share",
+    "sources": {source: {"label", "n_total", "n_precise", "n_used",
+    "n_good", "share", "lift"}}} ; share = n_good / n_used, lift = share /
+    area_share (None si non calculable).
+    """
+    good_idx = config.PROBABILITY_LABELS.index(_GOOD_LABEL)
+    threshold = float(config.PROBABILITY_THRESHOLDS[good_idx - 1])
+    valid = np.isfinite(score)
+    if study_mask is not None:
+        valid &= study_mask
+    good = np.zeros(score.shape, dtype=bool)
+    np.greater_equal(score, threshold, out=good, where=valid)
+    n_area = int(np.count_nonzero(valid))
+    area_share = int(np.count_nonzero(good)) / n_area if n_area else None
+
+    occs = list(occurrences)
+    sources: dict[str, dict[str, Any]] = {}
+    for source, label in SOURCES.items():
+        group = [o for o in occs if o.get("source") == source]
+        precise = [o for o in group if is_precise(o)]
+        n_used = n_good = 0
+        if precise:
+            xs, ys = TO_L93.transform(
+                np.array([float(o["lng"]) for o in precise]),
+                np.array([float(o["lat"]) for o in precise]),
+            )
+            cols, rows = ~transform * (np.asarray(xs), np.asarray(ys))
+            cols = np.floor(np.asarray(cols)).astype(np.int64)
+            rows = np.floor(np.asarray(rows)).astype(np.int64)
+            inside = (
+                (rows >= 0) & (rows < score.shape[0])
+                & (cols >= 0) & (cols < score.shape[1])
+            )
+            rows, cols = rows[inside], cols[inside]
+            n_used = int(np.count_nonzero(valid[rows, cols]))
+            n_good = int(np.count_nonzero(good[rows, cols]))
+        share = n_good / n_used if n_used else None
+        sources[source] = {
+            "label": label,
+            "n_total": len(group),
+            "n_precise": len(precise),
+            "n_used": n_used,
+            "n_good": n_good,
+            "share": round(share, 4) if share is not None else None,
+            "lift": (
+                round(share / area_share, 2)
+                if share is not None and area_share else None
+            ),
+        }
+    return {
+        "classes": list(config.PROBABILITY_LABELS[good_idx:]),
+        "threshold": threshold,
+        "precise_max_m": PRECISE_MAX_M,
+        "area_share": round(area_share, 4) if area_share is not None else None,
+        "sources": sources,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -337,6 +498,7 @@ def _normalize(
     uncertainty = rec.get("coordinateUncertaintyInMeters")
     return {
         "id": gbif_id,
+        "source": "inaturalist" if inat_id is not None else "gbif",
         "lat": round(lat, 6),
         "lng": round(lng, 6),
         "taxon": str(
@@ -348,6 +510,8 @@ def _normalize(
         "generalized": bool(rec.get("informationWithheld")),
         "dataset": titles.get(dataset_key, _DEFAULT_TITLE),
         "inat_id": inat_id,
+        # Le jeu iNaturalist de GBIF ne contient que le « research grade »
+        "quality": "research" if inat_id is not None else None,
     }
 
 
