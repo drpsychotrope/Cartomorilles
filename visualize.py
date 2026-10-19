@@ -298,6 +298,18 @@ def _polygons(geom: BaseGeometry) -> list[Any]:
     return []
 
 
+def _display_value(value: Any) -> str | None:
+    """Libellé d'une clé d'essence OU de géologie quand le type n'est pas
+    connu (ex. export GPX) ; None si vide ou « unknown ». Sinon, préférer
+    config.tree_label / config.geology_label."""
+    key = "" if value is None else str(value).strip()
+    if key.lower() in {"", "unknown", "none", "nan"}:
+        return None
+    if key in config.TREE_LABELS:
+        return config.tree_label(key)
+    return config.geology_label(key)
+
+
 def _js_json(obj: Any) -> str:
     """JSON injectable dans un <script> (« </ » échappé)."""
     return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
@@ -886,6 +898,14 @@ class MorilleVisualizer:
             "scientific": str(params.get("scientific_name", species)),
         }
 
+    def _weather_factor(self) -> float | None:
+        """Facteur que main.py applique aux scores quand la météo est
+        disponible (0,4 + 0,6 × score du jour), annoncé sur la carte comme
+        dans la console. None sans météo."""
+        if not self._weather_days:
+            return None
+        return 0.4 + 0.6 * float(self._weather_days[0].score)
+
     def _page_title(self) -> str:
         names = ", ".join(
             self._species_info(sp)["name"] for sp in self.species_list
@@ -971,6 +991,15 @@ class MorilleVisualizer:
             f"Isère · maille {float(config.CELL_SIZE):.0f} m · "
             f"générée le {datetime.now():%d/%m/%Y}"
         )
+        # Même facteur que « Météo J+0 … ×0.89 » dans la console
+        factor = self._weather_factor()
+        weather_hint = ""
+        if factor is not None:
+            factor_txt = f"{factor:.2f}".replace(".", ",")
+            weather_hint = (
+                f'<p class="cs-hint">Scores multipliés par {factor_txt} '
+                "(météo du jour).</p>"
+            )
 
         cfg: dict[str, Any] = {
             "mapVar": folium_map.get_name(),
@@ -1163,6 +1192,7 @@ class MorilleVisualizer:
                     <h2 id="cs-legend-title">Probabilité</h2>
                     <p class="cs-hint">Cliquez une classe pour la masquer ou l'afficher.</p>
                     <ul class="cs-legend" id="cs-legend"></ul>
+                    %WEATHER_HINT%
                     <p class="cs-hint" id="cs-palette-hint" hidden>Sur photo aérienne,
                         couleurs inversées : plus c'est clair, meilleur c'est.</p>
                     <button type="button" class="cs-link" id="cs-legend-reset" hidden>Tout afficher</button>
@@ -1645,6 +1675,7 @@ class MorilleVisualizer:
             "%LAYER_CHECKS%": layer_checks,
             "%DIAG_BLOCK%": diag_block,
             "%WEATHER_SECTION%": weather_html,
+            "%WEATHER_HINT%": weather_hint,
             "%TERRAIN_URI%": terrain_uri,
             "%DATA_IMGS%": data_imgs,
             "%AREA_LINE%": _AREA_LINE,
@@ -1778,7 +1809,8 @@ class MorilleVisualizer:
     # ──────────────────────────────────────────────────────
     def _weather_section_html(self) -> str:
         """Section météo du panneau ('' sans données). Même échelle que la
-        carte : classe du jour = config.PROBABILITY_* (weather.py)."""
+        carte : la classe du jour est recalculée depuis le score avec
+        config.PROBABILITY_* (weather.py garde ses propres 5 niveaux)."""
         if not self._weather_days:
             return ""
 

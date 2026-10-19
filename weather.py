@@ -8,11 +8,12 @@ import os
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 import requests
 
-from config import MAP_CENTER, PROBABILITY_LABELS, PROBABILITY_THRESHOLDS
+from config import MAP_CENTER
 
 logger = logging.getLogger("cartomorilles.weather")
 
@@ -48,10 +49,13 @@ _BURST_BONUS: float = 0.12           # bonus score jour standard
 _BURST_BONUS_INTENSE: float = 0.20   # bonus score choc marqué
 _BURST_BONUS_THERMAL: float = 0.06   # bonus supplémentaire si réchauffement
 
-# Même échelle que la carte et la console : les 6 classes de config
-# (Nul … Excellent, seuils PROBABILITY_THRESHOLDS). « Favorable » = Bon et +.
-_GOOD_LEVEL: int = PROBABILITY_LABELS.index("Bon")
-_LEVEL_ICONS: tuple[str, ...] = ("⛔", "🔴", "🟠", "🟡", "🟢", "🟢")
+_PROSPECTING_LABELS = MappingProxyType({
+    4: "🟢 Excellent",
+    3: "🟡 Bon",
+    2: "🟠 Moyen",
+    1: "🔴 Défavorable",
+    0: "⛔ Très défavorable",
+})
 
 _JOURS_FR = (
     "lundi", "mardi", "mercredi", "jeudi",
@@ -192,7 +196,7 @@ class WeatherChecker:
                     )
 
             level = self._score_to_level(score)
-            label = PROBABILITY_LABELS[level]
+            label = _PROSPECTING_LABELS[level]
             date_fr = _format_date_fr(fc.date)
             results.append(
                 ProspectingDay(
@@ -215,7 +219,7 @@ class WeatherChecker:
                 "; ".join(details),
             )
 
-        excellent = sum(1 for r in results if r.level >= _GOOD_LEVEL)
+        excellent = sum(1 for r in results if r.level >= 3)
         bursts = sum(1 for r in results if r.burst is not None)
         logger.info(
             "📊 Prospection : %d/%d jours favorables (bon+), "
@@ -238,8 +242,7 @@ class WeatherChecker:
             fc = d.forecast
             burst_tag = " 🍄" if d.burst else ""
             lines.append(
-                f"  {d.date_fr:<22s}  {_LEVEL_ICONS[d.level]} "
-                f"{d.label:<11s}{burst_tag:<3s}  "
+                f"  {d.date_fr:<22s}  {d.label}{burst_tag:<22s}  "
                 f"score={d.score:.2f}  "
                 f"T={fc.temperature_min:.0f}/{fc.temperature_max:.0f}°C  "
                 f"P={fc.precipitation:.0f}mm  "
@@ -269,7 +272,7 @@ class WeatherChecker:
                 )
             lines.append("")
 
-        best = [d for d in days if d.level >= _GOOD_LEVEL]
+        best = [d for d in days if d.level >= 3]
         if best:
             lines.append(
                 f"  🍄 Meilleurs jours : "
@@ -501,8 +504,15 @@ class WeatherChecker:
 
     @staticmethod
     def _score_to_level(score: float) -> int:
-        """Classe 0–5 de l'échelle commune (config.PROBABILITY_THRESHOLDS)."""
-        return sum(score >= t for t in PROBABILITY_THRESHOLDS)
+        if score >= 0.75:
+            return 4
+        if score >= 0.55:
+            return 3
+        if score >= 0.40:
+            return 2
+        if score >= 0.25:
+            return 1
+        return 0
 
     # ------------------------------------------------------------------
     # API / cache

@@ -94,7 +94,7 @@ These decisions are documented in `decisions.md` — do not reverse them without
 | **D28** | Landcover `_resample_to_grid()` uses inverse L93→WGS84 mapping with Mercator Y correction (not naive ndizoom) |
 | **D29** | Folium overlays are reprojected to **EPSG:3857** (Web Mercator), not EPSG:4326 — Leaflet stretches ImageOverlay linearly in Mercator space, so pixels must be evenly spaced in Mercator Y |
 | **D37** | Folium map = one JS-rendered probability layer (per-species score PNG + shared terrain PNG), one collapsible sidebar (species, class legend-as-filter, opacity, top-N numbered hotspots from JSON, layers, weather) — no floating panels, no LayerControl; overlays at grid resolution; diagnostic overlays only with `--debug-layers` |
-| **D38** | One score scale everywhere = the 6 `config.PROBABILITY_*` classes (map legend, console stats, weather days). Probability palette = one-hue amber→brown ramp with monotone lightness on light basemaps, reversed brown→yellow on dark ones (`dark: True` in `config.BASEMAPS`) |
+| **D38** | One score scale = the 6 `config.PROBABILITY_*` classes (map legend and weather panel, console stats; `weather.py` is session-locked and keeps its own 5 levels). Probability palette = one-hue amber→brown ramp with monotone lightness on light basemaps, reversed brown→yellow on dark ones (`dark: True` in `config.BASEMAPS`) |
 | **D39** | Study area = BDCharm-50 departmental coverage (Isère) ∩ grid: outlined, exterior faded, no score (data PNG code 254) and no hotspot shown outside; model outputs (GeoTIFF, CSV) unchanged |
 
 ## Session / Branch Workflow
