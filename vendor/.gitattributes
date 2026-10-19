@@ -1,0 +1,3 @@
+# Copies conformes des fichiers publiés (empreintes : SHA256SUMS) :
+# Git ne convertit pas leurs fins de ligne.
+* -text

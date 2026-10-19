@@ -39,6 +39,12 @@ Terrain et téléphone (audit UI/UX, lot D) :
   - Meta viewport sans maximum-scale ni user-scalable=no (zoom du
     navigateur possible), cibles tactiles ≥ 44 px, état du panneau
     mémorisé (localStorage).
+
+Hors ligne (D43) :
+  - Leaflet, jQuery, leaflet-measure et les feuilles de base de
+    Bootstrap 5 et 3 sont insérés dans la page depuis vendor/ (copies
+    figées des fichiers des CDN de Folium, même rendu) ; seuls les fonds
+    de carte demandent le réseau.
 """
 from __future__ import annotations
 
@@ -47,6 +53,7 @@ import html
 import io
 import json
 import logging
+import mimetypes
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,7 +71,12 @@ import matplotlib.colors as mcolors  # noqa: E402
 import numpy as np  # noqa: E402
 import rasterio  # noqa: E402
 import shapely  # noqa: E402
-from branca.element import Element  # type: ignore[import-untyped]  # noqa: E402
+from branca.element import (  # type: ignore[import-untyped]  # noqa: E402
+    CssLink,
+    Element,
+    JavascriptLink,
+)
+from folium.elements import JSCSSMixin  # noqa: E402
 from folium.plugins import MeasureControl  # noqa: E402
 from folium.raster_layers import ImageOverlay  # noqa: E402
 from PIL import Image  # noqa: E402
@@ -84,7 +96,7 @@ from config import TWI_WATERLOG  # noqa: E402
 from utils import TO_MERC, TO_WGS84  # noqa: E402
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from shapely.geometry.base import BaseGeometry
 
@@ -178,6 +190,59 @@ _SCORE_NAN: int = 255
 _ALT_OFFSET: int = 500
 _SLOPE_OFFSET: int = 1
 _SLOPE_SCALE: float = 2.0
+
+# Bibliothèques de la carte intégrées à la page (D43) : copies figées,
+# dans vendor/, des fichiers que Folium chargerait depuis des CDN. La
+# carte fonctionne ainsi sans réseau, fonds de carte mis à part. Clé =
+# URL du lien Folium : si une version de Folium en change une, son lien
+# CDN est gardé (avertissement) plutôt que de mélanger deux versions.
+_VENDOR_DIR: Path = Path(__file__).resolve().parent / "vendor"
+_VENDORED: dict[str, str] = {
+    "https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.js":
+        "leaflet-1.9.3/leaflet.js",
+    "https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css":
+        "leaflet-1.9.3/leaflet.css",
+    # Folium construit ses popups avec $(…)
+    "https://code.jquery.com/jquery-3.7.1.min.js":
+        "jquery-3.7.1/jquery.min.js",
+    "https://cdn.jsdelivr.net/gh/ljagis/leaflet-measure@2.1.7/dist/"
+    "leaflet-measure.min.js":
+        "leaflet-measure-2.1.7/leaflet-measure.min.js",
+    # jsDelivr sert ce .min.css à partir du .css, déjà minifié
+    "https://cdn.jsdelivr.net/gh/ljagis/leaflet-measure@2.1.7/dist/"
+    "leaflet-measure.min.css":
+        "leaflet-measure-2.1.7/leaflet-measure.css",
+    # Aucune classe Bootstrap sur la page, mais le rendu dépend des deux
+    # feuilles de base que Folium charge : reboot de Bootstrap 5 (box-sizing,
+    # [hidden] !important, titres, marges)...
+    "https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/css/bootstrap.min.css":
+        "bootstrap-5.2.2/bootstrap-reboot.min.css",
+    # ... puis normalize + scaffolding de Bootstrap 3, livrés dans ce
+    # fichier « glyphicons » : html à 62,5 % (1rem = 10 px, d'où la taille
+    # du texte des popups et des contrôles), texte 14 px #333. Copie sans
+    # les glyphicons ni leurs polices, inutilisés.
+    "https://netdna.bootstrapcdn.com/bootstrap/3.0.0/css/bootstrap-glyphicons.css":
+        "bootstrap-3.0.0/bootstrap-glyphicons.base.css",
+}
+# Folium crée chaque Marker avec l'icône par défaut de Leaflet, puis lui
+# applique son icône (repères en DivIcon). Avec la CSS insérée, Leaflet ne
+# trouve plus le dossier de ces images et les demanderait à côté de la
+# page (marker-icon.png en 404) : elles lui sont données en data URI.
+_LEAFLET_ICONS: dict[str, str] = {
+    "iconUrl": "leaflet-1.9.3/images/marker-icon.png",
+    "iconRetinaUrl": "leaflet-1.9.3/images/marker-icon-2x.png",
+    "shadowUrl": "leaflet-1.9.3/images/marker-shadow.png",
+}
+# Liens Folium sans effet sur cette carte : JS de Bootstrap (aucun
+# composant), Font Awesome et awesome-markers (repères et hotspots en
+# DivIcon). Styles calculés identiques sans eux (D43).
+_UNUSED_LIBS: frozenset[str] = frozenset({
+    "bootstrap",
+    "awesome_markers",
+    "awesome_markers_font_css",
+    "awesome_markers_css",
+    "awesome_rotate_css",
+})
 
 
 # ───────────────────────────────────────────────────────────
@@ -340,6 +405,100 @@ def _allow_page_zoom(html_doc: str) -> str:
     if not n:
         logger.warning("Meta viewport Folium introuvable : zoom navigateur non vérifié")
     return fixed
+
+
+class _RawHtml(Element):  # type: ignore[misc]
+    """Élément rendu tel quel : le code tiers ne passe pas par Jinja."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self._text = text
+
+    def render(self, **kwargs: Any) -> str:
+        return self._text
+
+
+_CSS_URL_RE = re.compile(r"""url\(\s*(['"]?)([^'")\s]+)\1\s*\)""")
+
+
+def _data_uri(path: Path) -> str:
+    """Image de vendor/ en data URI."""
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+
+
+def _vendored_tag(rel: str) -> str:
+    """<script> ou <style> avec le contenu d'un fichier de vendor/ ; les
+    images d'une feuille de style y sont mises en data URI."""
+    path = _VENDOR_DIR / rel
+    text = path.read_text(encoding="utf-8")
+    tag = "script"
+    if path.suffix == ".css":
+        tag = "style"
+
+        def _inline_url(m: re.Match[str]) -> str:
+            ref = m.group(2)
+            if ref.startswith(("data:", "#", "/", "http:", "https:")):
+                return m.group(0)
+            return f'url("{_data_uri(path.parent / ref)}")'
+
+        text = _CSS_URL_RE.sub(_inline_url, text)
+    if f"</{tag}" in text.lower():
+        raise ValueError(f"« </{tag} » dans {rel}")
+    return f"<{tag}>/* vendor/{rel} */\n{text}\n</{tag}>"
+
+
+def _leaflet_icons_tag() -> str:
+    """Icône par défaut de Leaflet en data URI (voir _LEAFLET_ICONS)."""
+    urls = {opt: _data_uri(_VENDOR_DIR / rel) for opt, rel in _LEAFLET_ICONS.items()}
+    return (
+        "<script>L.Icon.Default.imagePath = '';\n"
+        f"L.Icon.Default.mergeOptions({json.dumps(urls)});</script>"
+    )
+
+
+def _walk(element: Element) -> Iterator[Element]:
+    """L'élément et ses descendants, dans l'ordre de rendu de Folium."""
+    yield element
+    for child in element._children.values():
+        yield from _walk(child)
+
+
+def _embed_libraries(folium_map: folium.Map) -> None:
+    """Remplace les liens CDN des éléments Folium par le contenu des
+    fichiers de vendor/ (même ordre dans <head>) et retire les
+    bibliothèques inutilisées. Sans copie conforme, le lien CDN reste."""
+    header = folium_map.get_root().header  # type: ignore[attr-defined]
+    for element in _walk(folium_map):
+        if not isinstance(element, JSCSSMixin):
+            continue
+        for links, link_cls in (
+            (element.default_js, JavascriptLink),
+            (element.default_css, CssLink),
+        ):
+            for name, url in links:
+                if name in _UNUSED_LIBS:
+                    continue
+                rel = _VENDORED.get(url)
+                reason = "version absente de vendor/"
+                if rel is not None:
+                    try:
+                        tag = _vendored_tag(rel)
+                        if name == "leaflet":
+                            tag += "\n" + _leaflet_icons_tag()
+                        header.add_child(_RawHtml(tag), name=name)
+                        continue
+                    except (OSError, ValueError) as exc:
+                        reason = str(exc)
+                logger.warning(
+                    "Carte : %s chargé depuis %s (%s), indispensable hors ligne",
+                    name, url, reason,
+                )
+                header.add_child(link_cls(url), name=name)
+        # Attributs d'instance : les listes de classe de Folium restent
+        # intactes pour les autres cartes.
+        element.default_js = []
+        element.default_css = []
 
 
 class _OverlaySpec(NamedTuple):
@@ -2379,6 +2538,8 @@ class MorilleVisualizer:
         )
 
         m.fit_bounds(self._bounds)
+        # Bibliothèques dans la page plutôt que sur des CDN (D43)
+        _embed_libraries(m)
 
         # ── Sauvegarde (équivalent de m.save, meta viewport corrigé) ──
         try:

@@ -107,19 +107,15 @@ Le détail (tableau des poids, statistiques par critère, validation point par p
 
 - **Sur le téléphone** : copier `cartomorilles.html` et l'ouvrir dans le navigateur. Toucher un point affiche son score, ses coordonnées (bouton *Copier*) et un lien *Itinéraire* vers Google Maps ; les popups des hotspots ont les mêmes actions. Le bouton de localisation, sous le zoom, centre la carte sur votre position et donne le score à cet endroit ; le point bleu suit ensuite vos déplacements (toucher à nouveau : recentrer, ou arrêter si la position est visible). Le navigateur n'autorise la localisation que sur une page sûre : `https`, `localhost` ou fichier local (`file://`). Servie en `http` sur le réseau local (`http://192.168…`), la page ne peut pas localiser et le bandeau du bas le dit.
 - **Pour un usage sans réseau fiable**, importer `{species}_hotspots.gpx` dans une appli GPS à cartes hors ligne (OsmAnd, Organic Maps, IGNrando', Locus Map, Garmin…).
-- **Ce que la carte HTML contient** : scores, pente et altitude (images intégrées), hotspots, cours d'eau, observations iNaturalist. **Ce qu'elle va chercher sur Internet** :
-  - les fonds de carte (IGN Géoplateforme `data.geopf.fr`, OpenStreetMap, Esri, OpenTopoMap) ;
-  - les bibliothèques que Folium charge d'office depuis des CDN : Leaflet, Bootstrap 5, Font Awesome et leaflet-measure (`cdn.jsdelivr.net`), jQuery (`code.jquery.com`), Leaflet.awesome-markers (`cdnjs.cloudflare.com`), glyphicons Bootstrap 3 (`netdna.bootstrapcdn.com`, ancien CDN MaxCDN, encore en service).
-- **Hors ligne, selon ce qui manque** (vérifié en rendant ces hôtes injoignables) :
+- **Ce que la carte HTML contient** : scores, pente et altitude (images intégrées), hotspots, cours d'eau, observations iNaturalist, et les bibliothèques qui la font fonctionner : Leaflet, jQuery, leaflet-measure et les feuilles de base de Bootstrap 5 et 3, copiées dans `vendor/` (+0,36 Mo, 1,9 % d'une carte de 18,9 Mo à 50 m ; même rendu qu'avec les CDN). **Ce qu'elle va chercher sur Internet** : seulement les fonds de carte (IGN Géoplateforme `data.geopf.fr`, OpenStreetMap, Esri, OpenTopoMap). Les liens *Itinéraire* et Google Maps des popups ouvrent des sites en ligne.
+- **Hors ligne** (vérifié en rendant injoignables tous les hôtes externes cités par la page) :
 
   | Indisponible | Effet |
   |---|---|
-  | Fonds de carte | Fond gris hors des tuiles déjà en cache ; probabilité, hotspots, lecture, popups et localisation fonctionnent |
-  | `netdna.bootstrapcdn.com`, `cdnjs.cloudflare.com` | Aucun effet : ces bibliothèques ne servent plus à la carte (repères dessinés sans icône Folium) |
-  | `code.jquery.com` | Folium construit ses popups avec jQuery : son script s'arrête à la première observation iNaturalist. Observations, points de repère et outil de mesure manquent, la vue de départ n'est pas recadrée ; probabilité, hotspots, lecture, popup du point et localisation fonctionnent |
-  | Tout (`cdn.jsdelivr.net` compris) | Pas de carte : Leaflet manque, le bandeau du bas affiche « Carte indisponible hors ligne » |
+  | Fonds de carte, ou tout le réseau | Fond gris hors des tuiles déjà en cache. Le reste fonctionne : probabilité, hotspots, lecture de cellule, popups, localisation, outil de mesure, observations iNaturalist et points de repère |
+  | Une bibliothèque dont Folium a changé la version (le run l'annonce : « Carte : … chargé depuis … ») | La carte garde le lien CDN de Folium pour celle-ci et en dépend : sans Leaflet, pas de carte (« Carte indisponible hors ligne » dans le bandeau du bas) ; sans jQuery, ni observations, ni repères, ni outil de mesure. Mettre à jour `vendor/` (voir `vendor/README.md`) |
 
-  Ouvrir la carte une fois en ligne avant de partir, en parcourant les zones et zooms utiles, laisse ces fichiers dans le cache du navigateur. Ce n'est pas garanti : le navigateur, surtout sur mobile, peut vider ce cache.
+  Ouvrir la carte une fois en ligne avant de partir, en parcourant les zones et zooms utiles, laisse les tuiles dans le cache du navigateur. Ce n'est pas garanti : le navigateur, surtout sur mobile, peut vider ce cache.
 
 ---
 
