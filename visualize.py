@@ -29,6 +29,16 @@ Cohérence (audit UI/UX, lot C) :
     estompé, pas de score ni de hotspot affiché hors emprise — D39.
   - Libellés lisibles des essences et géologies (config.*_LABELS),
     couche iNaturalist liée à la morille, repères en gris neutre.
+
+Terrain et téléphone (audit UI/UX, lot D) :
+  - Clic ou toucher sur la carte → popup du point (score, coordonnées
+    copiables, liens Itinéraire / Google Maps), comme les hotspots.
+  - Bouton « Me localiser » (navigator.geolocation) : centre la carte et
+    donne le score à la position de l'utilisateur, qui suit ses
+    déplacements.
+  - Meta viewport sans maximum-scale ni user-scalable=no (zoom du
+    navigateur possible), cibles tactiles ≥ 44 px, état du panneau
+    mémorisé (localStorage).
 """
 from __future__ import annotations
 
@@ -37,6 +47,7 @@ import html
 import io
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -313,6 +324,22 @@ def _display_value(value: Any) -> str | None:
 def _js_json(obj: Any) -> str:
     """JSON injectable dans un <script> (« </ » échappé)."""
     return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
+
+
+# Folium impose « maximum-scale=1.0, user-scalable=no » : le pincement
+# hors carte (panneau, popups) ne pourrait plus agrandir le texte.
+_VIEWPORT_RE = re.compile(r'<meta\s+name="viewport"[^>]*>', re.IGNORECASE)
+_VIEWPORT_META = '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+
+
+def _allow_page_zoom(html_doc: str) -> str:
+    """Remplace le meta viewport de Folium par une version qui laisse le
+    navigateur zoomer (accessibilité). Le pincement sur la carte reste
+    capté par Leaflet."""
+    fixed, n = _VIEWPORT_RE.subn(_VIEWPORT_META, html_doc, count=1)
+    if not n:
+        logger.warning("Meta viewport Folium introuvable : zoom navigateur non vérifié")
+    return fixed
 
 
 class _OverlaySpec(NamedTuple):
@@ -1166,10 +1193,51 @@ class MorilleVisualizer:
             border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5);
             font: 700 12px/1 'Segoe UI', system-ui, Arial, sans-serif;
         }
-        .cs-coords { font-variant-numeric: tabular-nums; }
+        .cs-coords {
+            font-variant-numeric: tabular-nums; user-select: all; -webkit-user-select: all;
+        }
+        .cs-pt-coords { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+        /* Pas de flex-wrap : Leaflet dimensionne la popup en min-content */
+        .cs-acts { display: flex; gap: 6px; margin-top: 6px; }
+        .cs-copy, .leaflet-container a.cs-act {
+            display: inline-flex; align-items: center; justify-content: center;
+            min-height: 30px; padding: 0 10px; border: 1px solid #cdd5cd; border-radius: 6px;
+            background: #fff; color: #1a5fb4; text-decoration: none; cursor: pointer;
+            font: 600 12px/1 'Segoe UI', system-ui, Arial, sans-serif;
+        }
+        .cs-copy:hover, .leaflet-container a.cs-act:hover { background: #eef4ee; }
+        .cs-locate button {
+            display: flex; align-items: center; justify-content: center;
+            width: 30px; height: 30px; padding: 0; border: 0; border-radius: 2px;
+            background: #fff; color: #333; cursor: pointer;
+        }
+        .cs-locate button:hover { background: #f4f4f4; }
+        .cs-locate .cs-loc-on, .cs-locate .cs-loc-wait { color: #1a73e8; }
+        .cs-locate .cs-loc-wait { animation: cs-pulse .8s ease-in-out infinite alternate; }
+        @keyframes cs-pulse { to { opacity: .35; } }
+        @media (prefers-reduced-motion: reduce) {
+            .cs-locate .cs-loc-wait { animation: none; }
+        }
+        .cs-copy:focus-visible, .leaflet-container a.cs-act:focus-visible,
+        .cs-locate button:focus-visible { outline: 2px solid #1a73e8; outline-offset: 2px; }
         @media (max-width: 700px) {
             .cartom-sidebar { width: auto; right: 10px; max-height: 70%; }
             .cs-readout { bottom: 30px; font-size: 12px; }
+        }
+        /* Écran tactile ou étroit : cibles d'au moins 44 px */
+        @media (pointer: coarse), (max-width: 700px) {
+            .cs-collapse, .cs-open { min-width: 44px; min-height: 44px; }
+            .cs-seg label, .cs-class, .cs-check, .cs-link, .cs-select,
+            .cs-copy, .leaflet-container a.cs-act { min-height: 44px; }
+            .cs-link { display: inline-flex; align-items: center; }
+            .cs-check input { width: 20px; height: 20px; }
+            .cs-row input[type=range] { height: 44px; }
+            .cs-diag summary { padding: 12px 0; margin: 0; line-height: 20px; }
+            /* 16 px : iOS ne zoome pas sur la liste au focus */
+            .cs-select { font-size: 16px; }
+            .leaflet-touch .leaflet-bar a, .cs-locate button {
+                width: 44px; height: 44px; line-height: 44px;
+            }
         }
         </style>
 
@@ -1234,7 +1302,11 @@ class MorilleVisualizer:
         function init() {
             var CFG = %CONFIG_JSON%;
             var map = window[CFG.mapVar];
-            if (!map) { return; }
+            if (!map) {   /* Leaflet (CDN) non chargé : hors ligne, sans cache */
+                document.getElementById('cs-readout').textContent =
+                    'Carte indisponible hors ligne (Leaflet non chargé)';
+                return;
+            }
 
             var LABELS = CFG.labels, TH = CFG.thresholds, ALPHA = CFG.classAlpha;
             var N = CFG.scoreScale, OUT = CFG.outCode;
@@ -1263,21 +1335,35 @@ class MorilleVisualizer:
                         parseInt(h.slice(5, 7), 16)];
             }
 
-            /* ═══════ Panneau : repli + isolation des clics ═══════ */
+            /* ═══════ Panneau : repli (mémorisé) + isolation des clics ═══════ */
             var sidebar = document.getElementById('cartom-sidebar');
             var openBtn = document.getElementById('cs-open');
+            var collapseBtn = document.getElementById('cs-collapse');
             var readout = document.getElementById('cs-readout');
+            var PANEL_KEY = 'cartomorilles.panneau';
             [sidebar, openBtn].forEach(function (el) {
                 L.DomEvent.disableClickPropagation(el);
                 L.DomEvent.disableScrollPropagation(el);
             });
-            function setCollapsed(c) { sidebar.hidden = c; openBtn.hidden = !c; }
-            document.getElementById('cs-collapse').addEventListener('click', function () {
-                setCollapsed(true); openBtn.focus();
+            function setCollapsed(c, remember) {
+                sidebar.hidden = c; openBtn.hidden = !c;
+                if (!remember) { return; }
+                try { window.localStorage.setItem(PANEL_KEY, c ? 'replie' : 'ouvert'); }
+                catch (err) { /* stockage indisponible (navigation privée…) */ }
+            }
+            collapseBtn.addEventListener('click', function () {
+                setCollapsed(true, true); openBtn.focus();
             });
-            openBtn.addEventListener('click', function () { setCollapsed(false); });
-            if (window.matchMedia && window.matchMedia('(max-width: 700px)').matches) {
-                setCollapsed(true);
+            openBtn.addEventListener('click', function () {
+                setCollapsed(false, true); collapseBtn.focus();
+            });
+            var savedPanel = null;
+            try { savedPanel = window.localStorage.getItem(PANEL_KEY); }
+            catch (err) { savedPanel = null; }
+            if (savedPanel === 'replie' || savedPanel === 'ouvert') {
+                setCollapsed(savedPanel === 'replie', false);
+            } else if (window.matchMedia && window.matchMedia('(max-width: 700px)').matches) {
+                setCollapsed(true, false);
             }
             L.control.scale({position: 'bottomright', imperial: false, maxWidth: 140}).addTo(map);
 
@@ -1438,7 +1524,7 @@ class MorilleVisualizer:
                 return fmt(ha * 10000, 0) + ' m²';
             }
             function hsPopup(h) {
-                var sp = CFG.species[current], ll = h.lat.toFixed(5) + ',' + h.lon.toFixed(5);
+                var sp = CFG.species[current];
                 var facts = [areaText(h.a)];
                 if (h.alt !== undefined) { facts.push('altitude ' + h.alt + ' m'); }
                 if (h.sl !== undefined) { facts.push('pente ' + fmt(h.sl, 0) + '°'); }
@@ -1449,10 +1535,7 @@ class MorilleVisualizer:
                 ];
                 if (h.tr) { lines.push('Essence dominante : ' + esc(h.tr)); }
                 if (h.g) { lines.push('Géologie : ' + esc(h.g)); }
-                lines.push('<span class="cs-coords">' + h.lat.toFixed(5) + ', ' + h.lon.toFixed(5)
-                    + '</span> · <a href="https://www.google.com/maps?q=' + ll
-                    + '" target="_blank" rel="noopener">Google Maps</a>');
-                return lines.join('<br>');
+                return lines.join('<br>') + coordsHtml(h.lat, h.lon, true);
             }
             function renderHotspots() {
                 hsLayer.clearLayers();
@@ -1585,39 +1668,239 @@ class MorilleVisualizer:
                 return 0.5 * Math.log((1 + s) / (1 - s));
             }
             var yN = mercY(CFG.north), yS = mercY(CFG.south);
-            function showReadout(ll) {
-                var d = dataPx[current], sp = CFG.species[current];
-                if (!d) { return; }
+            function cellAt(ll) {
+                var d = dataPx[current];
+                if (!d) { return {state: 'loading'}; }
                 if (ll.lat < CFG.south || ll.lat > CFG.north
                     || ll.lng < CFG.west || ll.lng > CFG.east) {
-                    readout.textContent = 'Hors de la zone modélisée';
-                    return;
+                    return {state: 'out'};
                 }
                 var px = Math.floor((ll.lng - CFG.west) / (CFG.east - CFG.west) * dataW);
                 var py = Math.floor((yN - mercY(ll.lat)) / (yN - yS) * dataH);
                 px = Math.max(0, Math.min(px, dataW - 1));
                 py = Math.max(0, Math.min(py, dataH - 1));
-                var o = (py * dataW + px) * 4, v = d[o], parts;
-                if (v === OUT) {
-                    parts = ['Hors zone étudiée (Isère) : pas de score'];
-                } else if (v > N) {
-                    readout.textContent = 'Pas de données ici';
-                    return;
-                } else {
-                    parts = [sp.name + ' : ' + fmt(v / N, 2) + ' · ' + LABELS[classOf(v / N)]];
-                }
+                var o = (py * dataW + px) * 4, v = d[o];
+                if (v > N && v !== OUT) { return {state: 'nodata'}; }
+                /* Hors zone étudiée (D39) : pas de score, mais le terrain */
+                var cell = v === OUT ? {state: 'outside'} : {state: 'ok', s: v / N};
                 if (terrainPx) {
                     var alt = terrainPx[o + 1] + (terrainPx[o + 2] << 8);
-                    if (alt > 0) { parts.push(Math.round(alt - CFG.altOffset) + ' m'); }
+                    if (alt > 0) { cell.alt = Math.round(alt - CFG.altOffset); }
                     if (terrainPx[o] > 0) {
-                        parts.push(fmt((terrainPx[o] - CFG.slopeOffset) / CFG.slopeScale, 0) + '°');
+                        cell.slope = (terrainPx[o] - CFG.slopeOffset) / CFG.slopeScale;
                     }
                 }
-                parts.push(ll.lat.toFixed(5) + ', ' + ll.lng.toFixed(5));
-                readout.textContent = parts.join(' · ');
+                return cell;
+            }
+            var OUT_TEXT = 'Hors zone étudiée (Isère) : pas de score';
+            function hasTerrain(cell) { return cell.state === 'ok' || cell.state === 'outside'; }
+            function cellParts(cell) {
+                if (cell.state === 'out') { return ['Hors de la zone modélisée']; }
+                if (cell.state === 'nodata') { return ['Pas de données ici']; }
+                if (!hasTerrain(cell)) { return ['Chargement de la carte…']; }
+                var parts = [cell.state === 'outside' ? OUT_TEXT
+                             : CFG.species[current].name + ' : ' + fmt(cell.s, 2) + ' · '
+                               + LABELS[classOf(cell.s)]];
+                if (cell.alt !== undefined) { parts.push(cell.alt + ' m'); }
+                if (cell.slope !== undefined) { parts.push(fmt(cell.slope, 0) + '°'); }
+                return parts;
+            }
+            function showReadout(ll, prefix) {
+                if (!dataPx[current]) { return; }
+                var cell = cellAt(ll), parts = cellParts(cell);
+                if (hasTerrain(cell)) { parts.push(ll.lat.toFixed(5) + ', ' + ll.lng.toFixed(5)); }
+                readout.textContent = (prefix || '') + parts.join(' · ');
             }
             map.on('mousemove click', function (e) { showReadout(e.latlng); });
             map.on('mouseout', function () { if (dataPx[current]) { readout.textContent = IDLE; } });
+
+            /* ═══════ Popups : score du point, coordonnées copiables, liens ═══════ */
+            function pointBody(ll) {
+                var cell = cellAt(ll), terrain = [];
+                if (!hasTerrain(cell)) { return esc(cellParts(cell)[0]); }
+                var lines = [cell.state === 'outside' ? esc(OUT_TEXT)
+                             : esc(CFG.species[current].name) + ' : <b>' + fmt(cell.s, 2)
+                               + '</b> · ' + esc(LABELS[classOf(cell.s)])];
+                if (cell.alt !== undefined) { terrain.push('altitude ' + cell.alt + ' m'); }
+                if (cell.slope !== undefined) { terrain.push('pente ' + fmt(cell.slope, 0) + '°'); }
+                if (terrain.length) { lines.push(terrain.join(' · ')); }
+                return lines.join('<br>');
+            }
+            /* Coordonnées WGS 84 (format accepté par les applis GPS) + bouton
+               Copier ; liens Itinéraire (directions Google Maps) et Google Maps. */
+            function coordsHtml(lat, lng, links) {
+                var txt = lat.toFixed(5) + ', ' + lng.toFixed(5);
+                var q = lat.toFixed(5) + ',' + lng.toFixed(5);
+                var out = '<div class="cs-pt-coords"><span class="cs-coords" '
+                    + 'title="Latitude, longitude (WGS 84)">' + txt + '</span>'
+                    + '<button type="button" class="cs-copy" data-copy="' + txt
+                    + '">Copier</button></div>';
+                if (!links) { return out; }
+                return out + '<div class="cs-acts">'
+                    + '<a class="cs-act" href="https://www.google.com/maps/dir/?api=1&amp;destination='
+                    + q + '" target="_blank" rel="noopener">Itinéraire</a>'
+                    + '<a class="cs-act" href="https://www.google.com/maps?q=' + q
+                    + '" target="_blank" rel="noopener">Google Maps</a></div>';
+            }
+            function copyFallback(text) {
+                var ta = document.createElement('textarea');
+                ta.value = text;
+                ta.setAttribute('readonly', '');
+                ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;font-size:16px';
+                document.body.appendChild(ta);
+                ta.select();
+                ta.setSelectionRange(0, text.length);
+                var ok = false;
+                try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+                document.body.removeChild(ta);
+                return ok;
+            }
+            function copyCoords(btn) {
+                var text = btn.getAttribute('data-copy');
+                function done(ok) {
+                    btn.focus();
+                    if (!ok) {   /* coordonnées sélectionnées : copie manuelle possible */
+                        var span = btn.parentNode.querySelector('.cs-coords');
+                        if (span && window.getSelection) { window.getSelection().selectAllChildren(span); }
+                    }
+                    btn.textContent = ok ? 'Copié ✓' : 'Copiez la sélection';
+                    setTimeout(function () { btn.textContent = 'Copier'; }, 2000);
+                }
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(text).then(function () { done(true); },
+                        function () { done(copyFallback(text)); });
+                } else {
+                    done(copyFallback(text));
+                }
+            }
+            /* Capture : Leaflet arrête la propagation des clics dans les popups. */
+            document.addEventListener('click', function (ev) {
+                var btn = ev.target && ev.target.closest ? ev.target.closest('.cs-copy') : null;
+                if (btn) { copyCoords(btn); }
+            }, true);
+
+            /* ═══════ Popup du point cliqué ou touché ═══════ */
+            var pointPopup = L.popup({maxWidth: 300}).setContent(function (p) {
+                var ll = p.getLatLng();
+                return '<b>Point sélectionné</b><br>' + pointBody(ll) + coordsHtml(ll.lat, ll.lng, true);
+            });
+            var popupOpen = false, dismissClick = false, clickTimer = null;
+            map.on('popupopen', function () { popupOpen = true; });
+            map.on('popupclose', function () { popupOpen = false; });
+            /* Toucher la carte quand une popup est ouverte la ferme seulement
+               (Leaflet la ferme au « preclick », juste avant ce « click »). */
+            map.on('preclick', function () {
+                dismissClick = popupOpen;
+                setTimeout(function () { dismissClick = false; }, 0);
+            });
+            map.on('click', function (e) {
+                clearTimeout(clickTimer);
+                if (dismissClick) { dismissClick = false; return; }
+                var ll = e.latlng;
+                /* Délai : un double-clic (zoom) n'ouvre pas de popup. */
+                clickTimer = setTimeout(function () { pointPopup.setLatLng(ll).openOn(map); }, 250);
+            });
+            map.on('dblclick', function () { clearTimeout(clickTimer); });
+
+            /* ═══════ Me localiser (navigator.geolocation) ═══════ */
+            var geo = {watch: null, ll: null, acc: 0, dot: null, ring: null, center: false};
+            var LocateControl = L.Control.extend({
+                options: {position: 'topright'},
+                onAdd: function () {
+                    var bar = L.DomUtil.create('div', 'leaflet-bar cs-locate');
+                    var btn = L.DomUtil.create('button', '', bar);
+                    btn.type = 'button';
+                    btn.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" '
+                        + 'aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="3.5" '
+                        + 'fill="currentColor"/><circle cx="12" cy="12" r="7.5" fill="none" '
+                        + 'stroke="currentColor" stroke-width="2"/><path d="M12 1.5V5M12 19v3.5'
+                        + 'M1.5 12H5M19 12h3.5" stroke="currentColor" stroke-width="2" '
+                        + 'stroke-linecap="round"/></svg>';
+                    btn.addEventListener('click', onLocateClick);
+                    L.DomEvent.disableClickPropagation(bar);
+                    this.button = btn;
+                    return bar;
+                }
+            });
+            var locate = new LocateControl().addTo(map), locBtn = locate.button;
+            /* Juste sous les boutons de zoom */
+            var zoomBar = map.getContainer().querySelector('.leaflet-right .leaflet-control-zoom');
+            if (zoomBar) { zoomBar.parentNode.insertBefore(locate.getContainer(), zoomBar.nextSibling); }
+            function locState(state) {
+                var label = {
+                    off: 'Me localiser',
+                    wait: 'Localisation en cours… (toucher pour annuler)',
+                    on: 'Ma position : recentrer la carte, ou arrêter si elle est visible'
+                }[state];
+                locBtn.className = 'cs-loc-' + state;
+                locBtn.setAttribute('aria-pressed', state === 'off' ? 'false' : 'true');
+                locBtn.setAttribute('aria-label', label);
+                locBtn.title = label;
+            }
+            locState('off');
+            function accText(m) {
+                return m >= 1000 ? fmt(m / 1000, 1) + ' km' : fmt(m, 0) + ' m';
+            }
+            function herePopup() {
+                return '<b>Vous êtes ici</b> (± ' + accText(geo.acc) + ')<br>'
+                    + pointBody(geo.ll) + coordsHtml(geo.ll.lat, geo.ll.lng, false);
+            }
+            function locStop(msg) {
+                if (geo.watch !== null) { navigator.geolocation.clearWatch(geo.watch); }
+                if (geo.dot) { map.removeLayer(geo.dot); map.removeLayer(geo.ring); }
+                geo = {watch: null, ll: null, acc: 0, dot: null, ring: null, center: false};
+                locState('off');
+                if (msg) { readout.textContent = msg; }
+            }
+            function onLocated(pos) {
+                var ll = L.latLng(pos.coords.latitude, pos.coords.longitude);
+                geo.ll = ll;
+                geo.acc = pos.coords.accuracy || 0;
+                if (!geo.dot) {
+                    geo.ring = L.circle(ll, {radius: geo.acc, color: '#1a73e8', weight: 1,
+                                             fillOpacity: 0.12, interactive: false}).addTo(map);
+                    geo.dot = L.circleMarker(ll, {radius: 8, color: '#fff', weight: 3,
+                                                  fillColor: '#1a73e8', fillOpacity: 1,
+                                                  bubblingMouseEvents: false})
+                        .bindPopup(herePopup, {maxWidth: 300}).addTo(map);
+                } else {
+                    geo.ring.setLatLng(ll).setRadius(geo.acc);
+                    geo.dot.setLatLng(ll);
+                    if (geo.dot.isPopupOpen()) { geo.dot.getPopup().update(); }
+                }
+                locState('on');
+                if (geo.center) {   /* premier point : centrer, sans suivre ensuite */
+                    geo.center = false;
+                    map.setView(ll, Math.max(map.getZoom(), 15));
+                    geo.dot.openPopup();
+                    showReadout(ll, 'Votre position · ');
+                }
+            }
+            function onLocError(err) {
+                if (geo.ll && err.code !== 1) { return; }   /* perte passagère du signal */
+                locStop(err.code === 1
+                    ? 'Localisation refusée : autorisez-la pour cette page'
+                    : err.code === 3 ? 'Position introuvable (délai dépassé), réessayez'
+                    : 'Position indisponible');
+            }
+            function onLocateClick() {
+                if (!navigator.geolocation) {
+                    readout.textContent = 'Géolocalisation non disponible dans ce navigateur';
+                } else if (window.isSecureContext === false) {
+                    readout.textContent = 'Localisation impossible en http : '
+                        + 'ouvrez le fichier directement, ou servez-le en https';
+                } else if (geo.watch === null) {
+                    geo.center = true;
+                    locState('wait');
+                    readout.textContent = 'Localisation en cours…';
+                    geo.watch = navigator.geolocation.watchPosition(onLocated, onLocError,
+                        {enableHighAccuracy: true, maximumAge: 10000, timeout: 30000});
+                } else if (geo.ll && !map.getBounds().contains(geo.ll)) {
+                    map.setView(geo.ll, Math.max(map.getZoom(), 15));
+                } else {
+                    locStop(dataPx[current] ? IDLE : '');
+                }
+            }
 
             /* ═══════ Espèce ═══════ */
             function setSpecies(sp) {
@@ -1627,6 +1910,9 @@ class MorilleVisualizer:
                     'Probabilité — ' + CFG.species[sp].name;
                 renderProb(); renderHotspots(); syncDiag(); syncLayers();
                 if (dataPx[current]) { readout.textContent = IDLE; }
+                /* Popups ouvertes : score de la nouvelle espèce */
+                if (pointPopup.isOpen()) { pointPopup.update(); }
+                if (geo.dot && geo.dot.isPopupOpen()) { geo.dot.getPopup().update(); }
             }
             document.querySelectorAll('input[name="cs-species"]').forEach(function (r) {
                 r.addEventListener('change', function () { if (r.checked) { setSpecies(r.value); } });
@@ -1797,6 +2083,8 @@ class MorilleVisualizer:
                 fill=True,
                 fill_color=_INAT_COLOR if quality == "research" else "#9e7cc1",
                 fill_opacity=0.9,
+                # le clic ouvre cette popup, pas celle du point de la carte
+                bubbling_mouse_events=False,
                 popup=folium.Popup(popup_html, max_width=220),
             ).add_to(fg)
 
@@ -2079,9 +2367,10 @@ class MorilleVisualizer:
 
         m.fit_bounds(self._bounds)
 
-        # ── Sauvegarde ──
+        # ── Sauvegarde (équivalent de m.save, meta viewport corrigé) ──
         try:
-            m.save(str(output))
+            html_doc = _allow_page_zoom(m.get_root().render())
+            output.write_bytes(html_doc.encode("utf-8"))
             size_mb = output.stat().st_size / (1024 * 1024)
             dt = time.perf_counter() - t0
             logger.info(

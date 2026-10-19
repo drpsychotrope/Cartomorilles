@@ -36,7 +36,9 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime
+import xml.etree.ElementTree as ET
+from bisect import bisect_right
+from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -70,6 +72,7 @@ from scoring import MorilleScoring
 from species_enricher import SpeciesEnricher
 from utils import TO_L93, TO_WGS84, compute_array_stats, hotspot_to_export_dict
 from visualize import MorilleVisualizer
+from visualize import _display_value as display_label  # libellés de la carte
 from weather import WeatherChecker
 
 # ═══════════════════════════════════════════════════════════════
@@ -727,6 +730,103 @@ def save_hotspots_csv(
 
     logger.info("📍 Hotspots CSV : %s (%d lignes)", csv_path, len(rows))
     return csv_path
+
+
+# ═══════════════════════════════════════════════════════════════
+#  EXPORT HOTSPOTS GPX
+# ═══════════════════════════════════════════════════════════════
+
+_GPX_NS = "http://www.topografix.com/GPX/1/1"
+# Autant de points que de hotspots affichés à l'ouverture de la carte HTML
+GPX_MAX_WAYPOINTS = 20
+
+
+def _fr_decimal(value: float, decimals: int) -> str:
+    return f"{value:.{decimals}f}".replace(".", ",")
+
+
+def _area_text(size_m2: float) -> str:
+    """Surface lisible, comme dans les popups de la carte."""
+    ha = size_m2 / 10_000.0
+    if ha >= 10:
+        return f"{ha:.0f} ha"
+    if ha >= 1:
+        return f"{_fr_decimal(ha, 1)} ha"
+    return f"{size_m2:.0f} m²"
+
+
+def save_hotspots_gpx(
+    output_dir: Path,
+    hotspots: list[dict[str, Any]],
+    species: str = "esculenta",
+    max_waypoints: int = GPX_MAX_WAYPOINTS,
+) -> Path:
+    """Exporte les meilleurs hotspots en GPX 1.1 (un waypoint chacun) pour
+    les applis GPS — `{species}_hotspots.gpx`, à côté du CSV.
+
+    Le waypoint « Morille n°3 » est le hotspot n°3 de la carte et du CSV.
+    """
+    gpx_path = output_dir / f"{species}_hotspots.gpx"
+    common = str(
+        config.SPECIES_PARAMS.get(species, {}).get("common_name", species),
+    )
+    labels = list(config.PROBABILITY_LABELS)
+    thresholds = [float(t) for t in config.PROBABILITY_THRESHOLDS]
+    best = hotspots[:max_waypoints]
+
+    def tag(name: str) -> str:
+        return f"{{{_GPX_NS}}}{name}"
+
+    ET.register_namespace("", _GPX_NS)
+    root = ET.Element(
+        tag("gpx"), {"version": "1.1", "creator": f"Cartomorilles {VERSION}"},
+    )
+    meta = ET.SubElement(root, tag("metadata"))
+    ET.SubElement(meta, tag("name")).text = (
+        f"Cartomorilles — {common} : meilleurs hotspots "
+        f"({len(best)} sur {len(hotspots)})"
+    )
+    ET.SubElement(meta, tag("desc")).text = (
+        "Triés par score moyen décroissant ; numéros identiques à la "
+        "carte HTML et au CSV."
+    )
+    ET.SubElement(meta, tag("time")).text = (
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+
+    # Ordre des enfants imposé par le schéma GPX 1.1 : ele, name, desc, type
+    for rank, h in enumerate(best, 1):
+        e = hotspot_to_export_dict(h, rank=rank)
+        wpt = ET.SubElement(
+            root, tag("wpt"), {"lat": f"{e['lat']:.5f}", "lon": f"{e['lon']:.5f}"},
+        )
+        alt = h.get("altitude")
+        if alt is not None and np.isfinite(alt):
+            ET.SubElement(wpt, tag("ele")).text = f"{float(alt):.0f}"
+        ET.SubElement(wpt, tag("name")).text = f"{common} n°{rank}"
+
+        score = float(h.get("mean_score", 0.0))
+        facts = [
+            f"Score moyen {_fr_decimal(score, 2)} "
+            f"({labels[bisect_right(thresholds, score)]})",
+            _area_text(float(h.get("size_m2", 0.0))),
+        ]
+        slope = h.get("mean_slope")
+        if slope is not None and np.isfinite(slope):
+            facts.append(f"pente {float(slope):.0f}°")
+        tree = display_label(h.get("dominant_species"))
+        if tree:
+            facts.append(f"essence dominante : {tree}")
+        geology = display_label(h.get("dominant_geology"))
+        if geology:
+            facts.append(f"géologie : {geology}")
+        ET.SubElement(wpt, tag("desc")).text = " · ".join(facts)
+        ET.SubElement(wpt, tag("type")).text = common
+
+    ET.indent(root)
+    ET.ElementTree(root).write(gpx_path, encoding="utf-8", xml_declaration=True)
+    logger.info("🧭 Hotspots GPX : %s (%d points)", gpx_path, len(best))
+    return gpx_path
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1408,6 +1508,10 @@ def main(args: argparse.Namespace) -> int:
             species=sp,
         )
         save_hotspots_csv(output_dir, sp_hotspots, species=sp)
+        try:
+            save_hotspots_gpx(output_dir, sp_hotspots, species=sp)
+        except OSError as e:
+            logger.warning("GPX [%s] échoué : %s", sp, e)
 
     # ══════════════════════════════════════════════════════════
     #  RÉSUMÉ FINAL
