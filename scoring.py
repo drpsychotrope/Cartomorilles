@@ -893,19 +893,20 @@ class MorilleScoring:
 
         self.probability_classes = classes
 
-        logger.info("Répartition des probabilités :")
+        # Répartition affichée par main.display_statistics (mêmes 6 classes)
+        logger.debug("Répartition des probabilités :")
         n_valid = int(np.isfinite(self.final_score).sum())
         for i, lbl in enumerate(_PROB_LABELS):
             n = int((classes == i).sum())
             pct = n / n_valid * 100 if n_valid > 0 else 0.0
             bar = "█" * int(pct / 2)
-            logger.info(
+            logger.debug(
                 "  %-14s : %8d cellules (%5.1f%%) %s", lbl, n, pct, bar
             )
 
         n_nan = int((classes == -1).sum())
         if n_nan > 0:
-            logger.info("  %-14s : %8d cellules", "NoData", n_nan)
+            logger.debug("  %-14s : %8d cellules", "NoData", n_nan)
 
         self._step_classified = True
         return self
@@ -1044,7 +1045,7 @@ class MorilleScoring:
             threshold,
             min_cluster_size,
         )
-        for h in hotspots[:15]:
+        for rank, h in enumerate(hotspots[:15], 1):
             parts = [
                 f"score={h['mean_score']:.2f}",
                 f"{h['size_m2']:.0f}m²",
@@ -1054,11 +1055,12 @@ class MorilleScoring:
             if h["mean_slope"] is not None:
                 parts.append(f"pente={h['mean_slope']:.0f}°")
             if h["dominant_species"]:
-                parts.append(f"essence={h['dominant_species']}")
+                parts.append(f"essence={config.tree_label(h['dominant_species'])}")
             if h["dominant_geology"]:
-                parts.append(f"géol={h['dominant_geology']}")
+                parts.append(f"géol={config.geology_label(h['dominant_geology'])}")
             parts.append(f"compact={h['compactness']:.2f}")
-            logger.info("  #%-3d | %s", h["id"], " | ".join(parts))
+            # Rang = numéro du marqueur sur la carte et colonne rank du CSV
+            logger.info("  n°%-3d | %s", rank, " | ".join(parts))
 
         return hotspots
 

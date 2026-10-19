@@ -95,6 +95,8 @@ __all__ = [
     # Géologie
     "GEOLOGY_SCORES", "GEOLOGY_BRGM_MAP", "ELIMINATORY_GEOLOGY",
     "resolve_geology", "get_geology_score",
+    # Libellés d'affichage
+    "TREE_LABELS", "GEOLOGY_LABELS", "tree_label", "geology_label",
     # Altitude
     "ALTITUDE_OPTIMAL", "ALTITUDE_RANGE", "ALTITUDE_ALLUVIAL_CENTER",
     # Pente
@@ -631,6 +633,88 @@ def get_geology_score(raw_code: str | None) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  LIBELLÉS D'AFFICHAGE (carte + console)
+# ═══════════════════════════════════════════════════════════════
+# Clés canoniques (TREE_SCORES / GEOLOGY_SCORES) → libellés lisibles.
+# « unknown » se lit après un intitulé (« Essence dominante : non précisée »).
+
+TREE_LABELS: MappingProxyType[str, str] = MappingProxyType({
+    "frene":            "Frêne",
+    "orme":             "Orme",
+    "pommier":          "Pommier",
+    "poirier":          "Poirier",
+    "chataignier":      "Châtaignier",
+    "peuplier":         "Peuplier",
+    "aulne":            "Aulne",
+    "saule":            "Saule",
+    "noisetier":        "Noisetier",
+    "hetre":            "Hêtre",
+    "tilleul":          "Tilleul",
+    "erable":           "Érable",
+    "charme":           "Charme",
+    "sapin":            "Sapin",
+    "epicea":           "Épicéa",
+    "pin_sylvestre":    "Pin sylvestre",
+    "douglas":          "Douglas",
+    "platane":          "Platane",
+    "robinier":         "Robinier",
+    "chene":            "Chêne",
+    "chene_pubescent":  "Chêne pubescent",
+    "bouleau":          "Bouleau",
+    "buis":             "Buis",
+    "unknown":          "non précisée",
+})
+
+GEOLOGY_LABELS: MappingProxyType[str, str] = MappingProxyType({
+    "calcaire":             "Calcaire",
+    "calcaire_marneux":     "Calcaire marneux",
+    "marne":                "Marne",
+    "alluvions_calcaires":  "Alluvions calcaires",
+    "calcaire_lacustre":    "Calcaire lacustre",
+    "eboulis_calcaire":     "Éboulis calcaire",
+    "dolomie":              "Dolomie",
+    "colluvions":           "Colluvions",
+    "alluvions":            "Alluvions",
+    "alluvions_recentes":   "Alluvions récentes",
+    "moraine":              "Moraine",
+    "flysch":               "Flysch",
+    "sable":                "Sable",
+    "molasse":              "Molasse",
+    "gres":                 "Grès",
+    "schiste":              "Schiste",
+    "remblai":              "Remblai",
+    "hydrographie":         "Réseau hydrographique",
+    "granite":              "Granite",
+    "gneiss":               "Gneiss",
+    "siliceux":             "Roche siliceuse",
+    "unknown":              "non classée",
+})
+
+
+def _display_label(key: object, labels: MappingProxyType[str, str]) -> str | None:
+    if key is None:
+        return None
+    text = str(key).strip()
+    if not text or text.lower() in {"none", "nan"}:
+        return None
+    if text in labels:
+        return labels[text]
+    # Clé absente de la table : jamais de « _ » brut à l'écran
+    text = text.replace("_", " ")
+    return text[:1].upper() + text[1:]
+
+
+def tree_label(key: object) -> str | None:
+    """Libellé affichable d'une essence canonique (None si vide)."""
+    return _display_label(key, TREE_LABELS)
+
+
+def geology_label(key: object) -> str | None:
+    """Libellé affichable d'une catégorie géologique (None si vide)."""
+    return _display_label(key, GEOLOGY_LABELS)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  ALTITUDE  (v2.2.0 : optimal élargi 200-600m)
 # ═══════════════════════════════════════════════════════════════
 #
@@ -806,7 +890,9 @@ PROBABILITY_LABELS: Final[tuple[str, ...]] = (
     "Excellent",
 )
 
-# Seuils binaires pour statistiques de reporting (main.compute_final_stats)
+# Anciens seuils binaires (n_high / n_medium) : gardés seulement dans le
+# rapport JSON pour comparer avec les calibrations passées (D35). La carte,
+# la console et la météo utilisent les 6 classes ci-dessus.
 SCORE_THRESHOLD_HIGH: Final[float] = 0.7
 SCORE_THRESHOLD_MEDIUM: Final[float] = 0.4
 
@@ -855,6 +941,7 @@ _BASEMAPS_DICT: dict[str, dict[str, Any]] = {
         "attr": "© IGN - Géoplateforme",
         "name": "IGN Photo aérienne",
         "max_zoom": 19,
+        "dark": True,   # fond sombre → palette inversée (D38)
     },
     "IGN Occupation du sol": {
         "tiles": (
@@ -880,6 +967,7 @@ _BASEMAPS_DICT: dict[str, dict[str, Any]] = {
         "attr": "© Esri, Maxar, Earthstar Geographics",
         "name": "Esri Satellite",
         "max_zoom": 18,
+        "dark": True,
     },
     "OpenTopoMap": {
         "tiles": "https://tile.opentopomap.org/{z}/{x}/{y}.png",
@@ -1019,8 +1107,8 @@ DEFAULT_SPECIES: Final[str] = "esculenta"
 _SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
     "esculenta": MappingProxyType({
         "common_name":           "Morille",
+        "common_name_plural":    "morilles",
         "scientific_name":       "Morchella esculenta",
-        "emoji":                 "🍄",
         "tree_scores":           TREE_SCORES,
         "geology_scores":        GEOLOGY_SCORES,
         "eliminatory_geology":   ELIMINATORY_GEOLOGY,
@@ -1041,8 +1129,8 @@ _SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
     }),
     "edulis": MappingProxyType({
         "common_name":           "Cèpe",
+        "common_name_plural":    "cèpes",
         "scientific_name":       "Boletus edulis",
-        "emoji":                 "🌰",
         "tree_scores":           _TREE_SCORES_EDULIS,
         "geology_scores":        _GEOLOGY_SCORES_EDULIS,
         "eliminatory_geology":   frozenset(),             # ∅ — cèpe ubiquiste
@@ -1269,6 +1357,17 @@ def validate_config() -> bool:
                     "de geology_scores", sp_name, geo,
                 )
                 ok = False
+        # Libellés d'affichage : non bloquant (repli « clé sans _ »)
+        for kind, keys, labels in (
+            ("TREE_LABELS", params["tree_scores"], TREE_LABELS),
+            ("GEOLOGY_LABELS", params["geology_scores"], GEOLOGY_LABELS),
+        ):
+            missing = sorted(k for k in keys if k not in labels)
+            if missing:
+                logger.warning(
+                    "%s : clés sans libellé (%s) : %s",
+                    kind, sp_name, ", ".join(missing),
+                )
 
     if ok:
         logger.info("✅ Configuration validée (v%s)", CONFIG_VERSION)

@@ -21,6 +21,14 @@ Refonte UI (audit UI/UX, lots A+B) :
   - Rendu à la résolution de la grille (plus de suréchantillonnage).
   - Couches de diagnostic (zones exclues, TWI) seulement avec
     debug_layers=True (option CLI --debug-layers).
+
+Cohérence (audit UI/UX, lot C) :
+  - Palette séquentielle ambre → brun à luminance monotone, inversée
+    (brun → jaune) sur les fonds sombres (photo aérienne, satellite) — D38.
+  - Emprise d'étude (Isère, couverture BDCharm-50) : contour, extérieur
+    estompé, pas de score ni de hotspot affiché hors emprise — D39.
+  - Libellés lisibles des essences et géologies (config.*_LABELS),
+    couche iNaturalist liée à la morille, repères en gris neutre.
 """
 from __future__ import annotations
 
@@ -44,11 +52,13 @@ import geopandas as gpd  # noqa: E402
 import matplotlib.colors as mcolors  # noqa: E402
 import numpy as np  # noqa: E402
 import rasterio  # noqa: E402
+import shapely  # noqa: E402
 from branca.element import Element  # type: ignore[import-untyped]  # noqa: E402
 from folium.plugins import MeasureControl  # noqa: E402
 from folium.raster_layers import ImageOverlay  # noqa: E402
 from PIL import Image  # noqa: E402
 from rasterio.crs import CRS  # noqa: E402
+from rasterio.features import rasterize  # noqa: E402
 from rasterio.transform import from_bounds  # noqa: E402
 from rasterio.warp import (  # noqa: E402
     Resampling,
@@ -64,6 +74,8 @@ from utils import TO_MERC, TO_WGS84  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from shapely.geometry.base import BaseGeometry
 
     from scoring import MorilleScoring
 
@@ -93,19 +105,35 @@ _ELIM_SMOOTH_SIGMA: float = 1.5
 # Seuil post-reprojection bilinéaire (< 0.5 → couverture légèrement élargie)
 _ELIM_MASK_THRESHOLD: float = 0.3
 
+# Palette séquentielle (D38) : une famille de teinte ambre → brun
+# « morille », luminance OKLab monotone, sûre pour les daltoniens (le
+# classement repose sur la clarté, pas sur la teinte). Fonds clairs :
+# clair → foncé, la meilleure classe est la plus contrastée.
 _CMAP_STOPS: tuple[tuple[float, str], ...] = (
-    (0.00, "#d73027"),
-    (0.15, "#f46d43"),
-    (0.30, "#fdae61"),
-    (0.45, "#fee08b"),
-    (0.60, "#a6d96a"),
-    (0.75, "#1a9850"),
-    (1.00, "#006837"),
+    (0.00, "#f3dca1"),
+    (0.15, "#eac266"),
+    (0.30, "#d99a1e"),
+    (0.45, "#b87501"),
+    (0.60, "#965504"),
+    (0.75, "#733803"),
+    (1.00, "#4e1d01"),
+)
+# Fonds sombres (photo aérienne, satellite) : même famille, sens inversé
+# (brun → jaune) pour que les meilleures classes y restent les plus
+# visibles. Choisi via config.BASEMAPS[...]["dark"].
+_CMAP_STOPS_DARK: tuple[tuple[float, str], ...] = (
+    (0.00, "#5b2b12"),
+    (0.15, "#713408"),
+    (0.30, "#965000"),
+    (0.45, "#bd7204"),
+    (0.60, "#e0991a"),
+    (0.75, "#fec348"),
+    (1.00, "#ffeebb"),
 )
 
-_CMAP = mcolors.LinearSegmentedColormap.from_list(
-    "morilles",
-    [(pos, col) for pos, col in _CMAP_STOPS],
+_CMAP = mcolors.LinearSegmentedColormap.from_list("morilles", list(_CMAP_STOPS))
+_CMAP_DARK = mcolors.LinearSegmentedColormap.from_list(
+    "morilles_sombre", list(_CMAP_STOPS_DARK),
 )
 
 # Couches de diagnostic : zones exclues par facteur éliminatoire
@@ -123,9 +151,18 @@ _ELIM_LABEL_MAP: dict[str, tuple[str, str]] = {
 _TWI_SWATCH: str = "#4575b4"
 # Couleur des observations iNaturalist (hors de la palette des scores)
 _INAT_COLOR: str = "#6a3d9a"
+# Les observations iNaturalist sont des Morchella (species_enricher) :
+# couche affichée seulement quand cette espèce est active.
+_INAT_SPECIES: str = "esculenta"
+# Repères : gris neutre, forme losange (≠ hotspots ronds numérotés)
+_LANDMARK_COLOR: str = "#5f6368"
+# Emprise d'étude : contour sombre sur halo blanc, extérieur voilé de blanc
+_AREA_LINE: str = "#2b2b2b"
+_AREA_VEIL_OPACITY: float = 0.5
 
 # Encodage data-PNG (score/altitude/pente dans RGBA)
 _SCORE_SCALE: int = 200
+_SCORE_OUT: int = 254   # hors emprise d'étude (pas de score affiché)
 _SCORE_NAN: int = 255
 _ALT_OFFSET: int = 500
 _SLOPE_OFFSET: int = 1
@@ -138,46 +175,16 @@ _SLOPE_SCALE: float = 2.0
 def _default_landmarks() -> list[dict[str, Any]]:
     """Points de repère par défaut pour l'Isère."""
     return [
-        {
-            "name": "Grenoble",
-            "lat": 45.1885,
-            "lon": 5.7245,
-            "info": "Préfecture de l'Isère",
-            "icon": "home",
-            "icon_color": "blue",
-        },
-        {
-            "name": "Voiron",
-            "lat": 45.3650,
-            "lon": 5.5910,
-            "info": "Porte de la Chartreuse",
-            "icon": "info-sign",
-            "icon_color": "green",
-        },
-        {
-            "name": "Vizille",
-            "lat": 45.0770,
-            "lon": 5.7720,
-            "info": "Vallée de la Romanche",
-            "icon": "info-sign",
-            "icon_color": "green",
-        },
-        {
-            "name": "La Mure",
-            "lat": 44.9040,
-            "lon": 5.7840,
-            "info": "Plateau matheysin",
-            "icon": "info-sign",
-            "icon_color": "green",
-        },
-        {
-            "name": "Sassenage",
-            "lat": 45.2130,
-            "lon": 5.6620,
-            "info": "Cuves de Sassenage — calcaire",
-            "icon": "info-sign",
-            "icon_color": "darkgreen",
-        },
+        {"name": "Grenoble", "lat": 45.1885, "lon": 5.7245,
+         "info": "Préfecture de l'Isère"},
+        {"name": "Voiron", "lat": 45.3650, "lon": 5.5910,
+         "info": "Porte de la Chartreuse"},
+        {"name": "Vizille", "lat": 45.0770, "lon": 5.7720,
+         "info": "Vallée de la Romanche"},
+        {"name": "La Mure", "lat": 44.9040, "lon": 5.7840,
+         "info": "Plateau matheysin"},
+        {"name": "Sassenage", "lat": 45.2130, "lon": 5.6620,
+         "info": "Cuves de Sassenage — calcaire"},
     ]
 
 
@@ -218,7 +225,10 @@ def _relative_luminance(rgb: tuple[float, float, float]) -> float:
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
-def _class_swatches(thresholds: list[float]) -> tuple[list[str], list[str]]:
+def _class_swatches(
+    thresholds: list[float],
+    cmap: mcolors.Colormap = _CMAP,
+) -> tuple[list[str], list[str]]:
     """Couleur de chaque classe (colormap au milieu de la classe, donc
     fidèle à la carte) et couleur de texte la plus contrastée dessus."""
     bounds = [0.0, *thresholds, 1.0]
@@ -226,7 +236,7 @@ def _class_swatches(thresholds: list[float]) -> tuple[list[str], list[str]]:
     texts: list[str] = []
     dark_lum = _relative_luminance(mcolors.to_rgb("#1b1b1b"))
     for lo, hi in zip(bounds[:-1], bounds[1:]):
-        rgb = mcolors.to_rgb(_CMAP((lo + hi) / 2.0))
+        rgb = mcolors.to_rgb(cmap((lo + hi) / 2.0))
         fills.append(mcolors.to_hex(rgb))
         lum = _relative_luminance(rgb)
         on_white = 1.05 / (lum + 0.05)
@@ -235,15 +245,57 @@ def _class_swatches(thresholds: list[float]) -> tuple[list[str], list[str]]:
     return fills, texts
 
 
-def _display_value(value: Any) -> str | None:
-    """Clé canonique brute → libellé affichable (None si inconnue)."""
-    if value is None:
+def _palette_cfg(
+    stops: tuple[tuple[float, str], ...],
+    cmap: mcolors.Colormap,
+    thresholds: list[float],
+) -> dict[str, Any]:
+    """Palette telle que la consomme le JS (LUT, légende, marqueurs)."""
+    swatches, swatch_text = _class_swatches(thresholds, cmap)
+    return {
+        "stops": [[pos, col] for pos, col in stops],
+        "swatches": swatches,
+        "swatchText": swatch_text,
+    }
+
+
+def _dissolve_study_area(study_area: Any) -> BaseGeometry | None:
+    """Emprise d'étude en Lambert-93 : union des polygones fournis
+    (BDCharm-50 départemental = couverture sans recouvrement, d'où
+    coverage_union_all ≈ 1 s contre ≈ 10 s pour union_all)."""
+    if study_area is None:
         return None
-    text = str(value).strip()
-    if not text or text.lower() in {"unknown", "inconnu", "none", "nan", "?"}:
+    if isinstance(study_area, (gpd.GeoDataFrame, gpd.GeoSeries)):
+        geoms = (
+            study_area.geometry
+            if isinstance(study_area, gpd.GeoDataFrame)
+            else study_area
+        )
+        if geoms.crs is not None and geoms.crs.to_epsg() != 2154:
+            geoms = geoms.to_crs(epsg=2154)
+        arr = np.asarray(geoms[~(geoms.isna() | geoms.is_empty)].values)
+        if arr.size == 0:
+            return None
+        try:
+            geom = shapely.coverage_union_all(arr)
+        except shapely.errors.GEOSException:
+            geom = shapely.union_all(arr)
+    else:
+        geom = study_area
+    if geom is None or geom.is_empty:
         return None
-    text = text.replace("_", " ")
-    return text[:1].upper() + text[1:]
+    if not geom.is_valid:
+        geom = shapely.make_valid(geom)
+    return geom
+
+
+def _polygons(geom: BaseGeometry) -> list[Any]:
+    """Polygones d'une géométrie (Polygon, MultiPolygon, collection)."""
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if hasattr(geom, "geoms"):
+        return [p for g in geom.geoms for p in _polygons(g)]
+    return []
 
 
 def _js_json(obj: Any) -> str:
@@ -283,7 +335,11 @@ class MorilleVisualizer:
         weather_days: list[Any] | None = None,
         debug_layers: bool = False,
         default_hotspots_shown: int = _DEFAULT_HOTSPOTS_SHOWN,
+        study_area: Any = None,
     ) -> None:
+        """study_area : emprise d'étude (GeoDataFrame dont on fait l'union,
+        ou géométrie Lambert-93). Hors emprise, la carte n'affiche ni score
+        ni hotspot et estompe le fond (D39). None = pas de restriction."""
         # ── v2.6.0 — accepter dict[species, MorilleScoring] OU instance unique
         if isinstance(scoring_model, dict):
             self.models: dict[str, MorilleScoring] = dict(scoring_model)
@@ -430,6 +486,27 @@ class MorilleVisualizer:
             "Raster WGS84 : %dx%d px", self._dst_width, self._dst_height,
         )
 
+        # Emprise d'étude ∩ grille (D39) + masque au pas du rendu Mercator
+        self._study_area: BaseGeometry | None = None
+        self._study_mask: np.ndarray | None = None
+        area = _dissolve_study_area(study_area)
+        if area is not None:
+            grid_box = shapely_box(
+                self._xmin_l93, self._ymin_l93, self._xmax_l93, self._ymax_l93,
+            )
+            area = area.intersection(grid_box)
+            # Écarter les miettes de découpe (< 10 ha)
+            parts = [p for p in _polygons(area) if p.area >= 1e5]
+            if parts:
+                self._study_area = shapely.multipolygons(parts)
+                shapely.prepare(self._study_area)
+                self._study_mask = self._rasterize_study_mask(self._study_area)
+                logger.info(
+                    "✅ Emprise d'étude : %.0f km² (%.0f %% de la grille)",
+                    self._study_area.area / 1e6,
+                    self._study_area.area / grid_box.area * 100,
+                )
+
     # ──────────────────────────────────────────────────────
     # Validation
     # ──────────────────────────────────────────────────────
@@ -510,6 +587,63 @@ class MorilleVisualizer:
         if is_mask:
             return np.asarray(np.nan_to_num(dst, nan=0.0) > 0.5)
         return np.asarray(dst)
+
+    # ──────────────────────────────────────────────────────
+    # Emprise d'étude (D39)
+    # ──────────────────────────────────────────────────────
+    def _rasterize_study_mask(self, area: BaseGeometry) -> np.ndarray:
+        """Masque bool « dans l'emprise » sur la grille de rendu Mercator
+        (mêmes pixels que les data PNG, D29)."""
+        merc = shapely.transform(
+            area, lambda xy: np.column_stack(TO_MERC.transform(xy[:, 0], xy[:, 1])),
+        )
+        mask = rasterize(
+            [(merc, 1)],
+            out_shape=(self._dst_height, self._dst_width),
+            transform=self._dst_transform,
+            fill=0,
+            dtype="uint8",
+        )
+        return np.asarray(mask, dtype=bool)
+
+    def _study_area_geojson(self) -> dict[str, Any] | None:
+        """Contour (Polygon/MultiPolygon) et voile extérieur (monde troué
+        par l'emprise) en GeoJSON WGS84, simplifiés à l'échelle de la
+        maille et arrondis à ~1 m."""
+        if self._study_area is None:
+            return None
+        tol = max(float(config.CELL_SIZE) / 2.0, 10.0)
+        simple = self._study_area.simplify(tol, preserve_topology=True)
+
+        def ring(coords: Any) -> list[list[float]]:
+            xy = np.asarray(coords)[:, :2]
+            lon, lat = self._to_wgs84.transform(xy[:, 0], xy[:, 1])
+            return [
+                [round(float(x), 5), round(float(y), 5)]
+                for x, y in zip(lon, lat)
+            ]
+
+        polys = [
+            [ring(p.exterior.coords), *(ring(h.coords) for h in p.interiors)]
+            for p in _polygons(simple)
+        ]
+        world = [[-180.0, -85.0], [180.0, -85.0], [180.0, 85.0],
+                 [-180.0, 85.0], [-180.0, -85.0]]
+        return {
+            "outline": {"type": "MultiPolygon", "coordinates": polys},
+            "veil": {
+                "type": "Polygon",
+                "coordinates": [world, *(p[0] for p in polys)],
+            },
+        }
+
+    def _inside_study_area(self, hotspots: list[dict[str, Any]]) -> np.ndarray:
+        """Hotspots (centroïdes L93) situés dans l'emprise d'étude."""
+        if self._study_area is None or not hotspots:
+            return np.ones(len(hotspots), dtype=bool)
+        xs = np.array([float(h["x_l93"]) for h in hotspots])
+        ys = np.array([float(h["y_l93"]) for h in hotspots])
+        return np.asarray(shapely.contains_xy(self._study_area, xs, ys))
 
     # ──────────────────────────────────────────────────────
     # Renderers statiques (thread-safe, pas d'état mutable)
@@ -670,7 +804,8 @@ class MorilleVisualizer:
         """PNG niveaux de gris du score d'une espèce, lu par le JS (rendu
         de la couche de probabilité + lecture de cellule).
 
-        Valeur = score × 200 (0–200 → 0.00–1.00), 255 = NaN.
+        Valeur = score × 200 (0–200 → 0.00–1.00), 254 = hors emprise
+        d'étude (D39), 255 = NaN.
         Altitude et pente, communes aux espèces, sont dans le PNG terrain.
 
         v2.6.0 : species kwarg sélectionne le raster source. Si None → primary.
@@ -684,6 +819,8 @@ class MorilleVisualizer:
             (score_wgs[valid_s] * _SCORE_SCALE).astype(np.int32),
             0, _SCORE_SCALE,
         ).astype(np.uint8)
+        if self._study_mask is not None:
+            gray[~self._study_mask] = _SCORE_OUT
 
         png_bytes = self._encode_opaque_png(gray)
         h, w = gray.shape
@@ -741,12 +878,11 @@ class MorilleVisualizer:
     # Panneau latéral + couche de probabilité rendue en JS
     # ──────────────────────────────────────────────────────
     def _species_info(self, species: str) -> dict[str, str]:
-        params = config.SPECIES_PARAMS.get(
-            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
-        )
+        # Pas d'emoji d'espèce : 🍄 est une amanite tue-mouches et 🌰 une
+        # châtaigne (essence du modèle) — le nom suffit.
+        params = config.get_species_params(species)
         return {
             "name": str(params.get("common_name", species)),
-            "emoji": str(params.get("emoji", "🍄")),
             "scientific": str(params.get("scientific_name", species)),
         }
 
@@ -774,15 +910,17 @@ class MorilleVisualizer:
         active."""
         labels = list(config.PROBABILITY_LABELS)
         thresholds = [float(t) for t in config.PROBABILITY_THRESHOLDS]
-        swatches, swatch_text = _class_swatches(thresholds)
+        palettes = {
+            "light": _palette_cfg(_CMAP_STOPS, _CMAP, thresholds),
+            "dark": _palette_cfg(_CMAP_STOPS_DARK, _CMAP_DARK, thresholds),
+        }
         info = {sp: self._species_info(sp) for sp in self.species_list}
 
         species_radios = "".join(
             f'<label><input type="radio" name="cs-species" '
             f'value="{html.escape(sp)}"'
             f'{" checked" if sp == self.primary_species else ""}>'
-            f'<span aria-hidden="true">{html.escape(info[sp]["emoji"])}</span>'
-            f' {html.escape(info[sp]["name"])}</label>'
+            f'{html.escape(info[sp]["name"])}</label>'
             for sp in self.species_list
         )
         basemap_options = "".join(
@@ -790,22 +928,34 @@ class MorilleVisualizer:
             f'{html.escape(b["label"])}</option>'
             for b in basemaps
         )
+        # (clé, libellé, style de pastille, cochée au départ)
         layer_defs = (
+            ("area", "Limite de la zone étudiée (Isère)",
+             f"background:#fff;border:2px solid {_AREA_LINE};border-radius:2px",
+             True),
             ("inat",
-             f"Observations iNaturalist — morilles "
+             f"Observations iNaturalist de morilles "
              f"({len(self._inat_observations)})",
-             _INAT_COLOR, True),
-            ("hydro", "Cours d'eau", "#0077cc", False),
-            ("landmarks", "Points de repère", "#2a81cb", True),
+             f"background:{_INAT_COLOR}", True),
+            ("hydro", "Cours d'eau", "background:#0077cc", False),
+            ("landmarks", "Points de repère",
+             f"background:{_LANDMARK_COLOR};border-radius:2px;"
+             "transform:rotate(45deg) scale(.8)", True),
         )
         layer_checks = "".join(
             f'<label class="cs-check"><input type="checkbox" '
             f'data-layer="{key}"{" checked" if on else ""}>'
-            f'<span class="cs-dot" style="background:{color}" '
+            f'<span class="cs-dot" style="{style}" '
             f'aria-hidden="true"></span><span>{html.escape(label)}</span></label>'
-            for key, label, color, on in layer_defs
+            for key, label, style, on in layer_defs
             if layer_vars.get(key)
         )
+        n_out = {
+            sp: int(np.count_nonzero(
+                ~self._inside_study_area(self.hotspots_by_species.get(sp, [])),
+            ))
+            for sp in self.species_list
+        }
         diag_block = (
             '<details class="cs-diag"><summary>Couches de diagnostic</summary>'
             '<p class="cs-hint">Zones exclues du modèle pour l\'espèce '
@@ -832,10 +982,9 @@ class MorilleVisualizer:
             "labels": labels,
             "thresholds": thresholds,
             "classAlpha": _class_alphas(len(labels)),
-            "swatches": swatches,
-            "swatchText": swatch_text,
-            "cmapStops": [[pos, col] for pos, col in _CMAP_STOPS],
+            "palettes": palettes,
             "scoreScale": _SCORE_SCALE,
+            "outCode": _SCORE_OUT,
             "altOffset": _ALT_OFFSET,
             "slopeOffset": _SLOPE_OFFSET,
             "slopeScale": _SLOPE_SCALE,
@@ -847,9 +996,16 @@ class MorilleVisualizer:
                 sp: len(self.hotspots_by_species.get(sp, []))
                 for sp in self.species_list
             },
+            "hotspotsOutside": n_out,
             "hotspotsDefault": self.default_hotspots_shown,
             "basemaps": basemaps,
             "layers": layer_vars,
+            "layerSpecies": {"inat": _INAT_SPECIES},
+            "area": self._study_area_geojson(),
+            "areaStyle": {
+                "line": _AREA_LINE,
+                "veilOpacity": _AREA_VEIL_OPACITY,
+            },
             "diag": diag_layers,
         }
 
@@ -926,6 +1082,7 @@ class MorilleVisualizer:
             border: 1px solid rgba(0,0,0,.3);
         }
         .cs-swatch-none { border-style: dashed; }
+        .cs-swatch-out { background: #ececec; border: 2px solid %AREA_LINE%; }
         .cs-range { margin-left: auto; color: #4a554a; font-size: 12px;
                     font-variant-numeric: tabular-nums; white-space: nowrap; }
         .cs-link {
@@ -967,6 +1124,12 @@ class MorilleVisualizer:
             pointer-events: none;
         }
         .cs-prob { image-rendering: auto; }
+        .cs-lm { background: transparent; border: 0; }
+        .cs-lm span {
+            display: block; width: 10px; height: 10px; margin: 2px;
+            background: %LANDMARK_COLOR%; border: 2px solid #fff; border-radius: 2px;
+            transform: rotate(45deg); box-shadow: 0 1px 3px rgba(0,0,0,.45);
+        }
         .cs-hs { background: transparent; border: 0; }
         .cs-hs span {
             display: flex; align-items: center; justify-content: center;
@@ -1000,6 +1163,8 @@ class MorilleVisualizer:
                     <h2 id="cs-legend-title">Probabilité</h2>
                     <p class="cs-hint">Cliquez une classe pour la masquer ou l'afficher.</p>
                     <ul class="cs-legend" id="cs-legend"></ul>
+                    <p class="cs-hint" id="cs-palette-hint" hidden>Sur photo aérienne,
+                        couleurs inversées : plus c'est clair, meilleur c'est.</p>
                     <button type="button" class="cs-link" id="cs-legend-reset" hidden>Tout afficher</button>
                     <div class="cs-row">
                         <label for="cs-opacity">Opacité</label>
@@ -1042,7 +1207,8 @@ class MorilleVisualizer:
             if (!map) { return; }
 
             var LABELS = CFG.labels, TH = CFG.thresholds, ALPHA = CFG.classAlpha;
-            var SW = CFG.swatches, SWTXT = CFG.swatchText, N = CFG.scoreScale;
+            var N = CFG.scoreScale, OUT = CFG.outCode;
+            var SW = [], SWTXT = [];  /* couleurs de classe de la palette active */
             var IDLE = 'Survolez ou touchez la carte';
             var current = CFG.primary;
             var visible = LABELS.map(function (_, i) { return i > 0; });
@@ -1086,9 +1252,17 @@ class MorilleVisualizer:
             L.control.scale({position: 'bottomright', imperial: false, maxWidth: 140}).addTo(map);
 
             /* ═══════ Couleurs : LUT score → couleur continue + classe ═══════ */
+            /* Palette claire → foncée sur les fonds clairs, inversée sur les
+               fonds sombres (photo aérienne) : la meilleure classe reste la
+               plus contrastée avec le fond (D38). */
             var lutRgb = new Uint8ClampedArray((N + 1) * 3), lutCls = new Uint8Array(N + 1);
-            (function () {
-                var stops = CFG.cmapStops.map(function (s) { return [s[0], hexToRgb(s[1])]; });
+            var paletteKey = null;
+            function setPalette(key) {
+                if (key === paletteKey) { return false; }
+                paletteKey = key;
+                var p = CFG.palettes[key];
+                SW = p.swatches; SWTXT = p.swatchText;
+                var stops = p.stops.map(function (s) { return [s[0], hexToRgb(s[1])]; });
                 for (var v = 0; v <= N; v++) {
                     var s = v / N, rgb = stops[stops.length - 1][1];
                     for (var i = 1; i < stops.length; i++) {
@@ -1103,7 +1277,13 @@ class MorilleVisualizer:
                     lutRgb[v * 3] = rgb[0]; lutRgb[v * 3 + 1] = rgb[1]; lutRgb[v * 3 + 2] = rgb[2];
                     lutCls[v] = classOf(s);
                 }
-            })();
+                document.getElementById('cs-palette-hint').hidden = key !== 'dark';
+                return true;
+            }
+            CFG.basemaps.forEach(function (b) {
+                if (b['default']) { setPalette(b.dark ? 'dark' : 'light'); }
+            });
+            if (!paletteKey) { setPalette('light'); }
 
             /* ═══════ Données : score par espèce + terrain (R=pente, G+B=altitude) ═══════ */
             var dataPx = {}, dataW = 0, dataH = 0, terrainPx = null;
@@ -1193,6 +1373,13 @@ class MorilleVisualizer:
                     }
                     ul.appendChild(li);
                 }
+                if (CFG.area) {
+                    var out = document.createElement('li');
+                    out.innerHTML = '<span class="cs-nul"><span class="cs-swatch cs-swatch-out"'
+                        + ' aria-hidden="true"></span><span>Hors zone étudiée : estompé,'
+                        + ' sans score</span></span>';
+                    ul.appendChild(out);
+                }
                 legendReset.hidden = visible.slice(1).every(Boolean);
             }
             function onClassClick(e) {
@@ -1226,7 +1413,7 @@ class MorilleVisualizer:
                 if (h.alt !== undefined) { facts.push('altitude ' + h.alt + ' m'); }
                 if (h.sl !== undefined) { facts.push('pente ' + fmt(h.sl, 0) + '°'); }
                 var lines = [
-                    '<b>' + esc(sp.emoji + ' ' + sp.name) + ' — hotspot n°' + h.r + '</b>',
+                    '<b>' + esc(sp.name) + ' — hotspot n°' + h.r + '</b>',
                     'Score moyen <b>' + fmt(h.s, 2) + '</b> · ' + esc(LABELS[classOf(h.s)]),
                     facts.join(' · ')
                 ];
@@ -1246,11 +1433,15 @@ class MorilleVisualizer:
                 hsN.value = String(Math.max(1, n));
                 hsN.disabled = total <= 1;
                 hsNOut.textContent = String(n);
-                hsInfo.textContent = total
-                    ? 'Les ' + n + ' meilleurs sur ' + detected.toLocaleString('fr-FR') + ' détectés'
-                      + (detected > total ? ' (carte limitée aux ' + total.toLocaleString('fr-FR')
+                var outside = CFG.hotspotsOutside[current] || 0;
+                var inside = detected - outside;
+                hsInfo.textContent = (total
+                    ? 'Les ' + n + ' meilleurs sur ' + inside.toLocaleString('fr-FR') + ' détectés'
+                      + (inside > total ? ' (carte limitée aux ' + total.toLocaleString('fr-FR')
                          + ' premiers, liste complète dans le CSV)' : '')
-                    : 'Aucun hotspot détecté';
+                    : 'Aucun hotspot détecté')
+                    + (outside ? ' · ' + outside.toLocaleString('fr-FR')
+                       + ' hors zone étudiée non affichés' : '');
                 if (!hsShow.checked) { return; }
                 for (var i = 0; i < n; i++) {
                     var h = list[i], c = classOf(h.s);
@@ -1282,16 +1473,52 @@ class MorilleVisualizer:
                 if (!layer || layer === baseLayer) { return; }
                 if (baseLayer) { map.removeLayer(baseLayer); }
                 layer.addTo(map); layer.bringToBack(); baseLayer = layer;
-            });
-            document.querySelectorAll('#cs-layers input[data-layer]').forEach(function (input) {
-                var layer = window[CFG.layers[input.dataset.layer]];
-                if (!layer) { input.closest('label').hidden = true; return; }
-                function sync() {
-                    if (input.checked) { map.addLayer(layer); } else { map.removeLayer(layer); }
+                if (setPalette(b.dark ? 'dark' : 'light')) {
+                    buildLegend(); renderProb(); renderHotspots();
                 }
-                input.addEventListener('change', sync);
-                sync();
             });
+
+            /* Zone étudiée (D39) : contour sur halo blanc + extérieur voilé,
+               dans un volet au-dessus de la probabilité, sous les marqueurs. */
+            if (CFG.area) {
+                map.createPane('csArea');
+                var areaPane = map.getPane('csArea');
+                areaPane.style.zIndex = 450;
+                areaPane.style.pointerEvents = 'none';
+                var AS = CFG.areaStyle;
+                window.cartom_study_area = L.layerGroup([
+                    L.geoJSON(CFG.area.veil, {pane: 'csArea', interactive: false, style: {
+                        stroke: false, fillColor: '#ffffff', fillOpacity: AS.veilOpacity
+                    }}),
+                    L.geoJSON(CFG.area.outline, {pane: 'csArea', interactive: false, style: {
+                        color: '#ffffff', weight: 4.5, opacity: 0.85, fill: false
+                    }}),
+                    L.geoJSON(CFG.area.outline, {pane: 'csArea', interactive: false, style: {
+                        color: AS.line, weight: 2, opacity: 0.95, fill: false
+                    }})
+                ]);
+            }
+
+            /* Couches : certaines ne valent que pour une espèce (les
+               observations iNaturalist sont des morilles). */
+            var layerRows = [];
+            document.querySelectorAll('#cs-layers input[data-layer]').forEach(function (input) {
+                var key = input.dataset.layer, layer = window[CFG.layers[key]];
+                var row = input.closest('label');
+                if (!layer) { row.hidden = true; return; }
+                layerRows.push({input: input, layer: layer, row: row,
+                                species: CFG.layerSpecies[key] || null});
+                input.addEventListener('change', syncLayers);
+            });
+            function syncLayers() {
+                layerRows.forEach(function (l) {
+                    var off = l.species !== null && l.species !== current;
+                    l.row.hidden = off;
+                    if (l.input.checked && !off) { map.addLayer(l.layer); }
+                    else { map.removeLayer(l.layer); }
+                });
+            }
+            syncLayers();
 
             /* ═══════ Couches de diagnostic (option --debug-layers) ═══════ */
             var diagOn = {};
@@ -1340,10 +1567,15 @@ class MorilleVisualizer:
                 var py = Math.floor((yN - mercY(ll.lat)) / (yN - yS) * dataH);
                 px = Math.max(0, Math.min(px, dataW - 1));
                 py = Math.max(0, Math.min(py, dataH - 1));
-                var o = (py * dataW + px) * 4;
-                if (d[o] > N) { readout.textContent = 'Pas de données ici'; return; }
-                var s = d[o] / N;
-                var parts = [sp.emoji + ' ' + sp.name + ' : ' + fmt(s, 2) + ' · ' + LABELS[classOf(s)]];
+                var o = (py * dataW + px) * 4, v = d[o], parts;
+                if (v === OUT) {
+                    parts = ['Hors zone étudiée (Isère) : pas de score'];
+                } else if (v > N) {
+                    readout.textContent = 'Pas de données ici';
+                    return;
+                } else {
+                    parts = [sp.name + ' : ' + fmt(v / N, 2) + ' · ' + LABELS[classOf(v / N)]];
+                }
                 if (terrainPx) {
                     var alt = terrainPx[o + 1] + (terrainPx[o + 2] << 8);
                     if (alt > 0) { parts.push(Math.round(alt - CFG.altOffset) + ' m'); }
@@ -1363,7 +1595,7 @@ class MorilleVisualizer:
                 current = sp;
                 document.getElementById('cs-legend-title').textContent =
                     'Probabilité — ' + CFG.species[sp].name;
-                renderProb(); renderHotspots(); syncDiag();
+                renderProb(); renderHotspots(); syncDiag(); syncLayers();
                 if (dataPx[current]) { readout.textContent = IDLE; }
             }
             document.querySelectorAll('input[name="cs-species"]').forEach(function (r) {
@@ -1415,6 +1647,8 @@ class MorilleVisualizer:
             "%WEATHER_SECTION%": weather_html,
             "%TERRAIN_URI%": terrain_uri,
             "%DATA_IMGS%": data_imgs,
+            "%AREA_LINE%": _AREA_LINE,
+            "%LANDMARK_COLOR%": _LANDMARK_COLOR,
             "%CONFIG_JSON%": _js_json(cfg),
         }
         for token, value in replacements.items():
@@ -1460,6 +1694,8 @@ class MorilleVisualizer:
                 "label": label,
                 "var": layer.get_name(),
                 "default": is_default,
+                # Fond sombre → palette inversée (D38)
+                "dark": bool(cfg.get("dark", False)),
             })
         return basemaps
 
@@ -1495,11 +1731,13 @@ class MorilleVisualizer:
     # Couche iNaturalist Morchella
     # ──────────────────────────────────────────────────────
     def _add_inaturalist_layer(self, folium_map: folium.Map) -> str | None:
-        if not self._inat_observations:
+        """Observations Morchella : affichées seulement quand la morille
+        est l'espèce active (le JS masque la couche pour les autres)."""
+        if not self._inat_observations or _INAT_SPECIES not in self.species_list:
             return None
 
         fg = folium.FeatureGroup(
-            name="Observations iNaturalist", show=True, control=False,
+            name="Observations iNaturalist de morilles", show=True, control=False,
         )
         for obs in self._inat_observations:
             lat = obs.get("lat")
@@ -1539,32 +1777,38 @@ class MorilleVisualizer:
     # Section météo du panneau
     # ──────────────────────────────────────────────────────
     def _weather_section_html(self) -> str:
-        """Section « Météo prospection » du panneau ('' sans données)."""
+        """Section météo du panneau ('' sans données). Même échelle que la
+        carte : classe du jour = config.PROBABILITY_* (weather.py)."""
         if not self._weather_days:
             return ""
 
+        good = config.PROBABILITY_LABELS.index("Bon")
+        medium = config.PROBABILITY_LABELS.index("Moyen")
         rows = ""
         best_day = None
         best_score = -1.0
         for d in self._weather_days:
             score = float(d.score)
-            label = html.escape(str(d.label))
+            level = int(np.digitize(score, config.PROBABILITY_THRESHOLDS))
+            label = html.escape(config.PROBABILITY_LABELS[level])
             date_str = html.escape(str(d.date_fr))
-            # Icône selon le niveau
-            if score >= 0.7:
+            # Icône : favorable (Bon et +), moyen, défavorable
+            if level >= good:
                 icon = "&#9733;"  # star
                 cls = "wx-good"
-            elif score >= 0.4:
+            elif level >= medium:
                 icon = "&#9679;"  # circle
                 cls = "wx-ok"
             else:
                 icon = "&#9675;"  # empty circle
                 cls = "wx-bad"
+            # Même format que les scores de la carte (0,81), pas en %
+            score_txt = f"{score:.2f}".replace(".", ",")
             rows += (
                 f'<tr class="{cls}">'
                 f"<td>{date_str}</td>"
                 f"<td>{icon} {label}</td>"
-                f"<td>{score:.0%}</td>"
+                f"<td>{score_txt}</td>"
                 f"</tr>"
             )
             if score > best_score:
@@ -1592,7 +1836,7 @@ class MorilleVisualizer:
         logger.info("✅ Panneau météo : %d jours affichés", len(self._weather_days))
         return (
             '<section class="cs-section cs-wx">'
-            "<h2>Météo prospection</h2>"
+            "<h2>Météo pour les morilles</h2>"
             f"<table>{rows}</table>{burst_html}{best_html}"
             "</section>"
         )
@@ -1602,12 +1846,18 @@ class MorilleVisualizer:
     # ──────────────────────────────────────────────────────
     def _hotspots_payload(self) -> dict[str, list[dict[str, Any]]]:
         """Hotspots compacts par espèce (rang, position, attributs), triés
-        comme le CSV. Les marqueurs sont créés en JS pour le top N."""
+        comme le CSV. Les marqueurs sont créés en JS pour le top N.
+        Hors emprise d'étude : écartés (D39), le rang reste celui du CSV."""
         payload: dict[str, list[dict[str, Any]]] = {}
         for species in self.species_list:
             sp_hotspots = self.hotspots_by_species.get(species, [])
+            inside = self._inside_study_area(sp_hotspots)
             records: list[dict[str, Any]] = []
-            for rank, h in enumerate(sp_hotspots[: self.max_hotspot_markers], 1):
+            for rank, h in enumerate(sp_hotspots, 1):
+                if len(records) >= self.max_hotspot_markers:
+                    break
+                if not inside[rank - 1]:
+                    continue
                 lon, lat = self._l93_to_wgs84(h["x_l93"], h["y_l93"])
                 rec: dict[str, Any] = {
                     "r": rank,
@@ -1623,36 +1873,45 @@ class MorilleVisualizer:
                 slope = h.get("mean_slope")
                 if slope is not None and np.isfinite(slope):
                     rec["sl"] = round(float(slope), 1)
-                tree = _display_value(h.get("dominant_species"))
+                tree = config.tree_label(h.get("dominant_species"))
                 if tree:
                     rec["tr"] = tree
-                geology = _display_value(h.get("dominant_geology"))
+                geology = config.geology_label(h.get("dominant_geology"))
                 if geology:
                     rec["g"] = geology
                 records.append(rec)
             payload[species] = records
-            logger.info("✅ Hotspots [%s] : %d sur la carte", species, len(records))
+            n_out = int(np.count_nonzero(~inside))
+            logger.info(
+                "✅ Hotspots [%s] : %d sur la carte%s", species, len(records),
+                f" ({n_out} hors emprise d'étude écartés)" if n_out else "",
+            )
         return payload
 
     # ──────────────────────────────────────────────────────
     # Landmarks
     # ──────────────────────────────────────────────────────
     def _add_landmarks(self, folium_map: folium.Map) -> str:
+        """Repères : petits losanges gris neutres, pour ne pas ressembler
+        aux hotspots (disques numérotés aux couleurs des classes)."""
         lg = folium.FeatureGroup(
             name="Points de repère", show=True, control=False,
         )
         for lm in self.landmarks:
             popup_html = (
-                f"<b>{lm['name']}</b><br>{lm.get('info', '')}<br>"
+                f"<b>{html.escape(str(lm['name']))}</b><br>"
+                f"{html.escape(str(lm.get('info', '')))}<br>"
                 f"<small>{lm['lat']:.4f}°N, {lm['lon']:.4f}°E</small>"
             )
             folium.Marker(
                 location=[lm["lat"], lm["lon"]],
                 popup=folium.Popup(popup_html, max_width=280),
-                tooltip=lm["name"],
-                icon=folium.Icon(
-                    color=lm.get("icon_color", "blue"),
-                    icon=lm.get("icon", "info-sign"),
+                tooltip=str(lm["name"]),
+                icon=folium.DivIcon(
+                    html="<span></span>",
+                    icon_size=(18, 18),
+                    icon_anchor=(9, 9),
+                    class_name="cs-lm",
                 ),
             ).add_to(lg)
         lg.add_to(folium_map)
@@ -1756,6 +2015,8 @@ class MorilleVisualizer:
 
         # ── Couches vectorielles + marqueurs fixes ──
         layer_vars: dict[str, str | None] = {
+            # Créée par le JS du panneau (volet dédié au-dessus des scores)
+            "area": "cartom_study_area" if self._study_area is not None else None,
             "inat": self._add_inaturalist_layer(m),
             "hydro": self._add_hydro_vector_layer(m),
             "landmarks": self._add_landmarks(m),

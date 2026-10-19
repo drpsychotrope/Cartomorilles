@@ -454,15 +454,42 @@ def compute_statistics(
     final_score: np.ndarray,
     threshold: float,
 ) -> dict[str, Any]:
-    """Calcule les statistiques du score final."""
+    """Calcule les statistiques du score final.
+
+    `classes` = répartition dans les 6 classes de la carte
+    (config.PROBABILITY_*), en % des cellules avec données. Les clés
+    n_high / n_medium / n_low (seuils 0.7 / 0.4) restent dans le rapport
+    JSON pour comparer avec les calibrations passées (D35).
+    """
     base = compute_array_stats(final_score, decimals=4)
+    finite = np.isfinite(final_score)
+    n_valid = int(np.count_nonzero(finite))
+    counts = np.bincount(
+        np.digitize(final_score[finite], config.PROBABILITY_THRESHOLDS),
+        minlength=len(config.PROBABILITY_LABELS),
+    )
+    bounds = [0.0, *config.PROBABILITY_THRESHOLDS, 1.0]
+    classes = [
+        {
+            "label": label,
+            "min": lo,
+            "max": hi,
+            "n": int(n),
+            "pct": round(float(n) / max(n_valid, 1) * 100, 2),
+        }
+        for label, lo, hi, n in zip(
+            config.PROBABILITY_LABELS, bounds[:-1], bounds[1:], counts,
+        )
+    ]
     return {
         "n_cells": int(final_score.size),
+        "n_valid": n_valid,
         "score_min": base["min"],
         "score_max": base["max"],
         "score_mean": base["mean"],
         "score_median": base["median"],
         "score_std": base["std"],
+        "classes": classes,
         "n_high": int(np.sum(final_score >= SCORE_THRESHOLD_HIGH)),
         "n_medium": int(np.sum(
             (final_score >= SCORE_THRESHOLD_MEDIUM)
@@ -483,8 +510,24 @@ def compute_statistics(
     }
 
 
+def _class_range(lo: float, hi: float) -> str:
+    """Bornes d'une classe, comme la légende de la carte."""
+    if lo <= 0.0:
+        return f"< {hi:.2f}"
+    if hi >= 1.0:
+        return f"≥ {lo:.2f}"
+    return f"{lo:.2f}–{hi:.2f}"
+
+
+def _score_class(score: float) -> str:
+    """Classe de probabilité (libellé) d'un score."""
+    idx = int(np.digitize(score, config.PROBABILITY_THRESHOLDS))
+    return config.PROBABILITY_LABELS[idx]
+
+
 def display_statistics(stats: dict[str, Any]) -> None:
-    """Affiche les statistiques en console/log."""
+    """Affiche les statistiques en console/log : mêmes 6 classes que la
+    légende de la carte, de la meilleure à la plus faible."""
     logger.info("")
     logger.info("📊 Statistiques du score final :")
     logger.info(
@@ -493,18 +536,18 @@ def display_statistics(stats: dict[str, Any]) -> None:
         stats["score_mean"], stats["score_median"],
         stats["score_std"],
     )
-    logger.info(
-        "   🟢 Élevée  (≥0.7)     : %8s cellules (%.1f%%)",
-        f"{stats['n_high']:,}", stats["pct_high"],
-    )
-    logger.info(
-        "   🟡 Moyenne (0.4–0.7)  : %8s cellules (%.1f%%)",
-        f"{stats['n_medium']:,}", stats["pct_medium"],
-    )
-    logger.info(
-        "   ⚪ Faible  (<0.4)     : %8s cellules",
-        f"{stats['n_low']:,}",
-    )
+    for i, c in reversed(list(enumerate(stats["classes"]))):
+        label = "Nul ou exclu" if i == 0 else c["label"]
+        logger.info(
+            "   %-13s %-10s : %12s cellules (%5.1f %%) %s",
+            label, _class_range(c["min"], c["max"]), f"{c['n']:,}",
+            c["pct"], "█" * int(c["pct"] / 2),
+        )
+    n_nodata = stats["n_cells"] - stats["n_valid"]
+    if n_nodata > 0:
+        logger.info(
+            "   %-24s : %12s cellules", "Sans données", f"{n_nodata:,}",
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -603,25 +646,28 @@ def display_hotspots(
         "\n🎯 Top %d hotspots (sur %d détectés) :", n_show, len(hotspots),
     )
 
-    for h in hotspots[:n_show]:
+    # Numéro = rang (comme les marqueurs de la carte et la colonne rank du CSV)
+    for rank, h in enumerate(hotspots[:n_show], 1):
         lon, lat = TO_WGS84.transform(h["x_l93"], h["y_l93"])
 
         parts: list[str] = [
-            f"Score {h['mean_score']:.2f}",
+            f"Score {h['mean_score']:.2f} ({_score_class(h['mean_score'])})",
             f"{h['size_m2']:.0f}m²",
         ]
         if h.get("altitude") is not None:
             parts.append(f"alt={h['altitude']:.0f}m")
         if h.get("mean_slope") is not None:
             parts.append(f"pente={h['mean_slope']:.0f}°")
-        if h.get("dominant_species"):
-            parts.append(f"🌳 {h['dominant_species']}")
-        if h.get("dominant_geology"):
-            parts.append(f"🪨 {h['dominant_geology']}")
+        tree = config.tree_label(h.get("dominant_species"))
+        if tree:
+            parts.append(f"🌳 {tree}")
+        geology = config.geology_label(h.get("dominant_geology"))
+        if geology:
+            parts.append(f"🪨 {geology}")
         if h.get("compactness") is not None:
             parts.append(f"compact={h['compactness']:.2f}")
 
-        logger.info("   #%d — %s", h["id"], ", ".join(parts))
+        logger.info("   n°%d — %s", rank, ", ".join(parts))
         logger.info("         📍 %.5f°N, %.5f°E", lat, lon)
         logger.info(
             "         🔗 https://www.google.com/maps?q=%.5f,%.5f", lat, lon,
@@ -1182,7 +1228,11 @@ def main(args: argparse.Namespace) -> int:
         sp_t0 = time.time()
         logger.info("")
         logger.info("─" * 70)
-        logger.info("🍄 PASS %d/%d — species=%s", sp_idx + 1, len(species_list), species)
+        sp_params = config.get_species_params(species)
+        logger.info(
+            "PASS %d/%d — %s (%s)", sp_idx + 1, len(species_list),
+            sp_params["common_name"], sp_params["scientific_name"],
+        )
         logger.info("─" * 70)
 
         # Recompute des 6 critères species-aware (grid.scores écrasé in-place)
@@ -1260,6 +1310,9 @@ def main(args: argparse.Namespace) -> int:
         inat_observations=_inat_obs,
         weather_days=weather_days,
         debug_layers=args.debug_layers,
+        # BDCharm-50 départemental = Isère : hors de cette emprise, ni
+        # géologie ni BD Forêt → pas de score affiché (D39)
+        study_area=geology_gdf if geology_source == "bdcharm50" else None,
     )
     # Carte Folium HTML — UN SEUL fichier multi-espèces avec toggle
     html_path = str(output_dir / "cartomorilles.html")
@@ -1399,7 +1452,11 @@ def main(args: argparse.Namespace) -> int:
                 concordance * 100,
             )
 
-    logger.info("\n🍄 Bonne chasse aux morilles !\n")
+    hunted = " et aux ".join(
+        str(config.get_species_params(sp).get("common_name_plural", sp))
+        for sp in species_list
+    )
+    logger.info("\n🧺 Bonne chasse aux %s !\n", hunted)
 
     _cleanup_files.clear()
 
