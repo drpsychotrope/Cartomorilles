@@ -70,6 +70,7 @@ python main.py --discover-wfs
 | `--seed` | `42` | Reproductibilité |
 | `--output-dir` | `output/` | Répertoire de sortie |
 | `--export-vector` | off | Export GPKG (volumineux) |
+| `--debug-layers` | off | Ajouter à la carte les couches de diagnostic (zones exclues, TWI brut) |
 | `--force` | off | Ignorer les avertissements (poids, taille grille) |
 
 Garde-fous : avertissement à 50 M cellules (TWI > 5 min), limite dure à 200 M sans `--force`.
@@ -78,7 +79,7 @@ Garde-fous : avertissement à 50 M cellules (TWI > 5 min), limite dure à 200 M 
 
 ## Sorties (`output/`)
 
-- `cartomorilles.html` — carte Folium interactive, multi-espèces avec toggle
+- `cartomorilles.html` — carte interactive : panneau latéral (espèce, légende-filtre par classe, opacité, hotspots numérotés, fonds et couches, météo) et lecture du score au survol ou au toucher
 - `{species}_probability.tif` — raster GeoTIFF par espèce (+ alias `morilles_probability.tif`)
 - `{species}_hotspots.csv` — hotspots triés par score, avec lien Google Maps
 - `rapport_{species}.json` — rapport complet et reproductible (config, stats, validation terrain)

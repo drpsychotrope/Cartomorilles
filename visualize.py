@@ -11,17 +11,29 @@ v2.4.0 :
   - Constantes render dédupliquées au niveau module
   - _encode_rgba helper centralisé
   - Hooks pour GPU reprojection (étape 2)
+
+Refonte UI (audit UI/UX, lots A+B) :
+  - Une seule couche de probabilité, rendue en JS depuis le data PNG de
+    l'espèce active : filtre, opacité et bascule d'espèce agissent dessus.
+  - Panneau latéral unique (espèce, légende-filtre, hotspots, couches,
+    météo) à la place des panneaux flottants et du LayerControl.
+  - Hotspots en JSON compact, marqueurs numérotés créés en JS (top N).
+  - Rendu à la résolution de la grille (plus de suréchantillonnage).
+  - Couches de diagnostic (zones exclues, TWI) seulement avec
+    debug_layers=True (option CLI --debug-layers).
 """
 from __future__ import annotations
 
 import base64
+import html
 import io
 import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import matplotlib
 
@@ -33,7 +45,7 @@ import matplotlib.colors as mcolors  # noqa: E402
 import numpy as np  # noqa: E402
 import rasterio  # noqa: E402
 from branca.element import Element  # type: ignore[import-untyped]  # noqa: E402
-from folium.plugins import MeasureControl, MiniMap, MousePosition  # noqa: E402
+from folium.plugins import MeasureControl  # noqa: E402
 from folium.raster_layers import ImageOverlay  # noqa: E402
 from PIL import Image  # noqa: E402
 from rasterio.crs import CRS  # noqa: E402
@@ -47,7 +59,7 @@ from shapely.geometry import box as shapely_box  # noqa: E402
 
 import _accel  # noqa: E402
 import config  # noqa: E402
-from config import TWI_OPTIMAL, TWI_WATERLOG  # noqa: E402
+from config import TWI_WATERLOG  # noqa: E402
 from utils import TO_MERC, TO_WGS84  # noqa: E402
 
 if TYPE_CHECKING:
@@ -65,10 +77,11 @@ __all__ = ["MorilleVisualizer"]
 _NODATA: float = -9999.0
 _MAX_HOTSPOT_MARKERS: int = 1000
 
-# Résolution de rendu — minimum ~25 m/px pour éviter pixels carrés visibles
-_RENDER_MAX_CELL_M: float = 25.0
-# Taille max du raster WGS84 reprojeté (par axe)
+# Taille max du raster reprojeté (par axe). Le rendu se fait à la
+# résolution de la grille : le navigateur lisse l'image à l'affichage.
 _RENDER_MAX_PX: int = 4000
+# Hotspots affichés à l'ouverture (le panneau permet d'en montrer plus)
+_DEFAULT_HOTSPOTS_SHOWN: int = 20
 
 # PNG : compress_level=1 ≈ ×3 plus rapide que optimize=True, ~20 % plus gros
 _PNG_COMPRESS: int = 1
@@ -95,24 +108,21 @@ _CMAP = mcolors.LinearSegmentedColormap.from_list(
     [(pos, col) for pos, col in _CMAP_STOPS],
 )
 
-_CLASS_COLORS: tuple[str, ...] = (
-    "#d73027",
-    "#f46d43",
-    "#fdae61",
-    "#fee08b",
-    "#1a9850",
-    "#006837",
-)
-
+# Couches de diagnostic : zones exclues par facteur éliminatoire
 _ELIM_LABEL_MAP: dict[str, tuple[str, str]] = {
-    "urban": ("🏠 Zones urbaines", "#555555"),
-    "water": ("💧 Cours d'eau", "#0077cc"),
-    "nodata": ("❓ NoData", "#000000"),
-    "species": ("🌳 Espèces éliminatoires", "#8b0000"),
-    "geology": ("🪨 Géologie éliminatoire", "#800080"),
-    "slope": ("⛰️ Pente éliminatoire", "#ff8c00"),
-    "altitude": ("📏 Altitude éliminatoire", "#8b4513"),
+    "urban": ("Exclu : zones urbaines", "#555555"),
+    "urban_proximity": ("Exclu : abords urbains", "#777777"),
+    "water": ("Exclu : plans d'eau", "#0077cc"),
+    "nodata": ("Exclu : MNT manquant", "#000000"),
+    "species": ("Exclu : essences", "#8b0000"),
+    "geology": ("Exclu : géologie", "#800080"),
+    "slope": ("Exclu : pente trop forte", "#ff8c00"),
+    "altitude": ("Exclu : altitude", "#8b4513"),
+    "twi": ("Exclu : sol engorgé (TWI)", "#1f4e9c"),
 }
+_TWI_SWATCH: str = "#4575b4"
+# Couleur des observations iNaturalist (hors de la palette des scores)
+_INAT_COLOR: str = "#6a3d9a"
 
 # Encodage data-PNG (score/altitude/pente dans RGBA)
 _SCORE_SCALE: int = 200
@@ -189,6 +199,71 @@ def _encode_rgba(
         return buf.getvalue()
 
 
+def _class_alphas(n_classes: int) -> list[float]:
+    """Alpha de rendu par classe : 0 pour « Nul » (transparent), rampe
+    0.25 → 0.55, puis 0.70 pour la meilleure classe."""
+    if n_classes <= 1:
+        return [0.0] * n_classes
+    ramp = np.linspace(0.15, 0.65, n_classes)[1:]
+    alphas = [0.0, *(round(float(a), 3) for a in ramp)]
+    alphas[-1] = 0.70
+    return alphas
+
+
+def _relative_luminance(rgb: tuple[float, float, float]) -> float:
+    """Luminance relative WCAG d'une couleur sRGB [0, 1]."""
+    def _lin(c: float) -> float:
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (_lin(c) for c in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _class_swatches(thresholds: list[float]) -> tuple[list[str], list[str]]:
+    """Couleur de chaque classe (colormap au milieu de la classe, donc
+    fidèle à la carte) et couleur de texte la plus contrastée dessus."""
+    bounds = [0.0, *thresholds, 1.0]
+    fills: list[str] = []
+    texts: list[str] = []
+    dark_lum = _relative_luminance(mcolors.to_rgb("#1b1b1b"))
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        rgb = mcolors.to_rgb(_CMAP((lo + hi) / 2.0))
+        fills.append(mcolors.to_hex(rgb))
+        lum = _relative_luminance(rgb)
+        on_white = 1.05 / (lum + 0.05)
+        on_dark = (lum + 0.05) / (dark_lum + 0.05)
+        texts.append("#ffffff" if on_white >= on_dark else "#1b1b1b")
+    return fills, texts
+
+
+def _display_value(value: Any) -> str | None:
+    """Clé canonique brute → libellé affichable (None si inconnue)."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"unknown", "inconnu", "none", "nan", "?"}:
+        return None
+    text = text.replace("_", " ")
+    return text[:1].upper() + text[1:]
+
+
+def _js_json(obj: Any) -> str:
+    """JSON injectable dans un <script> (« </ » échappé)."""
+    return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
+
+
+class _OverlaySpec(NamedTuple):
+    """Couche de diagnostic à encoder en PNG puis à ajouter à la carte."""
+
+    key: str                     # identifiant unique (ex. "geology-esculenta")
+    group: str                   # identique d'une espèce à l'autre
+    label: str                   # libellé du panneau
+    species: str | None          # None = commune à toutes les espèces
+    render: Callable[[], bytes]  # thread-safe
+    opacity: float
+    swatch: str                  # pastille du panneau
+    log_msg: str
+
+
 # ═══════════════════════════════════════════════════════════
 # Classe principale
 # ═══════════════════════════════════════════════════════════
@@ -206,6 +281,8 @@ class MorilleVisualizer:
         urban_gdf: gpd.GeoDataFrame | None = None,
         inat_observations: list[dict[str, Any]] | None = None,
         weather_days: list[Any] | None = None,
+        debug_layers: bool = False,
+        default_hotspots_shown: int = _DEFAULT_HOTSPOTS_SHOWN,
     ) -> None:
         # ── v2.6.0 — accepter dict[species, MorilleScoring] OU instance unique
         if isinstance(scoring_model, dict):
@@ -245,6 +322,8 @@ class MorilleVisualizer:
         self._urban_gdf = urban_gdf
         self._inat_observations: list[dict[str, Any]] = inat_observations or []
         self._weather_days: list[Any] = weather_days or []
+        self.debug_layers = debug_layers
+        self.default_hotspots_shown = max(1, int(default_hotspots_shown))
 
         # Stocker raw scores par espèce pour exports per-species
         self._final_score_by_species: dict[str, np.ndarray] = {}
@@ -293,10 +372,10 @@ class MorilleVisualizer:
         self._src_crs = CRS.from_epsg(2154)
         self._dst_crs = CRS.from_epsg(3857)
 
-        # Résolution de rendu (découplée de la grille)
-        render_scale = max(1.0, config.CELL_SIZE / _RENDER_MAX_CELL_M)
-        render_nx = min(int(self.grid.nx * render_scale), _RENDER_MAX_PX)
-        render_ny = min(int(self.grid.ny * render_scale), _RENDER_MAX_PX)
+        # Résolution de rendu = celle de la grille (le suréchantillonnage
+        # n'ajoutait aucune information et multipliait le poids du HTML).
+        render_nx = min(int(self.grid.nx), _RENDER_MAX_PX)
+        render_ny = min(int(self.grid.ny), _RENDER_MAX_PX)
 
         # Emprise WGS84 exacte depuis pyproj (pour bounds Folium)
         _corners_x = [self._xmin_l93, self._xmax_l93, self._xmin_l93, self._xmax_l93]
@@ -436,30 +515,6 @@ class MorilleVisualizer:
     # Renderers statiques (thread-safe, pas d'état mutable)
     # ──────────────────────────────────────────────────────
     @staticmethod
-    def _colorize_score(
-        score: np.ndarray,
-        cmap: mcolors.LinearSegmentedColormap,
-        thresholds: list[float],
-    ) -> np.ndarray:
-        """Colorise un array 2D de scores → RGBA uint8."""
-        arr = np.asarray(score, dtype=np.float32)
-        valid = np.asarray(np.isfinite(arr))
-        safe = np.where(valid, arr, 0.0)
-
-        rgba_f = np.asarray(cmap(safe))  # (H, W, 4) float [0,1]
-
-        alpha = np.zeros(arr.shape, dtype=np.float32)
-        steps = np.linspace(0.15, 0.65, len(thresholds) + 1)[1:]
-        for i, th in enumerate(thresholds):
-            alpha[safe >= th] = float(steps[i])
-        if thresholds:
-            alpha[safe >= thresholds[-1]] = 0.70
-        alpha[~valid] = 0.0
-        rgba_f[:, :, 3] = alpha
-
-        return np.clip(rgba_f * 255, 0, 255).astype(np.uint8)
-
-    @staticmethod
     def _colorize_mask(
         mask: np.ndarray,
         color_hex: str,
@@ -493,300 +548,176 @@ class MorilleVisualizer:
         return rgba
 
     @staticmethod
-    def _colorize_twi_score(reprojected: np.ndarray) -> np.ndarray:
-        """Colorise score TWI [0,1] → RGBA uint8 (RdYlGn)."""
-        valid = np.isfinite(reprojected) & (reprojected > 0)
-        norm = np.clip(reprojected, 0.0, 1.0)
-        cmap = matplotlib.colormaps["RdYlGn"]
-        colored = cmap(norm)
-        rgba = np.zeros((*reprojected.shape, 4), dtype=np.uint8)
-        rgba[..., :3] = (colored[..., :3] * 255).astype(np.uint8)
-        rgba[..., 3] = np.where(valid, 180, 0).astype(np.uint8)
-        return rgba
-
-    @staticmethod
-    def _colorize_waterlog(reprojected: np.ndarray) -> np.ndarray:
-        """Masque engorgement → RGBA uint8 rouge."""
-        active = reprojected > 0.5
-        rgba = np.zeros((*reprojected.shape, 4), dtype=np.uint8)
-        rgba[active, 0] = 220
-        rgba[active, 1] = 40
-        rgba[active, 2] = 40
-        rgba[active, 3] = 180
-        return rgba
-
-    @staticmethod
     def _png_to_data_uri(png_bytes: bytes) -> str:
         b64 = base64.b64encode(png_bytes).decode("ascii")
         return f"data:image/png;base64,{b64}"
 
     # ──────────────────────────────────────────────────────
-    # Prepare overlays (reprojection séquentielle → render closures)
+    # Couches de diagnostic (option debug_layers)
     # ──────────────────────────────────────────────────────
-    # Chaque _prepare_* retourne une liste de tuples :
-    #   (name, render_fn, show, opacity, zindex, log_msg)
-    # render_fn: Callable[[], bytes]  — thread-safe, pas d'état mutable.
-    # ──────────────────────────────────────────────────────
-
-    def _prepare_probability(
+    def _mask_render_fn(
         self,
-    ) -> list[tuple[str, Callable[[], bytes], bool, float, int, str]]:
-        """Prépare les couches probabilité (1 par espèce — v2.6.0).
-
-        Pour dual-render : génère N ImageOverlay (un par species). Toutes
-        sont ajoutées à la map. La 1ère espèce est visible (opacité 1.0),
-        les autres masquées (opacité 0). Le toggle JS bascule entre elles.
-        """
-        specs: list[tuple[str, Callable[[], bytes], bool, float, int, str]] = []
-        thresholds = list(config.PROBABILITY_THRESHOLDS)
-        scale = max(1.0, config.CELL_SIZE / _RENDER_MAX_CELL_M)
-
-        for sp_idx, species in enumerate(self.species_list):
-            score: np.ndarray = self._final_score_by_species[species]
-            valid: np.ndarray = np.asarray(np.isfinite(score))
-
-            if not np.any(valid):
-                logger.warning("Score [%s] entièrement NaN — overlay ignoré", species)
-                continue
-
-            # Upsampling source avant reprojection
-            if scale > 1.0:
-                from scipy.ndimage import zoom  # upsample only — pas dans _accel
-                safe = np.where(valid, score, 0.0)
-                safe_up = np.asarray(zoom(safe, scale, order=1), dtype=np.float32)
-                valid_up = np.asarray(
-                    zoom(valid.astype(np.float32), scale, order=0),
-                ) > 0.5
-                safe_up[~valid_up] = np.nan
-                score_up = safe_up
-            else:
-                score_up = score
-
-            reprojected = self._reproject_to_wgs84(score_up)
-            h_src, w_src = score.shape
-            h_dst, w_dst = reprojected.shape
-
-            # Capture sp + reprojected pour closure
-            def _make_render(_repr: np.ndarray = reprojected) -> Callable[[], bytes]:
-                def render() -> bytes:
-                    rgba = MorilleVisualizer._colorize_score(
-                        _repr, _CMAP, thresholds,
-                    )
-                    return _encode_rgba(rgba)
-                return render
-
-            sp_params = config.SPECIES_PARAMS.get(
-                species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
-            )
-            sp_emoji = sp_params.get("emoji", "🍄")
-            sp_common = sp_params.get("common_name", species)
-            label = f"{sp_emoji} Probabilité {sp_common}s"
-
-            # 1ère espèce visible, les autres masquées (toggle JS prend le relais)
-            show = (sp_idx == 0)
-
-            msg = (
-                f"Couche probabilité [{species}] : {w_src}×{h_src}"
-                f" → {w_dst}×{h_dst} px WGS84"
-            )
-            specs.append(
-                (label, _make_render(), show, 1.0, 1 + sp_idx, msg),
-            )
-
-        return specs
-
-    def _prepare_elimination(
-        self,
-    ) -> list[tuple[str, Callable[[], bytes], bool, float, int, str]]:
-        """Prépare les couches éliminatoires (lissage + reprojection)."""
-        if not self._elim_detail:
-            return []
-
-        specs: list[tuple[str, Callable[[], bytes], bool, float, int, str]] = []
-
-        for key, mask_arr in self._elim_detail.items():
-            if not isinstance(mask_arr, np.ndarray):
-                continue
-            mask = np.asarray(mask_arr, dtype=bool)
-            if not np.any(mask):
-                continue
-
-            # Lissage en espace source via _accel
-            # Sigma réduit pour la pente : préserver les bandes étroites
-            # de falaises au lieu de les éroder par excès de lissage.
-            sigma = 0.5 if key == "slope" else _ELIM_SMOOTH_SIGMA
-            mask_f = np.asarray(
-                _accel.gaussian_filter(
-                    mask.astype(np.float32),
-                    sigma=sigma,
-                    mode="reflect",
-                ),
-            )
-
-            # Reprojection bilinéaire (float, pas is_mask)
-            reprojected_f = self._reproject_to_wgs84(mask_f, is_mask=False)
-            reprojected = np.asarray(
-                np.nan_to_num(reprojected_f, nan=0.0) > _ELIM_MASK_THRESHOLD,
-            )
-
-            label, color = _ELIM_LABEL_MAP.get(key, (f"❌ {key}", "#ff0000"))
-            n = int(np.sum(mask))
-
-            # Capture explicite pour closure dans boucle
-            def render(
-                _r: np.ndarray = reprojected,
-                _c: str = color,
-            ) -> bytes:
-                rgba = MorilleVisualizer._colorize_mask(_r, _c, alpha=0.45)
-                return _encode_rgba(rgba)
-
-            specs.append(
-                (label, render, False, 1.0, 2, f"{label} : {n} cellules"),
-            )
-
-        logger.info("✅ %d couches éliminatoires préparées", len(specs))
-        return specs
-
-    def _prepare_urban_raster(
-        self,
-    ) -> list[tuple[str, Callable[[], bytes], bool, float, int, str]]:
-        """Prépare la couche urbaine raster adoucie."""
-        if not hasattr(self.grid, "urban_mask") or self.grid.urban_mask is None:
-            return []
-
-        mask = np.asarray(self.grid.urban_mask, dtype=bool)
-        if not np.any(mask):
-            return []
-
-        # Reprojection bilinéaire suffit pour lisser le masque —
-        # pas besoin d'upscale + gaussian sur grille doublée
-        mask_f = _accel.gaussian_filter(
-            mask.astype(np.float32), sigma=1.5, mode="reflect",
+        mask: np.ndarray,
+        key: str,
+        color: str,
+    ) -> Callable[[], bytes]:
+        """Lisse et reprojette un masque bool → fonction de rendu PNG."""
+        # Sigma réduit pour la pente : préserver les bandes étroites
+        # de falaises au lieu de les éroder par excès de lissage.
+        sigma = 0.5 if key == "slope" else _ELIM_SMOOTH_SIGMA
+        mask_f = np.asarray(
+            _accel.gaussian_filter(
+                mask.astype(np.float32),
+                sigma=sigma,
+                mode="reflect",
+            ),
         )
-        reprojected = self._reproject_to_wgs84(mask_f, is_mask=False)
+        reprojected_f = self._reproject_to_wgs84(mask_f, is_mask=False)
         reprojected = np.asarray(
-            np.nan_to_num(reprojected, nan=0.0) > 0.3,
+            np.nan_to_num(reprojected_f, nan=0.0) > _ELIM_MASK_THRESHOLD,
         )
-        n = int(np.sum(self.grid.urban_mask))
 
-        def render() -> bytes:
-            rgba = MorilleVisualizer._colorize_mask(
-                reprojected, "#888888", alpha=0.35,
-            )
+        def render(_r: np.ndarray = reprojected, _c: str = color) -> bytes:
+            rgba = MorilleVisualizer._colorize_mask(_r, _c, alpha=0.45)
             return _encode_rgba(rgba)
 
-        return [
-            ("🏘️ Zones urbaines", render, False, 1.0, 2,
-             f"Urbain raster : {n} cellules"),
-        ]
+        return render
 
-    def _prepare_twi(
-        self,
-    ) -> list[tuple[str, Callable[[], bytes], bool, float, int, str]]:
-        """Prépare les couches TWI (brut, score, engorgement)."""
-        twi_data = self.model.get_twi_display_data()
-        if not twi_data["has_data"]:
-            logger.debug("   Pas de données TWI")
-            return []
+    def _prepare_diagnostics(self) -> list[_OverlaySpec]:
+        """Couches de diagnostic : zones exclues par espèce (un seul
+        exemplaire quand le masque est identique pour toutes les espèces,
+        ex. urbain ou eau) et TWI brut."""
+        specs: list[_OverlaySpec] = []
 
-        specs: list[tuple[str, Callable[[], bytes], bool, float, int, str]] = []
+        masks: dict[str, dict[str, np.ndarray]] = {}
+        for species in self.species_list:
+            detail = self._elim_detail_by_species.get(species) or {}
+            for key, arr in detail.items():
+                if not isinstance(arr, np.ndarray):
+                    continue
+                if arr.shape != self._final_score.shape:
+                    continue
+                mask = np.asarray(arr, dtype=bool)
+                if np.any(mask):
+                    masks.setdefault(key, {})[species] = mask
 
-        # TWI brut
-        twi_raw = twi_data["raw"]
-        if twi_raw is not None:
-            rep_raw = self._reproject_to_wgs84(np.asarray(twi_raw, dtype=np.float32))
-            rng = f"[{float(np.nanmin(twi_raw)):.1f}, {float(np.nanmax(twi_raw)):.1f}]"
+        for key, by_species in masks.items():
+            label, color = _ELIM_LABEL_MAP.get(key, (f"Exclu : {key}", "#ff0000"))
+            first = next(iter(by_species.values()))
+            shared = len(by_species) == len(self.species_list) and all(
+                np.array_equal(first, m) for m in by_species.values()
+            )
+            targets: list[tuple[str | None, np.ndarray]] = (
+                [(None, first)] if shared else list(by_species.items())
+            )
+            for species, mask in targets:
+                suffix = "" if species is None else f"-{species}"
+                n = int(np.sum(mask))
+                specs.append(_OverlaySpec(
+                    key=f"elim-{key}{suffix}",
+                    group=f"elim-{key}",
+                    label=label,
+                    species=species,
+                    render=self._mask_render_fn(mask, key, color),
+                    opacity=1.0,
+                    swatch=color,
+                    log_msg=(
+                        f"Diagnostic {label} "
+                        f"[{species or 'toutes espèces'}] : {n} cellules"
+                    ),
+                ))
 
-            def render_raw(_r: np.ndarray = rep_raw) -> bytes:
+        twi_raw = getattr(self.grid, "twi", None)
+        if isinstance(twi_raw, np.ndarray) and np.any(np.isfinite(twi_raw)):
+            rep_twi = self._reproject_to_wgs84(
+                np.asarray(twi_raw, dtype=np.float32),
+            )
+            rng = (
+                f"[{float(np.nanmin(twi_raw)):.1f}, "
+                f"{float(np.nanmax(twi_raw)):.1f}]"
+            )
+
+            def render_twi(_r: np.ndarray = rep_twi) -> bytes:
                 return _encode_rgba(MorilleVisualizer._colorize_twi_raw(_r))
 
-            specs.append((
-                "🌊 TWI brut (valeurs hydrologiques)",
-                render_raw, False, 0.65, 1,
-                f"TWI brut — range {rng}",
+            specs.append(_OverlaySpec(
+                key="twi-raw",
+                group="twi-raw",
+                label="TWI brut (humidité du sol)",
+                species=None,
+                render=render_twi,
+                opacity=0.65,
+                swatch=_TWI_SWATCH,
+                log_msg=f"Diagnostic TWI brut — plage {rng}",
             ))
 
-        # TWI score
-        twi_score = twi_data["score"]
-        if isinstance(twi_score, np.ndarray):
-            rep_score = self._reproject_to_wgs84(
-                np.asarray(twi_score, dtype=np.float32),
-            )
-            valid_s = twi_score[np.isfinite(twi_score)]
-            stats = ""
-            if valid_s.size > 0:
-                stats = (
-                    f" mean={float(np.mean(valid_s)):.3f}"
-                    f" median={float(np.median(valid_s)):.3f}"
-                )
-
-            def render_score(_r: np.ndarray = rep_score) -> bytes:
-                return _encode_rgba(
-                    MorilleVisualizer._colorize_twi_score(_r),
-                )
-
-            specs.append((
-                "📊 TWI score [0–1]",
-                render_score, False, 0.65, 1,
-                f"TWI score —{stats}",
-            ))
-
-        # Engorgement
-        waterlog = twi_data["waterlog_mask"]
-        if waterlog is not None and np.any(waterlog):
-            rep_wl = self._reproject_to_wgs84(
-                np.asarray(waterlog, dtype=np.float32),
-            )
-            n_wl = int(np.sum(waterlog))
-
-            def render_wl(_r: np.ndarray = rep_wl) -> bytes:
-                return _encode_rgba(MorilleVisualizer._colorize_waterlog(_r))
-
-            specs.append((
-                f"⚠️ TWI engorgement (>{TWI_WATERLOG}) — {n_wl} cellules",
-                render_wl, False, 0.70, 2,
-                f"Engorgement TWI : {n_wl} cellules (>{TWI_WATERLOG:.0f})",
-            ))
-        else:
-            logger.info(
-                "   Aucune cellule engorgée (TWI > %.0f)", TWI_WATERLOG,
-            )
-
+        logger.info("✅ %d couches de diagnostic préparées", len(specs))
         return specs
 
     # ──────────────────────────────────────────────────────
-    # Data PNG (score + altitude + pente encodés RGBA)
+    # Data PNG (score par espèce) + PNG terrain (pente + altitude)
     # ──────────────────────────────────────────────────────
+    @staticmethod
+    def _encode_opaque_png(arr: np.ndarray) -> bytes:
+        """PNG opaque (L ou RGB selon la forme) — Fix B1 : pas de canal
+        alpha, donc pas de pré-multiplication par le navigateur."""
+        with Image.fromarray(np.asarray(arr, dtype=np.uint8)) as img:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", compress_level=6)
+            return buf.getvalue()
+
     def _build_data_png_bytes(self, species: str | None = None) -> bytes:
-        """Construit le PNG RGB opaque pour tooltip mousemove + filtre JS.
+        """PNG niveaux de gris du score d'une espèce, lu par le JS (rendu
+        de la couche de probabilité + lecture de cellule).
 
-        R = score (0–200 → 0.00–1.00, 255 = NaN)
-        G = altitude low byte (alt + 500)
-        B = altitude high byte
-
-        Fix B1 : RGB opaque — pas de pré-multiplication alpha navigateur.
-        La pente est encodée dans un PNG séparé (_build_slope_png_bytes).
+        Valeur = score × 200 (0–200 → 0.00–1.00), 255 = NaN.
+        Altitude et pente, communes aux espèces, sont dans le PNG terrain.
 
         v2.6.0 : species kwarg sélectionne le raster source. Si None → primary.
         """
         sp = species or self.primary_species
         score_src = self._final_score_by_species.get(sp, self._final_score)
         score_wgs = self._reproject_to_wgs84(score_src)
-        h, w = score_wgs.shape
-        rgb = np.zeros((h, w, 3), dtype=np.uint8)
-
-        # R : score
         valid_s = np.asarray(np.isfinite(score_wgs))
-        r_ch = np.full((h, w), _SCORE_NAN, dtype=np.uint8)
-        r_ch[valid_s] = np.clip(
+        gray = np.full(score_wgs.shape, _SCORE_NAN, dtype=np.uint8)
+        gray[valid_s] = np.clip(
             (score_wgs[valid_s] * _SCORE_SCALE).astype(np.int32),
             0, _SCORE_SCALE,
         ).astype(np.uint8)
-        rgb[:, :, 0] = r_ch
 
-        # G, B : altitude
+        png_bytes = self._encode_opaque_png(gray)
+        h, w = gray.shape
+        logger.info(
+            "✅ Data PNG [%s] : %dx%d px (%.0f KB) — score",
+            sp, w, h, len(png_bytes) / 1024,
+        )
+        return png_bytes
+
+    def _build_terrain_png_bytes(self) -> bytes:
+        """PNG RGB du terrain, commun à toutes les espèces.
+
+        R = pente encodée (1–181 → 0–90°, 0 = NaN)
+        G = altitude octet bas (alt + 500), B = octet haut (0 = NaN)
+        """
+        h, w = self._dst_height, self._dst_width
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        shape = self._final_score.shape
+
+        slp_grid = getattr(self.grid, "slope", None)
+        if isinstance(slp_grid, np.ndarray) and slp_grid.shape == shape:
+            slp_wgs = self._reproject_to_wgs84(slp_grid)
+            valid_p = np.asarray(np.isfinite(slp_wgs))
+            rgb[valid_p, 0] = np.clip(
+                (slp_wgs[valid_p] * _SLOPE_SCALE + _SLOPE_OFFSET).astype(
+                    np.int32,
+                ),
+                1, 181,
+            ).astype(np.uint8)
+        else:
+            logger.debug("   Pente non disponible pour le PNG terrain")
+
         alt_grid = getattr(self.grid, "altitude", None)
-        if isinstance(alt_grid, np.ndarray) and alt_grid.shape == score_src.shape:
+        if isinstance(alt_grid, np.ndarray) and alt_grid.shape == shape:
             alt_wgs = self._reproject_to_wgs84(alt_grid)
             valid_a = np.asarray(np.isfinite(alt_wgs))
             alt_enc = np.zeros((h, w), dtype=np.uint16)
@@ -797,938 +728,779 @@ class MorilleVisualizer:
             rgb[:, :, 1] = (alt_enc & 0xFF).astype(np.uint8)
             rgb[:, :, 2] = ((alt_enc >> 8) & 0xFF).astype(np.uint8)
         else:
-            logger.debug("   Altitude non disponible pour data PNG")
+            logger.debug("   Altitude non disponible pour le PNG terrain")
 
-        with Image.fromarray(rgb, mode="RGB") as img:
-            buf = io.BytesIO()
-            img.save(buf, format="PNG", compress_level=6)
-            png_bytes = buf.getvalue()
-        size_kb = len(png_bytes) / 1024
+        png_bytes = self._encode_opaque_png(rgb)
         logger.info(
-            "✅ Data PNG [%s] : %dx%d px (%.0f KB) — score+alt",
-            sp, w, h, size_kb,
-        )
-        return png_bytes
-
-    def _build_slope_png_bytes(self) -> bytes:
-        """Construit le PNG RGB opaque contenant la pente par pixel.
-
-        R = pente encodée (1–181 → 0–90°, 0 = NaN)
-        G = 0, B = 0 (réservés)
-
-        Fix B1 : séparé du data PNG pour éviter la pré-multiplication alpha.
-        """
-        score_wgs = self._reproject_to_wgs84(self._final_score)
-        h, w = score_wgs.shape
-        rgb = np.zeros((h, w, 3), dtype=np.uint8)
-
-        slp_grid = getattr(self.grid, "slope", None)
-        if isinstance(slp_grid, np.ndarray) and slp_grid.shape == self._final_score.shape:
-            slp_wgs = self._reproject_to_wgs84(slp_grid)
-            valid_p = np.asarray(np.isfinite(slp_wgs))
-            r_ch = np.zeros((h, w), dtype=np.uint8)
-            r_ch[valid_p] = np.clip(
-                (slp_wgs[valid_p] * _SLOPE_SCALE + _SLOPE_OFFSET).astype(
-                    np.int32,
-                ),
-                1, 181,
-            ).astype(np.uint8)
-            rgb[:, :, 0] = r_ch
-        else:
-            logger.debug("   Pente non disponible pour slope PNG")
-
-        with Image.fromarray(rgb, mode="RGB") as img:
-            buf = io.BytesIO()
-            img.save(buf, format="PNG", compress_level=6)
-            png_bytes = buf.getvalue()
-        size_kb = len(png_bytes) / 1024
-        logger.info(
-            "✅ Slope PNG : %dx%d px (%.0f KB) — pente",
-            w, h, size_kb,
+            "✅ Terrain PNG : %dx%d px (%.0f KB) — pente+altitude",
+            w, h, len(png_bytes) / 1024,
         )
         return png_bytes
 
     # ──────────────────────────────────────────────────────
-    # JS consolidé — panneaux draggable, tooltip, filtres
+    # Panneau latéral + couche de probabilité rendue en JS
     # ──────────────────────────────────────────────────────
-    def _add_interactive_controls(
+    def _species_info(self, species: str) -> dict[str, str]:
+        params = config.SPECIES_PARAMS.get(
+            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+        )
+        return {
+            "name": str(params.get("common_name", species)),
+            "emoji": str(params.get("emoji", "🍄")),
+            "scientific": str(params.get("scientific_name", species)),
+        }
+
+    def _page_title(self) -> str:
+        names = ", ".join(
+            self._species_info(sp)["name"] for sp in self.species_list
+        )
+        return f"Cartomorilles — {names} (Isère)"
+
+    def _add_sidebar_ui(
         self,
         folium_map: folium.Map,
-        data_uri: str,
-        slope_uri: str = "",
         *,
-        data_uris_by_species: dict[str, str] | None = None,
+        data_uris_by_species: dict[str, str],
+        terrain_uri: str,
+        basemaps: list[dict[str, Any]],
+        layer_vars: dict[str, str | None],
+        diag_layers: list[dict[str, Any]],
+        hotspots: dict[str, list[dict[str, Any]]],
+        weather_html: str,
     ) -> None:
-        """Injecte CSS + JS : panneaux draggable, opacité, filtre, légende,
-        tooltip mousemove, hotspot slider.
+        """Injecte le panneau latéral (espèce, légende-filtre, opacité,
+        hotspots, couches, météo), la lecture de cellule et le JS qui rend
+        l'unique couche de probabilité depuis le data PNG de l'espèce
+        active."""
+        labels = list(config.PROBABILITY_LABELS)
+        thresholds = [float(t) for t in config.PROBABILITY_THRESHOLDS]
+        swatches, swatch_text = _class_swatches(thresholds)
+        info = {sp: self._species_info(sp) for sp in self.species_list}
 
-        v2.6.0 : data_uris_by_species fournit un data PNG par espèce afin
-        que le filtre min/max + tooltip suivent l'espèce active.
-        """
-        n_hotspots = getattr(self, "_hotspot_count_on_map", 0)
-        # Fallback : single-species → réplique data_uri sur primary
-        if data_uris_by_species is None:
-            data_uris_by_species = {self.primary_species: data_uri}
+        species_radios = "".join(
+            f'<label><input type="radio" name="cs-species" '
+            f'value="{html.escape(sp)}"'
+            f'{" checked" if sp == self.primary_species else ""}>'
+            f'<span aria-hidden="true">{html.escape(info[sp]["emoji"])}</span>'
+            f' {html.escape(info[sp]["name"])}</label>'
+            for sp in self.species_list
+        )
+        basemap_options = "".join(
+            f'<option{" selected" if b["default"] else ""}>'
+            f'{html.escape(b["label"])}</option>'
+            for b in basemaps
+        )
+        layer_defs = (
+            ("inat",
+             f"Observations iNaturalist — morilles "
+             f"({len(self._inat_observations)})",
+             _INAT_COLOR, True),
+            ("hydro", "Cours d'eau", "#0077cc", False),
+            ("landmarks", "Points de repère", "#2a81cb", True),
+        )
+        layer_checks = "".join(
+            f'<label class="cs-check"><input type="checkbox" '
+            f'data-layer="{key}"{" checked" if on else ""}>'
+            f'<span class="cs-dot" style="background:{color}" '
+            f'aria-hidden="true"></span><span>{html.escape(label)}</span></label>'
+            for key, label, color, on in layer_defs
+            if layer_vars.get(key)
+        )
+        diag_block = (
+            '<details class="cs-diag"><summary>Couches de diagnostic</summary>'
+            '<p class="cs-hint">Zones exclues du modèle pour l\'espèce '
+            'affichée, et TWI brut.</p><div id="cs-diag-list"></div></details>'
+            if diag_layers else ""
+        )
+        data_imgs = "\n".join(
+            f'<img id="cartom-data-img-{html.escape(sp)}" src="{uri}" '
+            f'alt="" hidden>'
+            for sp, uri in data_uris_by_species.items()
+        )
+        subtitle = (
+            f"Isère · maille {float(config.CELL_SIZE):.0f} m · "
+            f"générée le {datetime.now():%d/%m/%Y}"
+        )
 
-        # ── Template JS (inline) ──
-        js_block = r"""
+        cfg: dict[str, Any] = {
+            "mapVar": folium_map.get_name(),
+            "bounds": self._bounds,
+            "south": self._south,
+            "north": self._north,
+            "west": self._west,
+            "east": self._east,
+            "labels": labels,
+            "thresholds": thresholds,
+            "classAlpha": _class_alphas(len(labels)),
+            "swatches": swatches,
+            "swatchText": swatch_text,
+            "cmapStops": [[pos, col] for pos, col in _CMAP_STOPS],
+            "scoreScale": _SCORE_SCALE,
+            "altOffset": _ALT_OFFSET,
+            "slopeOffset": _SLOPE_OFFSET,
+            "slopeScale": _SLOPE_SCALE,
+            "speciesList": self.species_list,
+            "primary": self.primary_species,
+            "species": info,
+            "hotspots": hotspots,
+            "hotspotTotals": {
+                sp: len(self.hotspots_by_species.get(sp, []))
+                for sp in self.species_list
+            },
+            "hotspotsDefault": self.default_hotspots_shown,
+            "basemaps": basemaps,
+            "layers": layer_vars,
+            "diag": diag_layers,
+        }
+
+        block = r"""
         <style>
-        .cartom-panel {
-            background: rgba(255,255,255,0.95);
-            border-radius: 8px;
+        .cartom-sidebar {
+            position: fixed; top: 10px; left: 10px; z-index: 1001;
+            width: 300px; max-height: calc(100% - 20px);
+            display: flex; flex-direction: column;
+            background: rgba(255,255,255,0.97); color: #1f2a1f;
+            border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,.3);
+            font: 13px/1.45 'Segoe UI', system-ui, -apple-system, Arial, sans-serif;
+            overflow: hidden;
+        }
+        .cartom-sidebar[hidden], .cs-open[hidden] { display: none !important; }
+        .cs-header {
+            display: flex; align-items: center; gap: 8px; padding: 9px 10px 9px 12px;
+            background: #2d6a2e; color: #fff;
+        }
+        .cs-title { font-weight: 700; font-size: 15px; }
+        .cs-sub { font-size: 12px; }
+        .cs-collapse, .cs-open {
+            cursor: pointer; font: 600 14px/1 'Segoe UI', system-ui, Arial, sans-serif;
+            border-radius: 6px; min-width: 34px; min-height: 34px;
+        }
+        .cs-collapse {
+            margin-left: auto; background: transparent; color: #fff;
+            border: 1px solid rgba(255,255,255,.7);
+        }
+        .cs-open {
+            position: fixed; top: 10px; left: 10px; z-index: 1001; padding: 0 12px;
+            background: #2d6a2e; color: #fff; border: 0;
             box-shadow: 0 2px 8px rgba(0,0,0,.35);
-            font: 12px/1.5 'Segoe UI', Arial, sans-serif;
-            position: fixed;
-            z-index: 10000;
-            pointer-events: auto;
-            max-width: 260px;
         }
-        .cartom-panel .cartom-titlebar {
-            cursor: grab;
-            background: linear-gradient(135deg, #2d6a2e, #3a9e3f);
-            color: white;
-            padding: 5px 10px;
-            border-radius: 8px 8px 0 0;
-            font-weight: bold;
-            font-size: 12px;
-            user-select: none;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+        .cs-collapse:focus-visible, .cs-open:focus-visible,
+        .cartom-sidebar button:focus-visible, .cartom-sidebar select:focus-visible,
+        .cartom-sidebar input:focus-visible, .cs-seg label:has(input:focus-visible) {
+            outline: 2px solid #1a73e8; outline-offset: 2px;
         }
-        .cartom-panel .cartom-titlebar:active { cursor: grabbing; }
-        .cartom-panel .cartom-body { padding: 8px 12px; }
-        .cartom-panel .cartom-minimize {
-            cursor: pointer; font-size: 16px; line-height: 1; opacity: 0.8;
+        .cs-body { overflow-y: auto; padding: 2px 12px 12px; }
+        .cs-section { border-top: 1px solid #dde3dd; padding: 10px 0 4px; }
+        .cs-section:first-child { border-top: 0; }
+        .cs-section h2 {
+            font-size: 12px; font-weight: 700; letter-spacing: .04em;
+            text-transform: uppercase; color: #4a554a; margin: 0 0 6px;
         }
-        .cartom-panel .cartom-minimize:hover { opacity: 1; }
-        .cartom-panel.minimized .cartom-body { display: none; }
-
-        #cartom-species  { top: 10px;     left: 10px; }
-        #cartom-legend   { bottom: 30px;  left: 30px; }
-        #cartom-colorbar { top: 10px;     right: 10px; left: auto; }
-        #cartom-opacity  { top: 130px;    left: 10px; }
-        #cartom-filter   { top: 240px;    left: 10px; }
-        #cartom-hotspots { top: 360px;    left: 10px; }
-        #cartom-info     { bottom: 30px;  right: 10px; min-width: 200px; }
-        #wx-panel        { bottom: 30px;  right: 10px; }
-        #cartom-species label { display:block; margin:3px 0; cursor:pointer; }
-        #cartom-species input[type=radio] { margin-right:6px; }
-        #wx-panel table  { border-collapse:collapse; width:100%; }
-        #wx-panel td     { padding:2px 6px; }
-        #wx-panel .wx-good  { color:#2d8a4e; font-weight:bold; }
-        #wx-panel .wx-ok    { color:#b8860b; }
-        #wx-panel .wx-bad   { color:#999; }
-        #wx-panel .wx-burst { color:#0066cc; margin-top:4px; font-weight:bold; }
-        #wx-panel .wx-best  { margin-top:4px; color:#333; }
-
-        .cartom-slider-row {
-            display: flex; align-items: center; gap: 6px; margin: 4px 0;
+        .cs-hint { font-size: 12px; color: #4a554a; margin: 0 0 6px; }
+        .cs-seg { display: flex; gap: 6px; }
+        .cs-seg label {
+            flex: 1; display: flex; align-items: center; justify-content: center;
+            gap: 6px; padding: 6px 8px; min-height: 36px; margin: 0;
+            border: 1px solid #cdd5cd; border-radius: 8px; cursor: pointer;
         }
-        .cartom-slider-row label {
-            min-width: 30px; font-size: 11px; color: #555;
+        .cs-seg input { position: absolute; opacity: 0; pointer-events: none; }
+        .cs-seg label:has(input:checked) {
+            background: #e3f1e3; border-color: #2d6a2e; font-weight: 600;
         }
-        .cartom-slider-row input[type=range] { flex: 1; }
-        .cartom-slider-row .cartom-val {
-            min-width: 32px; text-align: right; font-size: 11px;
-            font-family: monospace; color: #333;
+        .cs-legend { list-style: none; margin: 0 0 4px; padding: 0; }
+        .cs-legend li { display: flex; }
+        .cs-class, .cs-nul {
+            flex: 1; display: flex; align-items: center; gap: 8px;
+            padding: 3px 6px; min-height: 30px; border-radius: 6px;
         }
-
-        .cartom-hotspot-hidden { display: none !important; }
+        .cs-class {
+            border: 0; background: transparent; color: inherit; font: inherit;
+            text-align: left; cursor: pointer;
+        }
+        .cs-class:hover { background: #eef4ee; }
+        .cs-class[aria-pressed="false"] { color: #6b746b; text-decoration: line-through; }
+        .cs-class[aria-pressed="false"] .cs-swatch { background: transparent !important; }
+        .cs-nul { color: #4a554a; }
+        .cs-swatch {
+            width: 18px; height: 14px; border-radius: 3px; flex: none;
+            border: 1px solid rgba(0,0,0,.3);
+        }
+        .cs-swatch-none { border-style: dashed; }
+        .cs-range { margin-left: auto; color: #4a554a; font-size: 12px;
+                    font-variant-numeric: tabular-nums; white-space: nowrap; }
+        .cs-link {
+            border: 0; background: none; padding: 0; color: #1a5fb4;
+            text-decoration: underline; cursor: pointer; font: inherit; font-size: 12px;
+        }
+        .cs-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+        .cs-row label { margin: 0; min-width: 58px; }
+        .cs-row input[type=range] { flex: 1; min-width: 0; }
+        .cs-row output { min-width: 40px; text-align: right;
+                         font-variant-numeric: tabular-nums; }
+        .cs-check {
+            display: flex; align-items: center; gap: 8px; margin: 3px 0;
+            min-height: 28px; cursor: pointer;
+        }
+        .cs-check input { margin: 0; }
+        .cs-label { display: block; margin: 0 0 3px; }
+        .cs-select {
+            width: 100%; padding: 5px 6px; margin-bottom: 6px; font: inherit;
+            border: 1px solid #cdd5cd; border-radius: 6px; background: #fff;
+        }
+        .cs-dot { width: 12px; height: 12px; border-radius: 50%; flex: none;
+                  border: 1px solid rgba(0,0,0,.25); }
+        .cs-diag summary { cursor: pointer; color: #4a554a; margin: 6px 0; }
+        .cs-wx table { border-collapse: collapse; width: 100%; font-size: 12px; }
+        .cs-wx td { padding: 2px 4px; }
+        .cs-wx .wx-good  { color: #1e6b3a; font-weight: 600; }
+        .cs-wx .wx-ok    { color: #7a5a00; }
+        .cs-wx .wx-bad   { color: #5f5f5f; }
+        .cs-wx .wx-burst { color: #0b5394; margin-top: 4px; font-weight: 600; }
+        .cs-wx .wx-best  { margin-top: 4px; }
+        .cs-readout {
+            position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+            z-index: 1001; max-width: calc(100% - 20px); padding: 5px 12px;
+            background: rgba(255,255,255,.96); color: #1f2a1f; border-radius: 16px;
+            box-shadow: 0 1px 6px rgba(0,0,0,.3);
+            font: 13px/1.4 'Segoe UI', system-ui, Arial, sans-serif;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            pointer-events: none;
+        }
+        .cs-prob { image-rendering: auto; }
+        .cs-hs { background: transparent; border: 0; }
+        .cs-hs span {
+            display: flex; align-items: center; justify-content: center;
+            width: 28px; height: 28px; border-radius: 50%;
+            border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5);
+            font: 700 12px/1 'Segoe UI', system-ui, Arial, sans-serif;
+        }
+        .cs-coords { font-variant-numeric: tabular-nums; }
+        @media (max-width: 700px) {
+            .cartom-sidebar { width: auto; right: 10px; max-height: 70%; }
+            .cs-readout { bottom: 30px; font-size: 12px; }
+        }
         </style>
 
-        <div id="cartom-species" class="cartom-panel">
-            <div class="cartom-titlebar">
-                <span>🍄 Espèce</span>
-                <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
-            </div>
-            <div class="cartom-body" id="cartom-species-body">%SPECIES_RADIOS%</div>
-        </div>
-
-        <div id="cartom-legend" class="cartom-panel">
-            <div class="cartom-titlebar">
-                <span>🍄 Probabilité morilles</span>
-                <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
-            </div>
-            <div class="cartom-body" id="cartom-legend-body"></div>
-        </div>
-
-        <div id="cartom-colorbar" class="cartom-panel">
-            <div class="cartom-titlebar">
-                <span>🎨 Échelle</span>
-                <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
-            </div>
-            <div class="cartom-body" id="cartom-colorbar-body"></div>
-        </div>
-
-        <div id="cartom-opacity" class="cartom-panel">
-            <div class="cartom-titlebar">
-                <span>🍄 Opacité</span>
-                <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
-            </div>
-            <div class="cartom-body">
-                <input type="range" min="0" max="100" value="70"
-                       style="width:100%;" id="cartom_opacity_slider">
-                <div style="display:flex;justify-content:space-between;font-size:10px;color:#666;">
-                    <span>0%</span><span id="cartom_opval">70%</span><span>100%</span>
+        <div id="cartom-sidebar" class="cartom-sidebar" role="region"
+             aria-label="Panneau Cartomorilles">
+            <div class="cs-header">
+                <div>
+                    <div class="cs-title">Cartomorilles</div>
+                    <div class="cs-sub">%SUBTITLE%</div>
                 </div>
+                <button type="button" class="cs-collapse" id="cs-collapse"
+                        aria-label="Replier le panneau" title="Replier le panneau">«</button>
+            </div>
+            <div class="cs-body">
+                <section class="cs-section"%SPECIES_HIDDEN%>
+                    <h2>Espèce</h2>
+                    <div class="cs-seg" role="radiogroup" aria-label="Espèce">%SPECIES_RADIOS%</div>
+                </section>
+                <section class="cs-section">
+                    <h2 id="cs-legend-title">Probabilité</h2>
+                    <p class="cs-hint">Cliquez une classe pour la masquer ou l'afficher.</p>
+                    <ul class="cs-legend" id="cs-legend"></ul>
+                    <button type="button" class="cs-link" id="cs-legend-reset" hidden>Tout afficher</button>
+                    <div class="cs-row">
+                        <label for="cs-opacity">Opacité</label>
+                        <input type="range" id="cs-opacity" min="0" max="100" value="70">
+                        <output id="cs-opacity-val" for="cs-opacity">70 %</output>
+                    </div>
+                </section>
+                <section class="cs-section">
+                    <h2>Hotspots</h2>
+                    <label class="cs-check"><input type="checkbox" id="cs-hs-show" checked>
+                        <span>Afficher les hotspots</span></label>
+                    <div class="cs-row">
+                        <label for="cs-hs-n">Nombre</label>
+                        <input type="range" id="cs-hs-n" min="1" max="1" value="1" step="1">
+                        <output id="cs-hs-n-val" for="cs-hs-n">0</output>
+                    </div>
+                    <p class="cs-hint" id="cs-hs-info"></p>
+                </section>
+                <section class="cs-section">
+                    <h2>Couches</h2>
+                    <label class="cs-label" for="cs-basemap">Fond de carte</label>
+                    <select id="cs-basemap" class="cs-select">%BASEMAP_OPTIONS%</select>
+                    <div id="cs-layers">%LAYER_CHECKS%</div>
+                    %DIAG_BLOCK%
+                </section>
+                %WEATHER_SECTION%
             </div>
         </div>
-
-        <div id="cartom-filter" class="cartom-panel">
-            <div class="cartom-titlebar">
-                <span>🎚️ Filtre probabilité</span>
-                <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
-            </div>
-            <div class="cartom-body">
-                <div class="cartom-slider-row">
-                    <label>Min</label>
-                    <input type="range" min="0" max="100" value="0"
-                           id="cartom_filter_min">
-                    <span class="cartom-val" id="cartom_fmin_val">0.00</span>
-                </div>
-                <div class="cartom-slider-row">
-                    <label>Max</label>
-                    <input type="range" min="0" max="100" value="100"
-                           id="cartom_filter_max">
-                    <span class="cartom-val" id="cartom_fmax_val">1.00</span>
-                </div>
-                <div style="text-align:center;font-size:10px;color:#888;margin-top:4px;">
-                    Affiche les cellules dans [Min, Max]
-                </div>
-            </div>
-        </div>
-
-        <div id="cartom-hotspots" class="cartom-panel">
-            <div class="cartom-titlebar">
-                <span>🎯 Hotspots visibles</span>
-                <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
-            </div>
-            <div class="cartom-body">
-                <div class="cartom-slider-row">
-                    <label>Top</label>
-                    <input type="range" min="0" max="%N_HOTSPOTS%"
-                           value="%N_HOTSPOTS%" step="1"
-                           id="cartom_hotspot_slider">
-                    <span class="cartom-val" id="cartom_hs_val">%N_HOTSPOTS%</span>
-                </div>
-                <div style="text-align:center;font-size:10px;color:#888;margin-top:4px;">
-                    Affiche les N meilleurs hotspots (sur %N_HOTSPOTS%)
-                </div>
-            </div>
-        </div>
-
-        <div id="cartom-info" class="cartom-panel">
-            <div class="cartom-titlebar">
-                <span>📍 Cellule</span>
-                <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
-            </div>
-            <div class="cartom-body" id="cartom-info-body">
-                <span style="color:#888;">Survolez la carte…</span>
-            </div>
-        </div>
-
-        <img id="cartom-data-img" src="%DATA_URI%" style="display:none;">
-        %SPECIES_DATA_IMGS%
-        <canvas id="cartom-data-canvas" style="display:none;"></canvas>
-        <canvas id="cartom-render-canvas" style="display:none;"></canvas>
-        <img id="cartom-slope-img" src="%SLOPE_URI%" style="display:none;">
-        <canvas id="cartom-slope-canvas" style="display:none;"></canvas>
+        <button type="button" id="cs-open" class="cs-open"
+                aria-label="Ouvrir le panneau" hidden>☰ Cartomorilles</button>
+        <div id="cs-readout" class="cs-readout" aria-live="polite">Chargement de la carte…</div>
+        <img id="cartom-terrain-img" src="%TERRAIN_URI%" alt="" hidden>
+        %DATA_IMGS%
 
         <script>
-        document.addEventListener('DOMContentLoaded', function(){
+        (function () {
+        function init() {
+            var CFG = %CONFIG_JSON%;
+            var map = window[CFG.mapVar];
+            if (!map) { return; }
 
-            /* ═══════ DRAG ═══════ */
-            document.querySelectorAll('.cartom-panel').forEach(function(panel){
-                var bar = panel.querySelector('.cartom-titlebar');
-                if (!bar) return;
-                bar.addEventListener('mousedown', function(e){
-                    if (e.target.classList.contains('cartom-minimize')) return;
-                    e.preventDefault();
-                    var mx = e.clientX, my = e.clientY;
-                    var rect = panel.getBoundingClientRect();
-                    panel.style.top  = rect.top + 'px';
-                    panel.style.left = rect.left + 'px';
-                    panel.style.bottom = 'auto';
-                    panel.style.right  = 'auto';
-                    function onMove(ev){
-                        var dx = ev.clientX - mx, dy = ev.clientY - my;
-                        mx = ev.clientX; my = ev.clientY;
-                        var t = Math.max(0, Math.min(parseInt(panel.style.top)+dy, window.innerHeight-40));
-                        var l = Math.max(0, Math.min(parseInt(panel.style.left)+dx, window.innerWidth-40));
-                        panel.style.top = t+'px'; panel.style.left = l+'px';
-                    }
-                    function onUp(){ document.removeEventListener('mousemove',onMove); document.removeEventListener('mouseup',onUp); }
-                    document.addEventListener('mousemove', onMove);
-                    document.addEventListener('mouseup', onUp);
+            var LABELS = CFG.labels, TH = CFG.thresholds, ALPHA = CFG.classAlpha;
+            var SW = CFG.swatches, SWTXT = CFG.swatchText, N = CFG.scoreScale;
+            var IDLE = 'Survolez ou touchez la carte';
+            var current = CFG.primary;
+            var visible = LABELS.map(function (_, i) { return i > 0; });
+
+            function fmt(x, d) {
+                return Number(x).toLocaleString('fr-FR',
+                    {minimumFractionDigits: d, maximumFractionDigits: d});
+            }
+            function esc(s) {
+                return String(s).replace(/[&<>"']/g, function (c) {
+                    return {'&': '&amp;', '<': '&lt;', '>': '&gt;',
+                            '"': '&quot;', "'": '&#39;'}[c];
                 });
-                L.DomEvent.disableClickPropagation(panel);
-                L.DomEvent.disableScrollPropagation(panel);
+            }
+            function classOf(s) {
+                var c = 0;
+                for (var i = 0; i < TH.length; i++) { if (s >= TH[i]) { c = i + 1; } }
+                return c;
+            }
+            function hexToRgb(h) {
+                return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16),
+                        parseInt(h.slice(5, 7), 16)];
+            }
+
+            /* ═══════ Panneau : repli + isolation des clics ═══════ */
+            var sidebar = document.getElementById('cartom-sidebar');
+            var openBtn = document.getElementById('cs-open');
+            var readout = document.getElementById('cs-readout');
+            [sidebar, openBtn].forEach(function (el) {
+                L.DomEvent.disableClickPropagation(el);
+                L.DomEvent.disableScrollPropagation(el);
+            });
+            function setCollapsed(c) { sidebar.hidden = c; openBtn.hidden = !c; }
+            document.getElementById('cs-collapse').addEventListener('click', function () {
+                setCollapsed(true); openBtn.focus();
+            });
+            openBtn.addEventListener('click', function () { setCollapsed(false); });
+            if (window.matchMedia && window.matchMedia('(max-width: 700px)').matches) {
+                setCollapsed(true);
+            }
+            L.control.scale({position: 'bottomright', imperial: false, maxWidth: 140}).addTo(map);
+
+            /* ═══════ Couleurs : LUT score → couleur continue + classe ═══════ */
+            var lutRgb = new Uint8ClampedArray((N + 1) * 3), lutCls = new Uint8Array(N + 1);
+            (function () {
+                var stops = CFG.cmapStops.map(function (s) { return [s[0], hexToRgb(s[1])]; });
+                for (var v = 0; v <= N; v++) {
+                    var s = v / N, rgb = stops[stops.length - 1][1];
+                    for (var i = 1; i < stops.length; i++) {
+                        if (s <= stops[i][0]) {
+                            var t = (s - stops[i - 1][0]) / (stops[i][0] - stops[i - 1][0]);
+                            var a = stops[i - 1][1], b = stops[i][1];
+                            rgb = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
+                                   a[2] + (b[2] - a[2]) * t];
+                            break;
+                        }
+                    }
+                    lutRgb[v * 3] = rgb[0]; lutRgb[v * 3 + 1] = rgb[1]; lutRgb[v * 3 + 2] = rgb[2];
+                    lutCls[v] = classOf(s);
+                }
+            })();
+
+            /* ═══════ Données : score par espèce + terrain (R=pente, G+B=altitude) ═══════ */
+            var dataPx = {}, dataW = 0, dataH = 0, terrainPx = null;
+            function pixels(img) {
+                var c = document.createElement('canvas');
+                c.width = img.naturalWidth; c.height = img.naturalHeight;
+                var ctx = c.getContext('2d', {willReadFrequently: true});
+                ctx.drawImage(img, 0, 0);
+                return ctx.getImageData(0, 0, c.width, c.height).data;
+            }
+
+            /* ═══════ Couche de probabilité unique ═══════ */
+            var probLayer = null, probUrl = null, renderSeq = 0;
+            var renderCanvas = document.createElement('canvas');
+            var opInput = document.getElementById('cs-opacity');
+            var opOut = document.getElementById('cs-opacity-val');
+            function opacity() { return parseInt(opInput.value, 10) / 100; }
+
+            function renderProb() {
+                var src = dataPx[current];
+                if (!src) { return; }
+                renderCanvas.width = dataW; renderCanvas.height = dataH;
+                var ctx = renderCanvas.getContext('2d');
+                var out = ctx.createImageData(dataW, dataH), dd = out.data;
+                var alphaByCls = ALPHA.map(function (a, i) {
+                    return visible[i] ? Math.round(a * 255) : 0;
+                });
+                for (var i = 0, n = dataW * dataH; i < n; i++) {
+                    var o = i * 4, v = src[o];
+                    if (v > N) { continue; }
+                    var a = alphaByCls[lutCls[v]];
+                    if (!a) { continue; }
+                    dd[o] = lutRgb[v * 3]; dd[o + 1] = lutRgb[v * 3 + 1];
+                    dd[o + 2] = lutRgb[v * 3 + 2]; dd[o + 3] = a;
+                }
+                ctx.putImageData(out, 0, 0);
+                var seq = ++renderSeq;
+                renderCanvas.toBlob(function (blob) {
+                    if (!blob || seq !== renderSeq) { return; }
+                    var url = URL.createObjectURL(blob), old = probUrl;
+                    probUrl = url;
+                    if (probLayer) {
+                        if (old) { probLayer.once('load', function () { URL.revokeObjectURL(old); }); }
+                        probLayer.setUrl(url);
+                    } else {
+                        probLayer = L.imageOverlay(url, CFG.bounds, {
+                            opacity: opacity(), interactive: false, zIndex: 1,
+                            className: 'cs-prob'
+                        }).addTo(map);
+                    }
+                }, 'image/png');
+            }
+
+            opInput.addEventListener('input', function () {
+                opOut.textContent = opInput.value + ' %';
+                if (probLayer) { probLayer.setOpacity(opacity()); }
             });
 
-            /* ═══════ LÉGENDE ═══════ */
-            var legendBody = document.getElementById('cartom-legend-body');
-            if (legendBody) {
-                var labels = %LABELS_JSON%;
-                var thresholds = %THRESHOLDS_JSON%;
-                var colors = %COLORS_JSON%;
-                var cellSize = %CELL_SIZE%;
-                var html = '';
-                for (var i = labels.length-1; i >= 0; i--) {
-                    var range;
-                    if (i===0) range='< '+thresholds[0].toFixed(2);
-                    else if (i===labels.length-1) range='≥ '+thresholds[thresholds.length-1].toFixed(2);
-                    else range=thresholds[i-1].toFixed(2)+' – '+thresholds[i].toFixed(2);
-                    html+='<div style="margin:2px 0;">'
-                        +'<span style="display:inline-block;width:18px;height:13px;background:'+colors[i]
-                        +';border-radius:2px;margin-right:6px;vertical-align:middle;"></span>'
-                        +'<span style="vertical-align:middle;">'+labels[i]+' ('+range+')</span></div>';
-                }
-                html+='<div style="margin-top:6px;color:#888;font-size:10px;">Résolution : '+cellSize+'m × '+cellSize+'m</div>';
-                legendBody.innerHTML = html;
+            /* ═══════ Légende = filtre par classe ═══════ */
+            var legendReset = document.getElementById('cs-legend-reset');
+            function rangeText(i) {
+                if (i === 0) { return '< ' + fmt(TH[0], 2); }
+                if (i === LABELS.length - 1) { return '≥ ' + fmt(TH[TH.length - 1], 2); }
+                return fmt(TH[i - 1], 2) + ' – ' + fmt(TH[i], 2);
             }
-
-            /* ═══════ COLORBAR ═══════ */
-            var cbBody = document.getElementById('cartom-colorbar-body');
-            if (cbBody) {
-                var stops = %CMAP_STOPS_JSON%;
-                var grad = stops.map(function(s){ return s[1]+' '+(s[0]*100)+'%'; }).join(', ');
-                cbBody.innerHTML =
-                    '<div style="height:14px;border-radius:3px;background:linear-gradient(to right, '+grad+');margin-bottom:3px;"></div>'
-                    +'<div style="display:flex;justify-content:space-between;font-size:10px;color:#666;">'
-                    +'<span>0.0</span><span>0.3</span><span>0.5</span><span>0.8</span><span>1.0</span></div>'
-                    +'<div style="text-align:center;font-size:10px;color:#888;margin-top:2px;">Score de probabilité morilles</div>';
-            }
-
-            /* ═══════ FIND MAP ═══════ */
-            var map = null;
-            for (var k in window) {
-                try { if (window[k] instanceof L.Map) { map = window[k]; break; } }
-                catch(e){}
-            }
-
-            /* ═══════ COLORMAP JS ═══════ */
-            var cmapStops = %CMAP_STOPS_JSON%;
-
-            function hexToRgb(hex) {
-                var r = parseInt(hex.slice(1,3),16);
-                var g = parseInt(hex.slice(3,5),16);
-                var b = parseInt(hex.slice(5,7),16);
-                return [r, g, b];
-            }
-
-            function scoreToRgb(s) {
-                if (s <= cmapStops[0][0]) return hexToRgb(cmapStops[0][1]);
-                if (s >= cmapStops[cmapStops.length-1][0]) return hexToRgb(cmapStops[cmapStops.length-1][1]);
-                for (var i = 1; i < cmapStops.length; i++) {
-                    if (s <= cmapStops[i][0]) {
-                        var t = (s - cmapStops[i-1][0]) / (cmapStops[i][0] - cmapStops[i-1][0]);
-                        var c0 = hexToRgb(cmapStops[i-1][1]);
-                        var c1 = hexToRgb(cmapStops[i][1]);
-                        return [
-                            Math.round(c0[0]+(c1[0]-c0[0])*t),
-                            Math.round(c0[1]+(c1[1]-c0[1])*t),
-                            Math.round(c0[2]+(c1[2]-c0[2])*t)
-                        ];
+            function buildLegend() {
+                var ul = document.getElementById('cs-legend');
+                ul.innerHTML = '';
+                for (var i = LABELS.length - 1; i >= 0; i--) {
+                    var li = document.createElement('li');
+                    if (i === 0) {
+                        li.innerHTML = '<span class="cs-nul"><span class="cs-swatch cs-swatch-none"'
+                            + ' aria-hidden="true"></span><span>' + esc(LABELS[0])
+                            + ' ou exclu : transparent</span><span class="cs-range">'
+                            + rangeText(0) + '</span></span>';
+                    } else {
+                        var b = document.createElement('button');
+                        b.type = 'button';
+                        b.className = 'cs-class';
+                        b.dataset.cls = String(i);
+                        b.setAttribute('aria-pressed', visible[i] ? 'true' : 'false');
+                        b.innerHTML = '<span class="cs-swatch" style="background:' + SW[i]
+                            + '" aria-hidden="true"></span><span>' + esc(LABELS[i])
+                            + '</span><span class="cs-range">' + rangeText(i) + '</span>';
+                        b.addEventListener('click', onClassClick);
+                        li.appendChild(b);
                     }
+                    ul.appendChild(li);
                 }
-                return hexToRgb(cmapStops[cmapStops.length-1][1]);
+                legendReset.hidden = visible.slice(1).every(Boolean);
             }
-
-            var thresholdsA = %THRESHOLDS_JSON%;
-            var alphaSteps = [];
-            for (var ai = 1; ai <= thresholdsA.length + 1; ai++) {
-                alphaSteps.push(0.15 + (0.65 - 0.15) * ai / (thresholdsA.length + 1));
+            function onClassClick(e) {
+                var i = parseInt(e.currentTarget.dataset.cls, 10);
+                visible[i] = !visible[i];
+                e.currentTarget.setAttribute('aria-pressed', visible[i] ? 'true' : 'false');
+                legendReset.hidden = visible.slice(1).every(Boolean);
+                renderProb();
             }
-
-            function scoreToAlpha(s) {
-                var a = 0;
-                for (var i = 0; i < thresholdsA.length; i++) {
-                    if (s >= thresholdsA[i]) a = alphaSteps[i];
-                }
-                if (thresholdsA.length > 0 && s >= thresholdsA[thresholdsA.length-1]) a = 0.70;
-                return a;
-            }
-
-            /* ═══════ DATA & RENDER CANVAS ═══════ */
-            /* v2.6.0 : 1 dataCtx par espèce (filtre + tooltip suivent active). */
-            /* speciesList/primarySpecies déclarés tôt — utilisés par initCanvases */
-            var speciesList = %SPECIES_LIST_JSON%;
-            var speciesEmojis = %SPECIES_EMOJIS_JSON%;
-            var primarySpecies = %PRIMARY_SPECIES_JSON%;
-            var currentSpecies = primarySpecies;
-
-            var dataImg    = document.getElementById('cartom-data-img');
-            var dataCanvas = document.getElementById('cartom-data-canvas');
-            var renderCanvas = document.getElementById('cartom-render-canvas');
-            var slopeImg    = document.getElementById('cartom-slope-img');
-            var slopeCanvas = document.getElementById('cartom-slope-canvas');
-            var infoBody   = document.getElementById('cartom-info-body');
-            var dataCtx    = null;       /* legacy: pointe sur ctx primary */
-            var renderCtx  = null;
-            var slopeCtx   = null;
-            var dataW = 0, dataH = 0;
-            var dataCtxBySpecies = {};   /* species → CanvasRenderingContext2D */
-            var dataImgBySpecies = {};   /* species → HTMLImageElement */
-            var activeDataSpecies = null;
-
-            var south = %SOUTH%, north = %NORTH%;
-            var west  = %WEST%,  east  = %EAST%;
-            var SCORE_SCALE = %SCORE_SCALE%;
-            var SCORE_NAN   = %SCORE_NAN%;
-            var ALT_OFFSET  = %ALT_OFFSET%;
-            var SLOPE_OFFSET = %SLOPE_OFFSET%;
-            var SLOPE_SCALE  = %SLOPE_SCALE%;
-            var labelsT = %LABELS_JSON%;
-            var thresholdsT = %THRESHOLDS_JSON%;
-
-            var probOverlay = null;
-            var renderTimer = null;
-
-            function initCanvases() {
-                if (!dataImg || !dataCanvas || !renderCanvas) return false;
-                dataW = dataImg.naturalWidth;
-                dataH = dataImg.naturalHeight;
-                if (dataW === 0 || dataH === 0) return false;
-
-                /* v2.6.0 : crée 1 canvas off-screen par espèce, dessine son data PNG */
-                speciesList.forEach(function(sp){
-                    var img = document.getElementById('cartom-data-img-' + sp);
-                    if (!img && sp === primarySpecies) img = dataImg;
-                    if (!img || img.naturalWidth === 0) return;
-                    var off = document.createElement('canvas');
-                    off.width = dataW; off.height = dataH;
-                    var ctx = off.getContext('2d', {willReadFrequently: true});
-                    ctx.drawImage(img, 0, 0);
-                    dataCtxBySpecies[sp] = ctx;
-                    dataImgBySpecies[sp] = img;
-                });
-
-                /* Legacy : dataCtx pointe sur primary species (active par défaut) */
-                dataCanvas.width = dataW;
-                dataCanvas.height = dataH;
-                dataCtx = dataCtxBySpecies[primarySpecies] ||
-                          (function(){
-                              var c = dataCanvas.getContext('2d', {willReadFrequently: true});
-                              c.drawImage(dataImg, 0, 0);
-                              return c;
-                          })();
-                activeDataSpecies = primarySpecies;
-
-                renderCanvas.width = dataW;
-                renderCanvas.height = dataH;
-                renderCtx = renderCanvas.getContext('2d');
-
-                /* Slope canvas — Fix B1 */
-                if (slopeImg && slopeCanvas && slopeImg.naturalWidth > 0) {
-                    slopeCanvas.width  = slopeImg.naturalWidth;
-                    slopeCanvas.height = slopeImg.naturalHeight;
-                    slopeCtx = slopeCanvas.getContext('2d', {willReadFrequently: true});
-                    slopeCtx.drawImage(slopeImg, 0, 0);
-                }
-
-                return true;
-            }
-
-            /* Switch dataCtx actif → re-render avec filtres courants */
-            function setActiveDataSpecies(sp) {
-                if (dataCtxBySpecies[sp]) {
-                    dataCtx = dataCtxBySpecies[sp];
-                    activeDataSpecies = sp;
-                }
-            }
-
-            function renderOverlay(filterMin, filterMax) {
-                if (!dataCtx || !renderCtx) return;
-                var src = dataCtx.getImageData(0, 0, dataW, dataH);
-                var dst = renderCtx.createImageData(dataW, dataH);
-                var sd = src.data, dd = dst.data;
-                var len = dataW * dataH;
-
-                for (var i = 0; i < len; i++) {
-                    var off = i * 4;
-                    var rVal = sd[off];
-
-                    if (rVal === SCORE_NAN) { dd[off+3] = 0; continue; }
-
-                    var score = rVal / SCORE_SCALE;
-                    if (score < filterMin || score > filterMax) {
-                        dd[off+3] = 0;
-                        continue;
-                    }
-
-                    var rgb = scoreToRgb(score);
-                    var alpha = scoreToAlpha(score);
-                    dd[off]   = rgb[0];
-                    dd[off+1] = rgb[1];
-                    dd[off+2] = rgb[2];
-                    dd[off+3] = Math.round(alpha * 255);
-                }
-
-                renderCtx.putImageData(dst, 0, 0);
-
-                var url = renderCanvas.toDataURL('image/png');
-                if (probOverlay) {
-                    probOverlay.setUrl(url);
-                } else if (map) {
-                    probOverlay = L.imageOverlay(url,
-                        [[south, west], [north, east]],
-                        {opacity: 0.7, interactive: false, zIndex: 1}
-                    );
-                    probOverlay.addTo(map);
-
-                    var controls = document.querySelectorAll('.leaflet-control-layers-overlays');
-                    if (controls.length > 0) {
-                        var container = controls[0];
-                        var lbl = document.createElement('label');
-                        lbl.innerHTML = '<span><input type="checkbox" class="leaflet-control-layers-selector" checked>'
-                            + ' <span> 🍄 Probabilité morilles</span></span>';
-                        container.insertBefore(lbl, container.firstChild);
-                        var cb = lbl.querySelector('input');
-                        cb.addEventListener('change', function(){
-                            if (this.checked) probOverlay.addTo(map);
-                            else map.removeLayer(probOverlay);
-                        });
-                    }
-                }
-            }
-
-            function renderDebounced() {
-                if (renderTimer) clearTimeout(renderTimer);
-                renderTimer = setTimeout(function(){
-                    var fmin = parseInt(document.getElementById('cartom_filter_min').value) / 100.0;
-                    var fmax = parseInt(document.getElementById('cartom_filter_max').value) / 100.0;
-                    renderOverlay(fmin, fmax);
-                }, 60);
-            }
-
-            function onReady() {
-                if (!initCanvases()) return;
-                renderOverlay(0.0, 1.0);
-            }
-
-            /* Attendre que TOUS les data imgs (1 par espèce) soient chargés
-               avant initCanvases — sinon dataCtxBySpecies incomplet. */
-            function allDataImgsReady() {
-                if (dataImg && (!dataImg.complete || dataImg.naturalWidth === 0)) {
-                    return false;
-                }
-                for (var i = 0; i < speciesList.length; i++) {
-                    var sp = speciesList[i];
-                    if (sp === primarySpecies) continue;
-                    var img = document.getElementById('cartom-data-img-' + sp);
-                    if (img && (!img.complete || img.naturalWidth === 0)) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-
-            function tryReady() {
-                if (allDataImgsReady()) onReady();
-            }
-
-            if (allDataImgsReady()) {
-                onReady();
-            } else {
-                if (dataImg) dataImg.addEventListener('load', tryReady);
-                speciesList.forEach(function(sp){
-                    if (sp === primarySpecies) return;
-                    var img = document.getElementById('cartom-data-img-' + sp);
-                    if (img) img.addEventListener('load', tryReady);
-                });
-            }
-            if (slopeImg && !slopeImg.complete) {
-                slopeImg.addEventListener('load', function(){ initCanvases(); });
-            }
-
-            /* ═══════ FILTRE SLIDERS ═══════ */
-            var sliderMin = document.getElementById('cartom_filter_min');
-            var sliderMax = document.getElementById('cartom_filter_max');
-            var valMin = document.getElementById('cartom_fmin_val');
-            var valMax = document.getElementById('cartom_fmax_val');
-
-            if (sliderMin && sliderMax) {
-                sliderMin.addEventListener('input', function(){
-                    var v = parseInt(this.value);
-                    var mx = parseInt(sliderMax.value);
-                    if (v > mx) { v = mx; this.value = v; }
-                    valMin.textContent = (v/100).toFixed(2);
-                    renderDebounced();
-                });
-                sliderMax.addEventListener('input', function(){
-                    var v = parseInt(this.value);
-                    var mn = parseInt(sliderMin.value);
-                    if (v < mn) { v = mn; this.value = v; }
-                    valMax.textContent = (v/100).toFixed(2);
-                    renderDebounced();
-                });
-            }
-
-            /* ═══════ OPACITÉ ═══════ */
-            var opSlider = document.getElementById('cartom_opacity_slider');
-            var opVal = document.getElementById('cartom_opval');
-            if (opSlider) {
-                opSlider.addEventListener('input', function(e){
-                    var v = parseInt(e.target.value) / 100.0;
-                    if (opVal) opVal.textContent = e.target.value + '%';
-                    if (!map) return;
-                    map.eachLayer(function(layer){
-                        if (layer instanceof L.TileLayer) return;
-                        if (layer instanceof L.ImageOverlay) { layer.setOpacity(v); return; }
-                        if (layer.eachLayer) layer.eachLayer(function(sub){
-                            if (sub instanceof L.ImageOverlay) sub.setOpacity(v);
-                        });
-                    });
-                });
-            }
-
-            /* ═══════ HOTSPOT SLIDER ═══════ */
-            var hsSlider = document.getElementById('cartom_hotspot_slider');
-            var hsVal    = document.getElementById('cartom_hs_val');
-            var nHotspots = %N_HOTSPOTS%;
-
-            function updateHotspotVisibility(maxVisible) {
-                if (!map) return;
-                map.eachLayer(function(layer) {
-                    if (!layer.eachLayer) return;
-                    layer.eachLayer(function(marker) {
-                        if (!marker.options || !marker.options.className) return;
-                        var cls = marker.options.className;
-                        if (cls.indexOf('cartom-hotspot') === -1) return;
-                        var match = cls.match(/cartom-rank-(\d+)/);
-                        if (!match) return;
-                        var rank = parseInt(match[1]);
-                        var el = null;
-                        if (marker._icon) el = marker._icon;
-                        else if (marker.getElement) el = marker.getElement();
-                        if (!el) return;
-                        if (rank < maxVisible) {
-                            el.classList.remove('cartom-hotspot-hidden');
-                            el.style.display = '';
-                        } else {
-                            el.classList.add('cartom-hotspot-hidden');
-                            el.style.display = 'none';
-                        }
-                        if (marker._shadow) {
-                            marker._shadow.style.display = rank < maxVisible ? '' : 'none';
-                        }
-                    });
-                });
-            }
-
-            if (hsSlider) {
-                hsSlider.addEventListener('input', function() {
-                    var v = parseInt(this.value);
-                    if (hsVal) hsVal.textContent = v;
-                    updateHotspotVisibility(v);
-                });
-            }
-
-            /* ═══════ TOOLTIP ═══════ */
-            function getClass(score) {
-                for (var i = thresholdsT.length - 1; i >= 0; i--) {
-                    if (score >= thresholdsT[i]) return labelsT[i + 1];
-                }
-                return labelsT[0];
-            }
-
-            if (map && infoBody) {
-                map.on('mousemove', function(e) {
-                    if (!dataCtx) { if (!initCanvases()) return; }
-                    var lat = e.latlng.lat, lng = e.latlng.lng;
-
-                    if (lat < south || lat > north || lng < west || lng > east) {
-                        infoBody.innerHTML = '<span style="color:#888;">Hors emprise</span>';
-                        return;
-                    }
-
-                    var px = Math.floor((lng - west) / (east - west) * dataW);
-                    var py = Math.floor((north - lat) / (north - south) * dataH);
-                    px = Math.max(0, Math.min(px, dataW - 1));
-                    py = Math.max(0, Math.min(py, dataH - 1));
-
-                    var pixel = dataCtx.getImageData(px, py, 1, 1).data;
-                    var r = pixel[0], g = pixel[1], b = pixel[2];
-
-                    if (r === SCORE_NAN || (r===0 && g===0 && b===0)) {
-                        infoBody.innerHTML = '<span style="color:#888;">Pas de données</span>';
-                        return;
-                    }
-
-                    var score = r / SCORE_SCALE;
-                    var cls = getClass(score);
-                    var h = '<b>🍄 '+(score*100).toFixed(1)+'%</b> — <em>'+cls+'</em><br>';
-
-                    /* Altitude — Fix B1 : RGB opaque, plus de pré-multiplication */
-                    var altRaw = g + (b << 8);
-                    if (altRaw > 0) h += '⛰️ '+(altRaw - ALT_OFFSET)+' m<br>';
-
-                    /* Pente — Fix B1 : lue depuis slope PNG séparé */
-                    var slopeR = slopeCtx ? slopeCtx.getImageData(px, py, 1, 1).data[0] : 0;
-                    if (slopeR > 0) {
-                        var slope = (slopeR - SLOPE_OFFSET) / SLOPE_SCALE;
-                        h += '📐 '+slope.toFixed(1)+'°<br>';
-                    }
-
-                    h += '<span style="font-size:9px;color:#aaa;">'
-                        +lat.toFixed(5)+', '+lng.toFixed(5)+'</span>';
-                    infoBody.innerHTML = h;
-                });
-
-                map.on('mouseout', function(){
-                    infoBody.innerHTML = '<span style="color:#888;">Survolez la carte…</span>';
-                });
-            }
-
-            /* ═══════ SPECIES TOGGLE (v2.6.0) ═══════ */
-            /* Vars déclarés plus haut (DATA & RENDER CANVAS section). */
-
-            // Trouve les ImageOverlay correspondant à chaque species par
-            // pattern dans leur "name" Folium (ex: "🍄 Probabilité Morilles").
-            function findOverlayForSpecies(sp) {
-                if (!map) return null;
-                var layers = [];
-                map.eachLayer(function(l){
-                    if (l instanceof L.ImageOverlay && l.options && l.options.name) {
-                        if (l.options.name.indexOf(speciesEmojis[sp]) >= 0
-                            && l.options.name.indexOf("Probabilité") >= 0) {
-                            layers.push(l);
-                        }
-                    }
-                });
-                return layers.length > 0 ? layers[0] : null;
-            }
-
-            function findHotspotGroupForSpecies(sp) {
-                if (!map) return null;
-                var groups = [];
-                map.eachLayer(function(l){
-                    if (l instanceof L.FeatureGroup && l.options && l.options.name) {
-                        if (l.options.name.indexOf("Hotspots") >= 0
-                            && l.options.name.toLowerCase().indexOf(sp) < 0) {
-                            // Match par nom commun n'est pas robuste — on filtre par
-                            // marqueur cartom-species-* dans children
-                            var hasMatch = false;
-                            l.eachLayer(function(child){
-                                if (child.options && child.options.className
-                                    && child.options.className.indexOf("cartom-species-"+sp) >= 0) {
-                                    hasMatch = true;
-                                }
-                            });
-                            if (hasMatch) groups.push(l);
-                        }
-                    }
-                });
-                return groups.length > 0 ? groups[0] : null;
-            }
-
-            // Récupère opacité du slider (réutilise slider opacité existant)
-            function getCurrentOpacity() {
-                var sl = document.getElementById('cartom_opacity_slider');
-                if (sl) return parseInt(sl.value, 10) / 100.0;
-                return 0.7;
-            }
-
-            function applySpeciesSelection(sp) {
-                currentSpecies = sp;
-                var op = getCurrentOpacity();
-                speciesList.forEach(function(other){
-                    var ov = findOverlayForSpecies(other);
-                    if (ov) {
-                        try { ov.setOpacity(other === sp ? op : 0); } catch(e){}
-                    }
-                });
-
-                /* v2.6.0 — switch dataCtx + re-render probOverlay (filtre)
-                   pour que filtre min/max suive l'espèce active */
-                if (typeof setActiveDataSpecies === 'function'
-                    && dataCtxBySpecies[sp]) {
-                    setActiveDataSpecies(sp);
-                    if (typeof renderDebounced === 'function') {
-                        renderDebounced();
-                    }
-                }
-                /* probOverlay garde son opacité par sliderProb, pas géré ici */
-
-                // Hotspot FeatureGroups : iter all layers, hide others
-                if (map) {
-                    map.eachLayer(function(l){
-                        if (l instanceof L.FeatureGroup && l.options && l.options.name
-                            && l.options.name.indexOf("Hotspots") >= 0) {
-                            // Détermine espèce du group via marqueurs enfants
-                            var ownerSp = null;
-                            l.eachLayer(function(child){
-                                if (child.options && child.options.className) {
-                                    var m = child.options.className.match(/cartom-species-(\w+)/);
-                                    if (m) { ownerSp = m[1]; }
-                                }
-                            });
-                            if (ownerSp && ownerSp !== sp) {
-                                map.removeLayer(l);
-                            }
-                        }
-                    });
-                    // Réajoute le group de l'espèce active
-                    var hg = window["_cartom_hotspot_groups_"+sp];
-                    if (hg && !map.hasLayer(hg)) hg.addTo(map);
-                }
-
-                // Update legend titlebar text
-                var legendTitle = document.querySelector('#cartom-legend .cartom-titlebar span:first-child');
-                if (legendTitle && speciesEmojis[sp]) {
-                    var common = sp === 'esculenta' ? 'Morilles'
-                                : sp === 'edulis' ? 'Cèpes' : sp;
-                    legendTitle.textContent = speciesEmojis[sp] + ' Probabilité ' + common;
-                }
-            }
-
-            // Bind radios
-            document.querySelectorAll('input[name="cartom-species-radio"]').forEach(function(r){
-                r.addEventListener('change', function(e){
-                    if (e.target.checked) applySpeciesSelection(e.target.value);
-                });
+            legendReset.addEventListener('click', function () {
+                visible = LABELS.map(function (_, i) { return i > 0; });
+                buildLegend(); renderProb();
             });
 
-            // Slider opacité bind : repropage à l'overlay actif
-            var opSlider = document.getElementById('cartom_opacity_slider');
-            if (opSlider) {
-                opSlider.addEventListener('input', function(){
-                    applySpeciesSelection(currentSpecies);
+            /* ═══════ Hotspots (top N de l'espèce active) ═══════ */
+            var hsLayer = L.layerGroup().addTo(map);
+            var hsShow = document.getElementById('cs-hs-show');
+            var hsN = document.getElementById('cs-hs-n');
+            var hsNOut = document.getElementById('cs-hs-n-val');
+            var hsInfo = document.getElementById('cs-hs-info');
+            var hsWanted = CFG.hotspotsDefault;
+
+            function areaText(ha) {
+                if (ha >= 10) { return fmt(ha, 0) + ' ha'; }
+                if (ha >= 1) { return fmt(ha, 1) + ' ha'; }
+                return fmt(ha * 10000, 0) + ' m²';
+            }
+            function hsPopup(h) {
+                var sp = CFG.species[current], ll = h.lat.toFixed(5) + ',' + h.lon.toFixed(5);
+                var facts = [areaText(h.a)];
+                if (h.alt !== undefined) { facts.push('altitude ' + h.alt + ' m'); }
+                if (h.sl !== undefined) { facts.push('pente ' + fmt(h.sl, 0) + '°'); }
+                var lines = [
+                    '<b>' + esc(sp.emoji + ' ' + sp.name) + ' — hotspot n°' + h.r + '</b>',
+                    'Score moyen <b>' + fmt(h.s, 2) + '</b> · ' + esc(LABELS[classOf(h.s)]),
+                    facts.join(' · ')
+                ];
+                if (h.tr) { lines.push('Essence dominante : ' + esc(h.tr)); }
+                if (h.g) { lines.push('Géologie : ' + esc(h.g)); }
+                lines.push('<span class="cs-coords">' + h.lat.toFixed(5) + ', ' + h.lon.toFixed(5)
+                    + '</span> · <a href="https://www.google.com/maps?q=' + ll
+                    + '" target="_blank" rel="noopener">Google Maps</a>');
+                return lines.join('<br>');
+            }
+            function renderHotspots() {
+                hsLayer.clearLayers();
+                var list = CFG.hotspots[current] || [], total = list.length;
+                var detected = Math.max(total, CFG.hotspotTotals[current] || 0);
+                var n = Math.min(hsWanted, total);
+                hsN.max = String(Math.max(1, total));
+                hsN.value = String(Math.max(1, n));
+                hsN.disabled = total <= 1;
+                hsNOut.textContent = String(n);
+                hsInfo.textContent = total
+                    ? 'Les ' + n + ' meilleurs sur ' + detected.toLocaleString('fr-FR') + ' détectés'
+                      + (detected > total ? ' (carte limitée aux ' + total.toLocaleString('fr-FR')
+                         + ' premiers, liste complète dans le CSV)' : '')
+                    : 'Aucun hotspot détecté';
+                if (!hsShow.checked) { return; }
+                for (var i = 0; i < n; i++) {
+                    var h = list[i], c = classOf(h.s);
+                    var icon = L.divIcon({
+                        className: 'cs-hs',
+                        html: '<span style="background:' + SW[c] + ';color:' + SWTXT[c] + '">'
+                            + h.r + '</span>',
+                        iconSize: [28, 28], iconAnchor: [14, 14], popupAnchor: [0, -14]
+                    });
+                    L.marker([h.lat, h.lon], {
+                        icon: icon, riseOnHover: true, zIndexOffset: (n - i) * 10,
+                        title: 'Hotspot n°' + h.r + ' — score ' + fmt(h.s, 2)
+                    }).bindPopup(hsPopup(h), {maxWidth: 320}).addTo(hsLayer);
+                }
+            }
+            hsShow.addEventListener('change', renderHotspots);
+            hsN.addEventListener('input', function () {
+                hsWanted = parseInt(hsN.value, 10);
+                renderHotspots();
+            });
+
+            /* ═══════ Fond de carte + couches ═══════ */
+            var baseSel = document.getElementById('cs-basemap'), baseLayer = null;
+            CFG.basemaps.forEach(function (b) {
+                if (b['default']) { baseLayer = window[b.var] || null; }
+            });
+            baseSel.addEventListener('change', function () {
+                var b = CFG.basemaps[baseSel.selectedIndex], layer = b && window[b.var];
+                if (!layer || layer === baseLayer) { return; }
+                if (baseLayer) { map.removeLayer(baseLayer); }
+                layer.addTo(map); layer.bringToBack(); baseLayer = layer;
+            });
+            document.querySelectorAll('#cs-layers input[data-layer]').forEach(function (input) {
+                var layer = window[CFG.layers[input.dataset.layer]];
+                if (!layer) { input.closest('label').hidden = true; return; }
+                function sync() {
+                    if (input.checked) { map.addLayer(layer); } else { map.removeLayer(layer); }
+                }
+                input.addEventListener('change', sync);
+                sync();
+            });
+
+            /* ═══════ Couches de diagnostic (option --debug-layers) ═══════ */
+            var diagOn = {};
+            function syncDiag() {
+                var box = document.getElementById('cs-diag-list');
+                if (!box) { return; }
+                box.innerHTML = '';
+                CFG.diag.forEach(function (d) {
+                    var layer = window[d.var];
+                    if (!layer) { return; }
+                    if (d.species && d.species !== current) { map.removeLayer(layer); return; }
+                    var lab = document.createElement('label');
+                    lab.className = 'cs-check';
+                    lab.innerHTML = '<input type="checkbox"><span class="cs-dot" style="background:'
+                        + d.swatch + '" aria-hidden="true"></span><span>' + esc(d.label) + '</span>';
+                    var input = lab.querySelector('input');
+                    input.checked = !!diagOn[d.group];
+                    function sync() {
+                        if (input.checked) { map.addLayer(layer); } else { map.removeLayer(layer); }
+                    }
+                    input.addEventListener('change', function () {
+                        diagOn[d.group] = input.checked; sync();
+                    });
+                    sync();
+                    box.appendChild(lab);
                 });
             }
 
-            // Init : applique sélection initiale après que les overlays soient ajoutés
-            setTimeout(function(){ applySpeciesSelection(primarySpecies); }, 100);
-        });
+            /* ═══════ Lecture de la cellule (survol, ou toucher sur mobile) ═══════ */
+            /* L'image est linéaire en Y Mercator (overlay EPSG:3857, D29) :
+               la ligne de pixel se calcule en Mercator, pas en latitude. */
+            function mercY(lat) {
+                var s = Math.sin(lat * Math.PI / 180);
+                return 0.5 * Math.log((1 + s) / (1 - s));
+            }
+            var yN = mercY(CFG.north), yS = mercY(CFG.south);
+            function showReadout(ll) {
+                var d = dataPx[current], sp = CFG.species[current];
+                if (!d) { return; }
+                if (ll.lat < CFG.south || ll.lat > CFG.north
+                    || ll.lng < CFG.west || ll.lng > CFG.east) {
+                    readout.textContent = 'Hors de la zone modélisée';
+                    return;
+                }
+                var px = Math.floor((ll.lng - CFG.west) / (CFG.east - CFG.west) * dataW);
+                var py = Math.floor((yN - mercY(ll.lat)) / (yN - yS) * dataH);
+                px = Math.max(0, Math.min(px, dataW - 1));
+                py = Math.max(0, Math.min(py, dataH - 1));
+                var o = (py * dataW + px) * 4;
+                if (d[o] > N) { readout.textContent = 'Pas de données ici'; return; }
+                var s = d[o] / N;
+                var parts = [sp.emoji + ' ' + sp.name + ' : ' + fmt(s, 2) + ' · ' + LABELS[classOf(s)]];
+                if (terrainPx) {
+                    var alt = terrainPx[o + 1] + (terrainPx[o + 2] << 8);
+                    if (alt > 0) { parts.push(Math.round(alt - CFG.altOffset) + ' m'); }
+                    if (terrainPx[o] > 0) {
+                        parts.push(fmt((terrainPx[o] - CFG.slopeOffset) / CFG.slopeScale, 0) + '°');
+                    }
+                }
+                parts.push(ll.lat.toFixed(5) + ', ' + ll.lng.toFixed(5));
+                readout.textContent = parts.join(' · ');
+            }
+            map.on('mousemove click', function (e) { showReadout(e.latlng); });
+            map.on('mouseout', function () { if (dataPx[current]) { readout.textContent = IDLE; } });
+
+            /* ═══════ Espèce ═══════ */
+            function setSpecies(sp) {
+                if (!CFG.species[sp]) { return; }
+                current = sp;
+                document.getElementById('cs-legend-title').textContent =
+                    'Probabilité — ' + CFG.species[sp].name;
+                renderProb(); renderHotspots(); syncDiag();
+                if (dataPx[current]) { readout.textContent = IDLE; }
+            }
+            document.querySelectorAll('input[name="cs-species"]').forEach(function (r) {
+                r.addEventListener('change', function () { if (r.checked) { setSpecies(r.value); } });
+            });
+
+            /* ═══════ Démarrage : attendre les data PNG ═══════ */
+            buildLegend();
+            setSpecies(current);
+            var imgs = CFG.speciesList.map(function (sp) {
+                return document.getElementById('cartom-data-img-' + sp);
+            });
+            var terrainImg = document.getElementById('cartom-terrain-img');
+            function ready(img) { return img && img.complete && img.naturalWidth > 0; }
+            function start() {
+                if (!imgs.every(ready)) { return; }
+                CFG.speciesList.forEach(function (sp, i) { dataPx[sp] = pixels(imgs[i]); });
+                dataW = imgs[0].naturalWidth; dataH = imgs[0].naturalHeight;
+                if (ready(terrainImg) && terrainImg.naturalWidth === dataW) {
+                    terrainPx = pixels(terrainImg);
+                }
+                readout.textContent = IDLE;
+                renderProb();
+            }
+            var waiting = imgs.concat([terrainImg]).filter(function (img) { return img && !ready(img); });
+            if (!waiting.length) { start(); }
+            waiting.forEach(function (img) {
+                img.addEventListener('load', function () {
+                    if (waiting.every(ready)) { start(); }
+                }, {once: true});
+            });
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+        })();
         </script>
         """
 
-        labels_json = json.dumps(list(config.PROBABILITY_LABELS))
-        thresholds_json = json.dumps(list(config.PROBABILITY_THRESHOLDS))
-        colors_json = json.dumps(
-            list(_CLASS_COLORS[: len(config.PROBABILITY_LABELS)]),
-        )
-        cmap_stops_json = json.dumps([[pos, col] for pos, col in _CMAP_STOPS])
-
-        # ── v2.6.0 species selector ──
-        species_emojis: dict[str, str] = {}
-        species_radios_parts: list[str] = []
-        for sp_idx, sp_name in enumerate(self.species_list):
-            sp_p = config.SPECIES_PARAMS.get(
-                sp_name, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
-            )
-            emoji = sp_p.get("emoji", "🍄")
-            common = sp_p.get("common_name", sp_name)
-            species_emojis[sp_name] = emoji
-            checked = "checked" if sp_idx == 0 else ""
-            species_radios_parts.append(
-                f'<label><input type="radio" name="cartom-species-radio" '
-                f'value="{sp_name}" {checked}> {emoji} {common}</label>'
-            )
-        species_radios = "\n".join(species_radios_parts)
-        species_list_json = json.dumps(self.species_list)
-        species_emojis_json = json.dumps(species_emojis)
-        primary_species_json = json.dumps(self.primary_species)
-
-        # ── Data PNG IMG tags supplémentaires (1 par espèce non-primary) ──
-        # Le primary species réutilise le tag #cartom-data-img existant.
-        extra_imgs_parts: list[str] = []
-        for sp_name in self.species_list:
-            if sp_name == self.primary_species:
-                continue
-            sp_uri = data_uris_by_species.get(sp_name, "")
-            if sp_uri:
-                extra_imgs_parts.append(
-                    f'<img id="cartom-data-img-{sp_name}" '
-                    f'src="{sp_uri}" style="display:none;">'
-                )
-        species_data_imgs = "\n        ".join(extra_imgs_parts)
-
-        js_final = (
-            js_block.replace("%DATA_URI%", data_uri)
-            .replace("%SLOPE_URI%", slope_uri)
-            .replace("%SOUTH%", f"{self._south:.8f}")
-            .replace("%NORTH%", f"{self._north:.8f}")
-            .replace("%WEST%", f"{self._west:.8f}")
-            .replace("%EAST%", f"{self._east:.8f}")
-            .replace("%SCORE_SCALE%", str(_SCORE_SCALE))
-            .replace("%SCORE_NAN%", str(_SCORE_NAN))
-            .replace("%ALT_OFFSET%", str(_ALT_OFFSET))
-            .replace("%SLOPE_OFFSET%", str(_SLOPE_OFFSET))
-            .replace("%SLOPE_SCALE%", str(_SLOPE_SCALE))
-            .replace("%LABELS_JSON%", labels_json)
-            .replace("%THRESHOLDS_JSON%", thresholds_json)
-            .replace("%COLORS_JSON%", colors_json)
-            .replace("%CELL_SIZE%", str(config.CELL_SIZE))
-            .replace("%CMAP_STOPS_JSON%", cmap_stops_json)
-            .replace("%N_HOTSPOTS%", str(n_hotspots))
-            .replace("%SPECIES_RADIOS%", species_radios)
-            .replace("%SPECIES_LIST_JSON%", species_list_json)
-            .replace("%SPECIES_EMOJIS_JSON%", species_emojis_json)
-            .replace("%PRIMARY_SPECIES_JSON%", primary_species_json)
-            .replace("%SPECIES_DATA_IMGS%", species_data_imgs)
-        )
+        replacements = {
+            "%SUBTITLE%": html.escape(subtitle),
+            "%SPECIES_HIDDEN%": " hidden" if len(self.species_list) < 2 else "",
+            "%SPECIES_RADIOS%": species_radios,
+            "%BASEMAP_OPTIONS%": basemap_options,
+            "%LAYER_CHECKS%": layer_checks,
+            "%DIAG_BLOCK%": diag_block,
+            "%WEATHER_SECTION%": weather_html,
+            "%TERRAIN_URI%": terrain_uri,
+            "%DATA_IMGS%": data_imgs,
+            "%CONFIG_JSON%": _js_json(cfg),
+        }
+        for token, value in replacements.items():
+            block = block.replace(token, value)
 
         folium_map.get_root().html.add_child(  # type: ignore[attr-defined]
-            Element(js_final),
+            Element(block),
         )
 
     # ──────────────────────────────────────────────────────
     # Fonds de carte
     # ──────────────────────────────────────────────────────
-    def _add_basemaps(self, folium_map: folium.Map) -> None:
+    def _add_basemaps(self, folium_map: folium.Map) -> list[dict[str, Any]]:
+        """Ajoute les fonds de carte (seul le défaut est affiché) et
+        retourne leur description pour le sélecteur du panneau."""
+        basemaps: list[dict[str, Any]] = []
         for name, cfg in config.BASEMAPS.items():
             is_default = name == config.DEFAULT_BASEMAP
+            label = str(cfg.get("name", name))
             tiles = cfg["tiles"]
             if tiles in {
                 "OpenStreetMap",
                 "CartoDB positron",
                 "CartoDB dark_matter",
             }:
-                folium.TileLayer(
+                layer = folium.TileLayer(
                     tiles=tiles,
-                    name=name,
+                    name=label,
                     show=is_default,
-                ).add_to(folium_map)
+                    control=False,
+                )
             else:
-                folium.TileLayer(
+                layer = folium.TileLayer(
                     tiles=tiles,
                     attr=cfg.get("attr", ""),
-                    name=cfg.get("name", name),
+                    name=label,
                     max_zoom=cfg.get("max_zoom", 18),
                     show=is_default,
-                ).add_to(folium_map)
+                    control=False,
+                )
+            layer.add_to(folium_map)
+            basemaps.append({
+                "label": label,
+                "var": layer.get_name(),
+                "default": is_default,
+            })
+        return basemaps
 
     # ──────────────────────────────────────────────────────
     # Couche hydro vectorielle
     # ──────────────────────────────────────────────────────
-    def _add_hydro_vector_layer(self, folium_map: folium.Map) -> None:
+    def _add_hydro_vector_layer(self, folium_map: folium.Map) -> str | None:
+        """Cours d'eau (masqués au départ). Géométries simplifiées à
+        l'échelle de la maille et arrondies à ~1 m pour alléger le HTML."""
         if self._hydro_gdf is None or self._hydro_gdf.empty:
             logger.debug("   Pas de données hydro vectorielles")
-            return
+            return None
 
-        gdf = self._hydro_gdf.copy()
-        if gdf.crs is not None and not gdf.crs.equals("EPSG:4326"):
-            gdf = gdf.to_crs(epsg=4326)
+        geoms = self._hydro_gdf.geometry
+        if geoms.crs is not None and geoms.crs.is_projected:
+            geoms = geoms.simplify(max(float(config.CELL_SIZE) / 4.0, 5.0))
+        if geoms.crs is not None and not geoms.crs.equals("EPSG:4326"):
+            geoms = geoms.to_crs(epsg=4326)
+        geoms = geoms.set_precision(1e-5)
+        geoms = geoms[~(geoms.isna() | geoms.is_empty)]
 
         style = {"color": "#0077cc", "weight": 2, "opacity": 0.7}
-        fg = folium.FeatureGroup(name="💧 Cours d'eau", show=False)
+        fg = folium.FeatureGroup(name="Cours d'eau", show=False, control=False)
         folium.GeoJson(
-            gdf.geometry.__geo_interface__,
+            geoms.__geo_interface__,
             style_function=lambda _feat, _s=style: _s,
         ).add_to(fg)
         fg.add_to(folium_map)
-        logger.info("✅ Cours d'eau vectoriels : %d entités", len(gdf))
+        logger.info("✅ Cours d'eau vectoriels : %d entités", len(geoms))
+        return fg.get_name()
 
     # ──────────────────────────────────────────────────────
     # Couche iNaturalist Morchella
     # ──────────────────────────────────────────────────────
-    def _add_inaturalist_layer(self, folium_map: folium.Map) -> None:
+    def _add_inaturalist_layer(self, folium_map: folium.Map) -> str | None:
         if not self._inat_observations:
-            return
+            return None
 
-        fg = folium.FeatureGroup(name="🍄 iNaturalist Morchella", show=True)
+        fg = folium.FeatureGroup(
+            name="Observations iNaturalist", show=True, control=False,
+        )
         for obs in self._inat_observations:
             lat = obs.get("lat")
             lng = obs.get("lng")
@@ -1739,21 +1511,21 @@ class MorilleVisualizer:
             taxon = str(obs.get("taxon_name", "Morchella"))
             obs_id = obs.get("id", "?")
 
-            color = "#e67300" if quality == "research" else "#cc9900"
             popup_html = (
-                f"<b>iNaturalist #{obs_id}</b><br>"
-                f"Taxon : {taxon}<br>"
-                f"Date : {date_str}<br>"
-                f"Qualité : {quality}"
+                f"<b>iNaturalist #{html.escape(str(obs_id))}</b><br>"
+                f"Taxon : {html.escape(taxon)}<br>"
+                f"Date : {html.escape(date_str)}<br>"
+                f"Qualité : {html.escape(quality)}"
             )
             folium.CircleMarker(
                 location=[float(lat), float(lng)],
                 radius=6,
-                color=color,
+                color="#ffffff",
+                weight=1.5,
                 fill=True,
-                fill_color=color,
-                fill_opacity=0.8,
-                popup=folium.Popup(popup_html, max_width=200),
+                fill_color=_INAT_COLOR if quality == "research" else "#9e7cc1",
+                fill_opacity=0.9,
+                popup=folium.Popup(popup_html, max_width=220),
             ).add_to(fg)
 
         fg.add_to(folium_map)
@@ -1761,21 +1533,23 @@ class MorilleVisualizer:
             "✅ iNaturalist : %d observations affichées",
             len(self._inat_observations),
         )
+        return fg.get_name()
 
     # ──────────────────────────────────────────────────────
-    # Panneau météo
+    # Section météo du panneau
     # ──────────────────────────────────────────────────────
-    def _add_weather_panel(self, folium_map: folium.Map) -> None:
+    def _weather_section_html(self) -> str:
+        """Section « Météo prospection » du panneau ('' sans données)."""
         if not self._weather_days:
-            return
+            return ""
 
         rows = ""
         best_day = None
         best_score = -1.0
         for d in self._weather_days:
             score = float(d.score)
-            label = str(d.label)
-            date_str = str(d.date_fr)
+            label = html.escape(str(d.label))
+            date_str = html.escape(str(d.date_fr))
             # Icône selon le niveau
             if score >= 0.7:
                 icon = "&#9733;"  # star
@@ -1815,103 +1589,58 @@ class MorilleVisualizer:
                 f"</div>"
             )
 
-        html = f"""
-        <div id="wx-panel" class="cartom-panel">
-          <div class="cartom-titlebar">
-            <span>&#127780; Météo prospection</span>
-            <span class="cartom-minimize" onclick="this.closest('.cartom-panel').classList.toggle('minimized')">−</span>
-          </div>
-          <div class="cartom-body">
-            <table>{rows}</table>
-            {burst_html}
-            {best_html}
-          </div>
-        </div>
-        """
-        folium_map.get_root().html.add_child(Element(html))
         logger.info("✅ Panneau météo : %d jours affichés", len(self._weather_days))
+        return (
+            '<section class="cs-section cs-wx">'
+            "<h2>Météo prospection</h2>"
+            f"<table>{rows}</table>{burst_html}{best_html}"
+            "</section>"
+        )
 
     # ──────────────────────────────────────────────────────
     # Hotspots
     # ──────────────────────────────────────────────────────
-    def _add_hotspot_markers(self, folium_map: folium.Map) -> None:
-        """v2.6.0 : crée 1 FeatureGroup par espèce. La 1ère est visible
-        par défaut, les autres masquées (toggle JS bascule entre elles)."""
-        self._hotspot_count_on_map = 0
-        self._hotspot_groups: dict[str, folium.FeatureGroup] = {}
-
-        for sp_idx, species in enumerate(self.species_list):
+    def _hotspots_payload(self) -> dict[str, list[dict[str, Any]]]:
+        """Hotspots compacts par espèce (rang, position, attributs), triés
+        comme le CSV. Les marqueurs sont créés en JS pour le top N."""
+        payload: dict[str, list[dict[str, Any]]] = {}
+        for species in self.species_list:
             sp_hotspots = self.hotspots_by_species.get(species, [])
-            sp_params = config.SPECIES_PARAMS.get(
-                species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
-            )
-            sp_emoji = sp_params.get("emoji", "🍄")
-            sp_common = sp_params.get("common_name", species)
-
-            show_default = (sp_idx == 0)
-            hg = folium.FeatureGroup(
-                name=f"🎯 Hotspots {sp_common}",
-                show=show_default,
-            )
-
-            if not sp_hotspots:
-                hg.add_to(folium_map)
-                self._hotspot_groups[species] = hg
-                continue
-
-            n_total = min(len(sp_hotspots), self.max_hotspot_markers)
-            for rank, h in enumerate(sp_hotspots[:n_total]):
+            records: list[dict[str, Any]] = []
+            for rank, h in enumerate(sp_hotspots[: self.max_hotspot_markers], 1):
                 lon, lat = self._l93_to_wgs84(h["x_l93"], h["y_l93"])
-                ms: float = float(h.get("mean_score", 0.0))
-
-                color = (
-                    "darkgreen" if ms >= 0.75
-                    else ("green" if ms >= 0.60 else "orange")
-                )
-                icon_name = (
-                    "star" if ms >= 0.75
-                    else ("ok-sign" if ms >= 0.60 else "question-sign")
-                )
-
-                popup_lines: list[str] = [
-                    f"<b>{sp_emoji} {sp_common} — Hotspot #{h.get('id', '?')}</b><br>",
-                    f"Score moyen : <b>{ms:.3f}</b><br>",
-                    f"Surface : {h.get('size_m2', 0):.0f} m²<br>",
-                ]
-                if h.get("altitude") is not None:
-                    popup_lines.append(f"Altitude : {h['altitude']:.0f} m<br>")
-                if h.get("mean_slope") is not None:
-                    popup_lines.append(
-                        f"Pente moy. : {h['mean_slope']:.1f}°<br>",
-                    )
-                if h.get("dominant_tree"):
-                    popup_lines.append(
-                        f"Essence dom. : {h['dominant_tree']}<br>",
-                    )
-                if h.get("geology"):
-                    popup_lines.append(f"Géologie : {h['geology']}<br>")
-
-                marker = folium.Marker(
-                    location=[lat, lon],
-                    popup=folium.Popup("".join(popup_lines), max_width=300),
-                    tooltip=f"{sp_emoji} Score : {ms:.2f}",
-                    icon=folium.Icon(color=color, icon=icon_name),
-                )
-                marker.options["className"] = (
-                    f"cartom-hotspot cartom-rank-{rank} cartom-species-{species}"
-                )
-                marker.add_to(hg)
-
-            hg.add_to(folium_map)
-            self._hotspot_groups[species] = hg
-            self._hotspot_count_on_map += n_total
-            logger.info("✅ Hotspots [%s] : %d markers", species, n_total)
+                rec: dict[str, Any] = {
+                    "r": rank,
+                    "id": int(h.get("id", rank)),
+                    "lat": round(lat, 6),
+                    "lon": round(lon, 6),
+                    "s": round(float(h.get("mean_score", 0.0)), 3),
+                    "a": round(float(h.get("size_m2", 0.0)) / 10_000.0, 2),
+                }
+                alt = h.get("altitude")
+                if alt is not None and np.isfinite(alt):
+                    rec["alt"] = int(round(float(alt)))
+                slope = h.get("mean_slope")
+                if slope is not None and np.isfinite(slope):
+                    rec["sl"] = round(float(slope), 1)
+                tree = _display_value(h.get("dominant_species"))
+                if tree:
+                    rec["tr"] = tree
+                geology = _display_value(h.get("dominant_geology"))
+                if geology:
+                    rec["g"] = geology
+                records.append(rec)
+            payload[species] = records
+            logger.info("✅ Hotspots [%s] : %d sur la carte", species, len(records))
+        return payload
 
     # ──────────────────────────────────────────────────────
     # Landmarks
     # ──────────────────────────────────────────────────────
-    def _add_landmarks(self, folium_map: folium.Map) -> None:
-        lg = folium.FeatureGroup(name="📌 Points de repère", show=True)
+    def _add_landmarks(self, folium_map: folium.Map) -> str:
+        lg = folium.FeatureGroup(
+            name="Points de repère", show=True, control=False,
+        )
         for lm in self.landmarks:
             popup_html = (
                 f"<b>{lm['name']}</b><br>{lm.get('info', '')}<br>"
@@ -1927,6 +1656,7 @@ class MorilleVisualizer:
                 ),
             ).add_to(lg)
         lg.add_to(folium_map)
+        return lg.get_name()
 
     # ══════════════════════════════════════════════════════
     # CARTE FOLIUM — point d'entrée principal
@@ -1944,81 +1674,54 @@ class MorilleVisualizer:
 
         m = folium.Map(
             location=[config.MAP_CENTER["lat"], config.MAP_CENTER["lon"]],
-            zoom_start=14,
+            zoom_start=10,
             tiles=None,
-            control_scale=True,
+            zoom_control="topright",
         )
-        self._add_basemaps(m)
+        m.get_root().header.add_child(  # type: ignore[attr-defined]
+            Element(f"<title>{html.escape(self._page_title())}</title>"),
+        )
+        basemaps = self._add_basemaps(m)
 
-        # ── Phase 1 : préparer les overlays (reprojection séquentielle) ──
+        # ── Phase 1 : couches de diagnostic (option) — reprojection ──
         t_prep = time.perf_counter()
-        overlay_specs: list[
-            tuple[str, Callable[[], bytes], bool, float, int, str]
-        ] = []
-
-        overlay_specs.extend(self._prepare_probability())
-
-        if show_elimination:
-            overlay_specs.extend(self._prepare_elimination())
-
-        overlay_specs.extend(self._prepare_urban_raster())
-        overlay_specs.extend(self._prepare_twi())
-
+        diag_specs = (
+            self._prepare_diagnostics()
+            if self.debug_layers and show_elimination
+            else []
+        )
         logger.info(
-            "⏱️  Préparation overlays (reproj.) : %.2fs — %d couches",
+            "⏱️  Préparation diagnostic (reproj.) : %.2fs — %d couches",
             time.perf_counter() - t_prep,
-            len(overlay_specs),
+            len(diag_specs),
         )
 
-        # ── Phase 2 : encoding PNG parallèle + data PNG ──
+        # ── Phase 2 : encodage PNG parallèle (score par espèce,
+        #    terrain, diagnostic) ──
         t_enc = time.perf_counter()
-        n_workers = min(_PNG_WORKERS, len(overlay_specs) + 1)
-
-        overlay_results: list[
-            tuple[str, str, bool, float, int, str]
-        ] = []
-        data_uri: str = ""
-        data_uris_by_species: dict[str, str] = {}
-
+        n_workers = max(
+            1, min(_PNG_WORKERS, len(diag_specs) + len(self.species_list) + 1),
+        )
+        diag_uris: dict[str, str] = {}
         with ThreadPoolExecutor(
-            max_workers=max(1, n_workers),
+            max_workers=n_workers,
             thread_name_prefix="png",
         ) as pool:
-            # Soumettre les overlays
-            future_to_idx = {}
-            for idx, (name, render_fn, show, opa, zi, msg) in enumerate(
-                overlay_specs,
-            ):
-                fut = pool.submit(render_fn)
-                future_to_idx[fut] = (idx, name, show, opa, zi, msg)
-
-            # Soumettre 1 data PNG par espèce (v2.6.0) + slope PNG global
-            data_futures: dict[str, Any] = {
+            diag_futures = {pool.submit(spec.render): spec for spec in diag_specs}
+            data_futures = {
                 sp: pool.submit(self._build_data_png_bytes, sp)
                 for sp in self.species_list
             }
-            slope_future = pool.submit(self._build_slope_png_bytes)
+            terrain_future = pool.submit(self._build_terrain_png_bytes)
 
-            # Collecter les overlays (ordre de complétion)
-            indexed_results: dict[
-                int, tuple[str, str, bool, float, int, str]
-            ] = {}
-            for fut in as_completed(future_to_idx):
-                idx, name, show, opa, zi, msg = future_to_idx[fut]
-                png_bytes = fut.result()
-                uri = self._png_to_data_uri(png_bytes)
-                indexed_results[idx] = (name, uri, show, opa, zi, msg)
-
-            # Restituer l'ordre original
-            for idx in sorted(indexed_results):
-                overlay_results.append(indexed_results[idx])
-
-            # Data PNGs par espèce + Slope PNG
-            for sp, fut in data_futures.items():
-                data_uris_by_species[sp] = self._png_to_data_uri(fut.result())
-            data_uri = data_uris_by_species[self.primary_species]
-            data_png_bytes = b""  # legacy var unused
-            slope_uri = self._png_to_data_uri(slope_future.result())
+            for fut in as_completed(diag_futures):
+                spec = diag_futures[fut]
+                diag_uris[spec.key] = self._png_to_data_uri(fut.result())
+            data_uris_by_species = {
+                sp: self._png_to_data_uri(fut.result())
+                for sp, fut in data_futures.items()
+            }
+            terrain_uri = self._png_to_data_uri(terrain_future.result())
 
         logger.info(
             "⏱️  Encoding PNG parallèle : %.2fs — %d workers",
@@ -2026,45 +1729,57 @@ class MorilleVisualizer:
             n_workers,
         )
 
-        # ── Phase 3 : ajout des ImageOverlay au map ──
-        for name, uri, show, opa, zi, msg in overlay_results:
-            ImageOverlay(
-                image=uri,
+        # ── Phase 3 : couches de diagnostic, masquées au départ ──
+        diag_layers: list[dict[str, Any]] = []
+        for spec in diag_specs:
+            overlay = ImageOverlay(
+                image=diag_uris[spec.key],
                 bounds=self._bounds,
-                opacity=opa,
-                name=name,
-                show=show,
+                opacity=spec.opacity,
+                name=spec.label,
+                show=False,
+                control=False,
                 interactive=False,
-                zindex=zi,
-            ).add_to(m)
-            logger.info("✅ %s", msg)
+                pixelated=False,
+                zIndex=2 if spec.group == "twi-raw" else 3,
+            )
+            overlay.add_to(m)
+            diag_layers.append({
+                "key": spec.key,
+                "group": spec.group,
+                "label": spec.label,
+                "species": spec.species,
+                "var": overlay.get_name(),
+                "swatch": spec.swatch,
+            })
+            logger.info("✅ %s", spec.log_msg)
 
-        # ── Couches vectorielles + marqueurs ──
-        self._add_hydro_vector_layer(m)
-        self._add_inaturalist_layer(m)
-        self._add_hotspot_markers(m)
-        self._add_landmarks(m)
+        # ── Couches vectorielles + marqueurs fixes ──
+        layer_vars: dict[str, str | None] = {
+            "inat": self._add_inaturalist_layer(m),
+            "hydro": self._add_hydro_vector_layer(m),
+            "landmarks": self._add_landmarks(m),
+        }
 
-        # ── Panneau météo (HTML overlay) ──
-        self._add_weather_panel(m)
-
-        # ── Plugins Folium ──
-        MiniMap(toggle_display=True).add_to(m)
-        MousePosition(
-            position="bottomright",
-            separator=" | ",
-            prefix="Curseur :",
-        ).add_to(m)
         MeasureControl(
-            position="topleft",
+            position="topright",
             primary_length_unit="meters",
-            primary_area_unit="sqmeters",
+            secondary_length_unit="kilometers",
+            primary_area_unit="hectares",
+            secondary_area_unit="sqmeters",
         ).add_to(m)
-        folium.LayerControl(collapsed=False, position="topright").add_to(m)
 
-        # ── Contrôles interactifs (JS + data PNG) ──
-        self._add_interactive_controls(m, data_uri, slope_uri,
-                                        data_uris_by_species=data_uris_by_species)
+        # ── Panneau latéral + couche de probabilité JS ──
+        self._add_sidebar_ui(
+            m,
+            data_uris_by_species=data_uris_by_species,
+            terrain_uri=terrain_uri,
+            basemaps=basemaps,
+            layer_vars=layer_vars,
+            diag_layers=diag_layers,
+            hotspots=self._hotspots_payload(),
+            weather_html=self._weather_section_html(),
+        )
 
         m.fit_bounds(self._bounds)
 

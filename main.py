@@ -1259,6 +1259,7 @@ def main(args: argparse.Namespace) -> int:
         urban_gdf=urban_gdf,
         inat_observations=_inat_obs,
         weather_days=weather_days,
+        debug_layers=args.debug_layers,
     )
     # Carte Folium HTML — UN SEUL fichier multi-espèces avec toggle
     html_path = str(output_dir / "cartomorilles.html")
@@ -1561,6 +1562,13 @@ Exemples d'utilisation :
     output_group.add_argument(
         "--max-hotspots", type=int, default=8, metavar="N",
         help="Nombre maximum de hotspots à afficher (défaut: 8).",
+    )
+    output_group.add_argument(
+        "--debug-layers", action="store_true",
+        help=(
+            "Ajouter à la carte les couches de diagnostic (zones exclues, "
+            "TWI brut) — fichier HTML plus lourd."
+        ),
     )
 
     # ── Modes spéciaux ──
