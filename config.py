@@ -409,11 +409,17 @@ def resolve_tree_name(raw_name: str | None) -> str:
     return "unknown"
 
 
-def get_tree_score(raw_name: str | None) -> float:
-    """Retourne le score d'une essence (NaN si elle est inconnue : aucune
-    information, à exclure des moyennes — D46)."""
+def get_tree_score(raw_name: str | None, species: str | None = None) -> float:
+    """Retourne le score d'une essence pour l'espèce modélisée (`species` :
+    None = DEFAULT_SPECIES, la morille ; « edulis » = table du cèpe — D47).
+    NaN si l'essence est inconnue : aucune information, à exclure des
+    moyennes (D46)."""
+    table: MappingProxyType[str, float] = (
+        TREE_SCORES if species is None
+        else get_species_params(species)["tree_scores"]
+    )
     canonical = resolve_tree_name(raw_name)
-    return float(TREE_SCORES.get(canonical, TREE_SCORES["unknown"]))
+    return float(table.get(canonical, table["unknown"]))
 
 
 # ═══════════════════════════════════════════════════════════════

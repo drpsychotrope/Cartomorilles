@@ -1191,7 +1191,8 @@ def main(args: argparse.Namespace) -> int:
          f. score_canopy_openness / score_ground_cover / score_disturbance
          g. apply_water_mask
          h. apply_landcover_mask
-      3. Scoring multicritère — une passe par espèce ; météo J+0 à part (D45)
+      3. Scoring multicritère — une passe par espèce : critères species-aware
+         recalculés puis essences ré-enrichies (D47) ; météo J+0 à part (D45)
       4. Exports, puis résumé console (fichiers, carte, hotspots par espèce)
 
     Returns:
@@ -1544,9 +1545,13 @@ def main(args: argparse.Namespace) -> int:
     grid.score_geology(geology_gdf)
 
     # ── 2c'. Enrichissement essences (niveaux B+C+D) ─────────
+    # Table de la 1re espèce modélisée ; rejoué par espèce à l'étape 3 (D47).
+    # Ce passage sert aux planchers forêt du masque landcover
+    # (_raw_tree_species) et aux statistiques d'enrichissement.
     logger.debug("   ▸ Enrichissement essences (IFN 1997 × altitude)...")
     enricher.enrich_grid_scores(
         grid, forest_gdf=forest_gdf, geology_gdf=geology_gdf,
+        species=species_list[0],
     )
     enrich_stats = enricher.get_stats(grid)
     logger.debug(
@@ -1659,6 +1664,13 @@ def main(args: argparse.Namespace) -> int:
         # 1ère itération esculenta : redondant avec score_* initiaux mais cache hit ~0s
         grid.recompute_species_scores(
             species, forest_gdf=forest_gdf, geology_gdf=geology_gdf,
+        )
+        # score_tree_species réécrit le critère depuis la table brute :
+        # rejouer l'enrichissement IFN (niveaux B+C+C'+D, lande) avec la
+        # table de l'espèce, sinon il n'atteint jamais le scoring (D47)
+        enricher.enrich_grid_scores(
+            grid, forest_gdf=forest_gdf, geology_gdf=geology_gdf,
+            species=species,
         )
 
         sp_model = MorilleScoring(grid, species=species)

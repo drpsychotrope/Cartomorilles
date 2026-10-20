@@ -52,6 +52,7 @@ __all__ = ["SpeciesEnricher"]
 
 _INAT_BASE_URL: Final[str] = "https://api.inaturalist.org/v1/observations"
 _INAT_TAXON: Final[str] = "Morchella"
+_INAT_SPECIES: Final[str] = "esculenta"    # seule espèce modélisée de ce taxon
 _INAT_PER_PAGE: Final[int] = 200
 _INAT_CACHE_TTL_S: Final[int] = 7 * 24 * 3600          # 7 jours
 _INAT_CACHE_SCHEMA: Final[int] = 2                      # 2 : + taxon, précision
@@ -502,6 +503,11 @@ class SpeciesEnricher:
         self._region_key_map: dict[int, str] = {}
         self._substrate_grid: np.ndarray | None = None
 
+        # Niveau C' : observations iNaturalist (Morchella), récupérées une
+        # fois par run, exposées pour la carte
+        self.inat_observations: list[dict[str, object]] = []
+        self._inat_fetched: bool = False
+
     # ═══════════════════════════════════════════════════════════════
     # NIVEAU A — BD Forêt v2 comme source forêt
     # ═══════════════════════════════════════════════════════════════
@@ -654,14 +660,18 @@ class SpeciesEnricher:
         grid: Any,
         forest_gdf: Any = None,
         geology_gdf: Any = None,
+        species: str = config.DEFAULT_SPECIES,
     ) -> None:
         """
-        Enrichit grid.scores["tree_species"] pour les cellules inconnues.
+        Enrichit grid.scores["tree_species"] pour les cellules inconnues,
+        avec la table d'essences de l'espèce modélisée (`species`, D47).
 
         Identifie les cellules unknown via le tree species int raster (v2.4),
         avec fallback sur comparaison float pour compatibilité.
 
-        Appelé APRÈS score_tree_species(), AVANT apply_landcover_mask().
+        Appelé APRÈS score_tree_species(), AVANT apply_landcover_mask(),
+        puis après chaque recompute_species_scores() : celui-ci réécrit le
+        critère depuis la table brute et perd l'enrichissement.
         """
         t0 = _time.perf_counter()
 
@@ -724,8 +734,8 @@ class SpeciesEnricher:
             return
 
         logger.info(
-            "Enrichissement : %d cellules (%.1f%%)",
-            n_enrich, n_enrich / max(tree_scores.size, 1) * 100,
+            "Enrichissement [%s] : %d cellules (%.1f%%)",
+            species, n_enrich, n_enrich / max(tree_scores.size, 1) * 100,
         )
 
         altitude = getattr(grid, "altitude", None)
@@ -759,24 +769,31 @@ class SpeciesEnricher:
 
         # ── Niveau C : observations terrain ───────────────────────
         n_obs = self._apply_observations(
-            tree_scores, enrichable, x_coords, y_coords,
+            tree_scores, enrichable, x_coords, y_coords, species=species,
         )
         if n_obs > 0:
             logger.info("  Niveau C : %d cellules", n_obs)
 
-        # ── Niveau C' : iNaturalist (Morchella, r=100m) ────────────
-        inat_obs = self._fetch_inaturalist(config.BBOX_WGS84)
-        self.inat_observations: list[dict[str, object]] = inat_obs
-        n_inat = self._apply_inaturalist_boost(
-            tree_scores, enrichable, x_coords, y_coords, inat_obs,
-        )
-        if n_inat > 0:
-            logger.info("  Niveau C' : %d cellules (iNaturalist)", n_inat)
+        # ── Niveau C' : iNaturalist (Morchella) — morille seulement ──
+        if species == _INAT_SPECIES:
+            if not self._inat_fetched:
+                self.inat_observations = self._fetch_inaturalist(
+                    config.BBOX_WGS84,
+                )
+                self._inat_fetched = True
+            n_inat = self._apply_inaturalist_boost(
+                tree_scores, enrichable, x_coords, y_coords,
+                self.inat_observations,
+            )
+            if n_inat > 0:
+                logger.info(
+                    "  Niveau C' : %d cellules (iNaturalist)", n_inat,
+                )
 
         # ── Niveaux B+D — vectorisé par combo keys ────────────────
         enriched = self._compute_regional_scores(
             _alt, rg_grid, ft_grid, enrichable,
-            substrate_grid=sub_grid,
+            substrate_grid=sub_grid, species=species,
         )
 
         n_final = int(np.count_nonzero(enrichable))
@@ -845,12 +862,14 @@ class SpeciesEnricher:
         forest_type_grid: np.ndarray,
         mask: np.ndarray,
         substrate_grid: np.ndarray | None = None,
+        species: str = config.DEFAULT_SPECIES,
     ) -> np.ndarray:
         """
         Calcule les scores enrichis — vectorisé par combo keys.
 
         Encode (region, forest_type, altitude_band, substrate) en clé int32,
         itère uniquement sur les combinaisons présentes dans le masque.
+        Table d'essences de l'espèce modélisée `species` (D47).
         NaN là où le mélange régional n'apporte aucune essence notée (D46).
         """
         result = np.full_like(altitude, np.nan, dtype=np.float32)
@@ -877,7 +896,7 @@ class SpeciesEnricher:
                 filtered = self._filter_by_forest_type(props, ft)
                 for bi in range(len(_ALT_BANDS)):
                     lookup[(rk, ft, bi, 0)] = self._weighted_morel_score(
-                        filtered, bi,
+                        filtered, bi, species,
                     )
                     if has_substrate:
                         for sub_code in range(1, len(_SUB_NAMES)):
@@ -886,7 +905,9 @@ class SpeciesEnricher:
                                 filtered, sub_key,
                             )
                             lookup[(rk, ft, bi, sub_code)] = (
-                                self._weighted_morel_score(modulated, bi)
+                                self._weighted_morel_score(
+                                    modulated, bi, species,
+                                )
                             )
 
         # ── Combo key int32 : region*1000 + ft*100 + band*10 + sub ─
@@ -982,8 +1003,11 @@ class SpeciesEnricher:
     def _weighted_morel_score(
         proportions: dict[str, float],
         band_idx: int,
+        species: str = config.DEFAULT_SPECIES,
     ) -> float:
-        """Σ(proportion × affinité × score_morille) / Σ(proportion × affinité).
+        """Σ(proportion × affinité × score) / Σ(proportion × affinité), avec
+        la table d'essences de l'espèce modélisée (`species`, D47 : morille
+        par défaut, cèpe pour « edulis »).
 
         Les essences sans score (« feuillus », « conifères »… → NaN, D46)
         n'apportent aucune information : ignorées, poids renormalisés sur
@@ -991,17 +1015,17 @@ class SpeciesEnricher:
         w_sum = 0.0
         w_total = 0.0
 
-        for species, proportion in proportions.items():
+        for essence, proportion in proportions.items():
             if proportion <= 0:
                 continue
 
-            score = config.get_tree_score(species)
+            score = config.get_tree_score(essence, species)
             if np.isnan(score):
                 continue
             if score < 0:
                 score = 0.25
 
-            aff = _ALT_AFFINITY.get(species)
+            aff = _ALT_AFFINITY.get(essence)
             affinity = aff[band_idx] if aff and band_idx < len(aff) else 1.0
 
             w = proportion * affinity
@@ -1390,8 +1414,12 @@ class SpeciesEnricher:
         enrichable: np.ndarray,
         x_coords: Any,
         y_coords: Any,
+        species: str = config.DEFAULT_SPECIES,
     ) -> int:
-        """Applique les overrides d'observations terrain sur les scores."""
+        """Applique les observations terrain (niveau C) sur les scores.
+
+        `essences` (proportions) est noté avec la table de l'espèce modélisée
+        (D47) ; `score_override` est un jugement direct, appliqué tel quel."""
         if not self._observations or x_coords is None or y_coords is None:
             return 0
 
@@ -1422,7 +1450,8 @@ class SpeciesEnricher:
                     continue
                 # Essences sans score (NaN, D46) ignorées, poids renormalisés
                 scored = [
-                    (p, config.get_tree_score(s)) for s, p in essences.items()
+                    (p, config.get_tree_score(s, species))
+                    for s, p in essences.items()
                 ]
                 scored = [(p, sc) for p, sc in scored if not np.isnan(sc)]
                 p_total = sum(p for p, _ in scored)

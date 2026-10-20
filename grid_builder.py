@@ -687,6 +687,10 @@ class GridBuilder:
 
         Cache disque (D23) isolé par hash MD5 du lookup → caches distincts
         par espèce coexistent automatiquement.
+
+        tree_species est réécrit depuis la table brute de l'espèce :
+        l'appelant rejoue ensuite SpeciesEnricher.enrich_grid_scores(
+        species=…), sinon l'enrichissement IFN et la lande sont perdus (D47).
         """
         logger.info(
             "🔄 Recompute species scores [%s] — 6 critères species-aware",
