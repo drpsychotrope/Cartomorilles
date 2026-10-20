@@ -54,6 +54,7 @@ _INAT_BASE_URL: Final[str] = "https://api.inaturalist.org/v1/observations"
 _INAT_TAXON: Final[str] = "Morchella"
 _INAT_PER_PAGE: Final[int] = 200
 _INAT_CACHE_TTL_S: Final[int] = 7 * 24 * 3600          # 7 jours
+_INAT_CACHE_SCHEMA: Final[int] = 2                      # 2 : + taxon, précision
 _INAT_QUALITY_SCORES: Final[dict[str, float]] = {
     "research": 0.90,
     "needs_id": 0.75,
@@ -1447,9 +1448,11 @@ class SpeciesEnricher:
         """Récupère les observations Morchella iNaturalist dans la BBOX.
 
         Retourne une liste de dicts : {"id", "lat", "lng", "quality_grade",
-        "observed_on"}.
+        "observed_on", "taxon_name", "accuracy_m", "obscured"}.
+        accuracy_m : précision publique en mètres (inclut le floutage des
+        observations « obscured », ≈ 27 km), None si non renseignée.
         Cache JSON TTL 7 jours dans cache_dir (défaut : data/cache/).
-        Retourne [] silencieusement si API indisponible.
+        API indisponible : cache précédent s'il existe (même périmé), sinon [].
         """
         cache_dir = cache_dir or Path("data/cache")
         bbox_key = (
@@ -1461,18 +1464,21 @@ class SpeciesEnricher:
             / f"inaturalist_{hashlib.md5(bbox_key.encode()).hexdigest()[:8]}.json"
         )
 
-        # Charger le cache s'il est valide
+        # Charger le cache s'il est valide ; sinon le garder en secours
+        stale: list[dict[str, object]] | None = None
         if cache_file.exists():
             try:
                 raw = json.loads(cache_file.read_text(encoding="utf-8"))
                 age = _time.time() - raw.get("fetched_at", 0)
-                if age < _INAT_CACHE_TTL_S:
+                stale = list(raw["results"])
+                if (age < _INAT_CACHE_TTL_S
+                        and raw.get("schema") == _INAT_CACHE_SCHEMA):
                     logger.info(
                         "✅ iNaturalist : %d obs. depuis cache (%.0fh)",
-                        len(raw["results"]),
+                        len(stale),
                         age / 3600,
                     )
-                    return list(raw["results"])
+                    return stale
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
 
@@ -1502,12 +1508,19 @@ class SpeciesEnricher:
                     parts = str(loc).split(",")
                     if len(parts) != 2:
                         continue
+                    taxon = obs.get("taxon")
+                    taxon_name = (
+                        taxon.get("name") if isinstance(taxon, dict) else None
+                    )
                     results.append({
                         "id": obs.get("id"),
                         "lat": float(parts[0]),
                         "lng": float(parts[1]),
                         "quality_grade": obs.get("quality_grade", "needs_id"),
                         "observed_on": obs.get("observed_on", ""),
+                        "taxon_name": str(taxon_name or _INAT_TAXON),
+                        "accuracy_m": obs.get("public_positional_accuracy"),
+                        "obscured": bool(obs.get("obscured")),
                     })
                 total = int(data.get("total_results", 0))
                 if len(results) >= total or len(page_results) < _INAT_PER_PAGE:
@@ -1516,6 +1529,12 @@ class SpeciesEnricher:
                 if int(params["page"]) > 5:
                     break
         except Exception as exc:  # noqa: BLE001
+            if stale is not None:
+                logger.warning(
+                    "⚠️ iNaturalist indisponible : %s — cache précédent "
+                    "réutilisé (%d obs.)", exc, len(stale),
+                )
+                return stale
             logger.warning("⚠️ iNaturalist indisponible : %s — skip", exc)
             return []
 
@@ -1523,7 +1542,11 @@ class SpeciesEnricher:
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(
             json.dumps(
-                {"fetched_at": _time.time(), "results": results},
+                {
+                    "fetched_at": _time.time(),
+                    "schema": _INAT_CACHE_SCHEMA,
+                    "results": results,
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
