@@ -921,7 +921,12 @@ class MorilleScoring:
         min_cluster_size: int | None = None,
         max_hotspots: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Identifie les clusters de forte probabilité."""
+        """Identifie les clusters de forte probabilité.
+
+        `x_l93` / `y_l93` de chaque hotspot : centre de la cellule de l'amas
+        au score maximal (`max_score`), le point à viser sur le terrain —
+        pas le centroïde, qui tombe hors d'un amas allongé ou en L (D50).
+        """
         self._require_step("_step_weighted", "get_hotspots")
         assert self.final_score is not None, "final_score is None for hotspots"
 

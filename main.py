@@ -885,6 +885,9 @@ def save_hotspots_csv(
     """Exporte tous les hotspots en CSV triés par score décroissant.
 
     v2.6.0 : nom CSV templaté par espèce — `{species}_hotspots.csv`.
+    Colonnes `lat`, `lon`, `x_l93`, `y_l93`, `google_maps` : la cellule de
+    l'amas au score maximal (`max_score`), le point à viser — pas le
+    centroïde de l'amas (D50).
     """
     csv_path = output_dir / f"{species}_hotspots.csv"
 
@@ -960,7 +963,9 @@ def save_hotspots_gpx(
     """Exporte les meilleurs hotspots en GPX 1.1 (un waypoint chacun) pour
     les applis GPS — `{species}_hotspots.gpx`, à côté du CSV.
 
-    Le waypoint « Morille grise n°3 » est le hotspot n°3 de la carte et du CSV.
+    Le waypoint « Morille grise n°3 » est le hotspot n°3 de la carte et du
+    CSV ; sa position est la cellule la mieux notée de l'amas (D50), comme
+    les colonnes lat/lon du CSV et le marqueur de la carte.
     `inside` (masque booléen aligné sur `hotspots`) écarte, comme la carte,
     les hotspots hors de la zone étudiée (D39) ; les numéros restent ceux
     du CSV.
@@ -989,7 +994,8 @@ def save_hotspots_gpx(
     )
     ET.SubElement(meta, tag("desc")).text = (
         "Triés par score moyen décroissant ; numéros identiques à la "
-        "carte HTML et au CSV."
+        "carte HTML et au CSV. Chaque point est la cellule la mieux notée "
+        "de son hotspot, pas son centre."
         + (f" {n_out} hotspot(s) hors zone étudiée écarté(s), comme sur la "
            "carte." if n_out else "")
     )

@@ -1202,7 +1202,14 @@ def vectorized_cluster_stats(
     altitude: np.ndarray | None = None,
     slope: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Stats vectorisées pour tous les clusters en une passe."""
+    """Stats vectorisées pour tous les clusters en une passe.
+
+    `x_l93` / `y_l93` : centre de la cellule de l'amas au score maximal,
+    le point à viser sur le terrain (D50). À égalité, la plus proche du
+    centroïde, puis la première en ordre raster. Le centroïde lui-même
+    (`x_centroid_l93` / `y_centroid_l93`) tombe hors d'un amas allongé ou
+    en L, souvent sur une cellule éliminée : il n'est plus qu'informatif.
+    """
     t0 = time.perf_counter()
     a, b, c, d, e, f = transform_params
 
@@ -1244,8 +1251,32 @@ def vectorized_cluster_stats(
     mean_row = row_sum[valid_ids] / valid_counts
     mean_col = col_sum[valid_ids] / valid_counts
 
-    x_l93 = c + (mean_col + 0.5) * a
-    y_l93 = f + (mean_row + 0.5) * e
+    x_centroid = c + (mean_col + 0.5) * a
+    y_centroid = f + (mean_row + 0.5) * e
+
+    # ── Point à viser : cellule de score maximal de l'amas (D50) ──
+    # Candidates = cellules au score égal au max de leur amas ; on garde
+    # la plus proche du centroïde (puis la première en ordre raster).
+    in_cluster = np.flatnonzero(flat_labels > 0)
+    cand_labels = flat_labels[in_cluster]
+    is_peak = flat_score[in_cluster] >= max_score_arr[cand_labels]
+    cand = in_cluster[is_peak]
+    cand_labels = cand_labels[is_peak]
+    cand_row = cand // nx
+    cand_col = cand % nx
+    cand_counts = counts[cand_labels].astype(np.float64)
+    d2 = (
+        (cand_row - row_sum[cand_labels] / cand_counts) ** 2
+        + (cand_col - col_sum[cand_labels] / cand_counts) ** 2
+    )
+    order = np.lexsort((cand, d2, cand_labels))
+    first = np.unique(cand_labels[order], return_index=True)[1]
+    peak_flat = np.full(n_clusters + 1, -1, dtype=np.int64)
+    peak_flat[cand_labels[order][first]] = cand[order][first]
+    valid_peak = peak_flat[valid_ids]
+    assert np.all(valid_peak >= 0), "amas sans cellule de score maximal"
+    x_l93 = c + (valid_peak % nx + 0.5) * a
+    y_l93 = f + (valid_peak // nx + 0.5) * e
 
     valid_alt: np.ndarray | None = None
     if isinstance(altitude, np.ndarray) and altitude.shape == labeled.shape:
@@ -1303,6 +1334,8 @@ def vectorized_cluster_stats(
         "max_score": valid_max_score.astype(np.float32),
         "x_l93": x_l93.astype(np.float64),
         "y_l93": y_l93.astype(np.float64),
+        "x_centroid_l93": x_centroid.astype(np.float64),
+        "y_centroid_l93": y_centroid.astype(np.float64),
         "altitude": (
             valid_alt.astype(np.float32) if valid_alt is not None else None
         ),

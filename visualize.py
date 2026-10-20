@@ -2308,7 +2308,8 @@ class MorilleVisualizer:
     # ──────────────────────────────────────────────────────
     def _hotspots_payload(self) -> dict[str, list[dict[str, Any]]]:
         """Hotspots compacts par espèce (rang, position, attributs), triés
-        comme le CSV. Les marqueurs sont créés en JS pour le top N.
+        comme le CSV. Position = cellule la mieux notée de l'amas, comme le
+        CSV et le GPX (D50). Les marqueurs sont créés en JS pour le top N.
         Hors emprise d'étude : écartés (D39), le rang reste celui du CSV."""
         payload: dict[str, list[dict[str, Any]]] = {}
         for species in self.species_list:

@@ -97,8 +97,8 @@ Le détail (tableau des poids, statistiques par critère, validation point par p
 
 - `cartomorilles.html` — carte interactive : panneau latéral (espèce, légende-filtre par classe, opacité, hotspots numérotés, fonds et couches, météo), lecture du score au survol ou au toucher, popup du point touché (coordonnées à copier, liens *Itinéraire* et *Google Maps*) et bouton *Me localiser*
 - `{species}_probability.tif` — raster GeoTIFF par espèce (+ alias `morilles_probability.tif`)
-- `{species}_hotspots.csv` — hotspots triés par score, avec lien Google Maps
-- `{species}_hotspots.gpx` — les 20 meilleurs hotspots de la zone étudiée, en waypoints GPX pour les applis GPS (« Morille grise n°3 » = hotspot n°3 de la carte et du CSV)
+- `{species}_hotspots.csv` — hotspots triés par score, avec lien Google Maps ; les coordonnées (`lat`/`lon`, `x_l93`/`y_l93`) sont la cellule la mieux notée de l'amas (`max_score`), le point à viser, pas son centre
+- `{species}_hotspots.gpx` — les 20 meilleurs hotspots de la zone étudiée, en waypoints GPX pour les applis GPS (« Morille grise n°3 » = hotspot n°3 de la carte et du CSV, même point que la carte et le CSV)
 - `rapport_{species}.json` — rapport complet et reproductible (config, stats, validation terrain)
 - `cartomorilles.log` — journal détaillé
 - `{species}_grid.gpkg` — grille vecteur (avec `--export-vector`)
