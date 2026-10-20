@@ -66,6 +66,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -292,7 +293,11 @@ _TREE_SCORES_DICT: dict[str, float] = {
     "buis":               0.05,
     # ── Défaut — forêt sans essence connue ≠ pas de forêt ──
     # v2.5.2 : 0.25 → 0.40 — forêt taguée sans essence ID = 64% du couvert
-    "unknown":            0.40,
+    # D46 : NaN — information manquante, pas une essence médiocre : la
+    # cellule est notée sur ses autres critères (poids renormalisés, légère
+    # pénalité de couverture D10). Dans l'enrichissement IFN, une essence
+    # notée garde son score ; « feuillus » / « conifères » sans essence → NaN.
+    "unknown":            float("nan"),
 }
 
 # ── Landcover : plancher green_score pour cellules BD Forêt ──
@@ -405,7 +410,8 @@ def resolve_tree_name(raw_name: str | None) -> str:
 
 
 def get_tree_score(raw_name: str | None) -> float:
-    """Retourne le score d'une essence."""
+    """Retourne le score d'une essence (NaN si elle est inconnue : aucune
+    information, à exclure des moyennes — D46)."""
     canonical = resolve_tree_name(raw_name)
     return float(TREE_SCORES.get(canonical, TREE_SCORES["unknown"]))
 
@@ -1037,8 +1043,8 @@ _TREE_SCORES_EDULIS_DICT: dict[str, float] = {
     "platane":            0.10,
     "robinier":           0.30,   # allélopathique
     "buis":               0.10,
-    # ── Défaut — forêt sans essence connue ──
-    "unknown":            0.50,
+    # ── Défaut — forêt sans essence connue : exclue de la moyenne (D46) ──
+    "unknown":            float("nan"),
 }
 
 # ── Cèpe : geology_scores (mêmes clés canoniques que GEOLOGY_SCORES) ──
@@ -1187,6 +1193,8 @@ def validate_config() -> bool:
         ("ASPECT_SCORES", ASPECT_SCORES),
     ]:
         for key, val in scores.items():
+            if name == "TREE_SCORES" and key == "unknown" and math.isnan(val):
+                continue   # essence inconnue = exclue de la moyenne (D46)
             if not (0.0 <= val <= 1.0):
                 logger.error("%s['%s'] = %.2f hors [0, 1]", name, key, val)
                 ok = False
@@ -1303,8 +1311,10 @@ def validate_config() -> bool:
             ok = False
             continue
         params = SPECIES_PARAMS[sp_name]
-        # Scores [0,1]
+        # Scores [0,1] ; « unknown » = NaN (exclu de la moyenne, D46)
         for tree_key, tree_val in params["tree_scores"].items():
+            if tree_key == "unknown" and math.isnan(tree_val):
+                continue
             if not (0.0 <= tree_val <= 1.0):
                 logger.error(
                     "SPECIES_PARAMS['%s'].tree_scores['%s']=%.2f hors [0,1]",

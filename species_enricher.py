@@ -787,12 +787,13 @@ class SpeciesEnricher:
         if raw is not None and isinstance(raw, np.ndarray):
             raw[enrichable] = enriched[enrichable]
 
-        mean_s = (
-            float(enriched[enrichable].mean()) if n_final > 0 else 0.0
-        )
+        scored = enrichable & np.isfinite(enriched)
+        n_scored = int(np.count_nonzero(scored))
+        mean_s = float(enriched[scored].mean()) if n_scored > 0 else 0.0
         logger.info(
-            "  Niveaux B+D : %d cellules, score moyen=%.3f",
-            n_final, mean_s,
+            "  Niveaux B+D : %d cellules notées (score moyen=%.3f), "
+            "%d sans essence notée → exclues de la moyenne (D46)",
+            n_scored, mean_s, n_final - n_scored,
         )
 
         # ── Stats finales ──────────────────────────────────────────
@@ -850,8 +851,9 @@ class SpeciesEnricher:
 
         Encode (region, forest_type, altitude_band, substrate) en clé int32,
         itère uniquement sur les combinaisons présentes dans le masque.
+        NaN là où le mélange régional n'apporte aucune essence notée (D46).
         """
-        result = np.full_like(altitude, 0.25, dtype=np.float32)
+        result = np.full_like(altitude, np.nan, dtype=np.float32)
 
         # ── Bande altitudinale ─────────────────────────────────────
         alt_idx = np.zeros_like(altitude, dtype=np.int8)
@@ -911,26 +913,19 @@ class SpeciesEnricher:
 
             rk = self._region_key_map.get(r_int, "_default")
 
-            score = lookup.get(
-                (rk, ft, bi, sv),
-                lookup.get(
-                    (rk, ft, bi, 0),
-                    lookup.get(("_default", ft, bi, 0), 0.25),
-                ),
+            # Mélange le plus précis qui ait un score, sinon régional,
+            # sinon défaut ; NaN si aucun n'en a
+            candidates = (
+                lookup.get((rk, ft, bi, sv), np.nan),
+                lookup.get((rk, ft, bi, 0), np.nan),
+                lookup.get(("_default", ft, bi, 0), np.nan),
+            )
+            score = next(
+                (c for c in candidates if not np.isnan(c)), float("nan"),
             )
 
             group_mask = mask & (combo == key)
             result[group_mask] = np.float32(score)
-
-        # ── Fallback : cellules encore à 0.25 ─────────────────────
-        still = mask & np.isclose(result, 0.25, atol=0.01)
-        if np.any(still):
-            for key in np.unique(combo[still]):
-                ft = int((key % 1000) // 100)
-                bi = int((key % 100) // 10)
-                s = lookup.get(("_default", ft, bi, 0), 0.25)
-                group_mask = still & (combo == key)
-                result[group_mask] = np.float32(s)
 
         return result
 
@@ -988,7 +983,11 @@ class SpeciesEnricher:
         proportions: dict[str, float],
         band_idx: int,
     ) -> float:
-        """Σ(proportion × affinité × score_morille) / Σ(proportion × affinité)."""
+        """Σ(proportion × affinité × score_morille) / Σ(proportion × affinité).
+
+        Les essences sans score (« feuillus », « conifères »… → NaN, D46)
+        n'apportent aucune information : ignorées, poids renormalisés sur
+        les autres. NaN si aucune essence du mélange n'a de score."""
         w_sum = 0.0
         w_total = 0.0
 
@@ -997,6 +996,8 @@ class SpeciesEnricher:
                 continue
 
             score = config.get_tree_score(species)
+            if np.isnan(score):
+                continue
             if score < 0:
                 score = 0.25
 
@@ -1008,7 +1009,7 @@ class SpeciesEnricher:
             w_total += w
 
         if w_total < 1e-10:
-            return 0.25
+            return float("nan")
 
         return float(np.clip(w_sum / w_total, 0.05, 1.0))
 
@@ -1419,10 +1420,15 @@ class SpeciesEnricher:
                 essences = obs.get("essences", {})
                 if not essences:
                     continue
-                score = sum(
-                    p * max(config.get_tree_score(s), 0.0)
-                    for s, p in essences.items()
-                )
+                # Essences sans score (NaN, D46) ignorées, poids renormalisés
+                scored = [
+                    (p, config.get_tree_score(s)) for s, p in essences.items()
+                ]
+                scored = [(p, sc) for p, sc in scored if not np.isnan(sc)]
+                p_total = sum(p for p, _ in scored)
+                if p_total <= 0:
+                    continue
+                score = sum(p * max(sc, 0.0) for p, sc in scored) / p_total
 
             tree_scores[zone] = np.float32(score)
             enrichable[zone] = False

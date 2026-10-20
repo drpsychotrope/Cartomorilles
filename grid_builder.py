@@ -1261,7 +1261,8 @@ class GridBuilder:
             species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
         )
         sp_tree_scores = sp_params["tree_scores"]
-        sp_unknown = float(sp_tree_scores.get("unknown", 0.4))
+        # Essence inconnue : NaN = exclue de la moyenne pondérée (D46)
+        sp_unknown = float(sp_tree_scores.get("unknown", np.nan))
         max_code = max(essence_to_code.values()) + 1
         lookup = np.full(max_code, 0.5, dtype=np.float32)
         for ess, code in essence_to_code.items():
@@ -1282,8 +1283,10 @@ class GridBuilder:
             lookup,
             np.asarray(gdf["_burn_code"].values, dtype=np.int16),
         )
+        # NaN (essence inconnue) en premier : un polygone sans essence perd
+        # tout chevauchement avec un polygone renseigné (D22, D46)
         gdf = gdf.sort_values(
-            "_burn_score", ascending=True,
+            "_burn_score", ascending=True, na_position="first",
         ).reset_index(drop=True)
 
         geometries: list[Any] = gdf.geometry.tolist()
