@@ -85,7 +85,7 @@ Garde-fous : avertissement à 50 M cellules (TWI > 5 min), limite dure à 200 M 
 
 Par défaut, la console n'affiche que les étapes `[1/4]`…`[4/4]`, les avertissements et un résumé :
 
-- la météo du jour et le facteur appliqué aux scores (×0,4 à ×1,0), ou son indisponibilité ;
+- la météo du jour (classe et score, à part du score des cellules), ou son indisponibilité ;
 - pour chaque espèce : les meilleurs hotspots (n°1, n°2… = rang du CSV et numéro du marqueur sur la carte, surface en ha, coordonnées, lien Google Maps) et la concordance avec les points de contrôle terrain ;
 - les fichiers écrits par ce run et le lien `file://` vers la carte.
 
@@ -156,8 +156,9 @@ Post-traitement :
 2. **Pénalité de monotonie** (terrain uniforme).
 3. **Pénalité calc-dry** (chênaies/buis xérothermophiles, morille seulement).
 4. **Lissage gaussien spatial** (sigma configurable, défaut 0,5).
-5. **Modulation météo** multiplicative : scores × (0,4 + 0,6 × score météo du jour Open-Meteo), sauf `--no-weather` ou API indisponible — signalée dans le résumé console et dans `rapport_{species}.json`.
-6. **Classification en 6 classes** : Nul / Très faible / Faible / Moyen / Bon / Excellent (seuils 0,15 · 0,30 · 0,45 · 0,60 · 0,75).
+5. **Classification en 6 classes** : Nul / Très faible / Faible / Moyen / Bon / Excellent (seuils 0,15 · 0,30 · 0,45 · 0,60 · 0,75).
+
+La **météo du jour** (Open-Meteo, 7 jours) n'entre pas dans le score : la carte montre le potentiel du terrain, stable d'un jour à l'autre, et la météo s'affiche à part dans le panneau de la carte, le résumé console et `rapport_{species}.json` (`--no-weather` pour ne pas la consulter, hors ligne).
 
 La sortie est validée contre des points de contrôle terrain par espèce (taux de concordance reporté en fin de run).
 

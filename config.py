@@ -948,7 +948,6 @@ _BASEMAPS_DICT: dict[str, dict[str, Any]] = {
         "attr": "© IGN - Géoplateforme",
         "name": "IGN Photo aérienne",
         "max_zoom": 19,
-        "dark": True,   # fond sombre → palette inversée (D38)
     },
     "IGN Occupation du sol": {
         "tiles": (
@@ -974,7 +973,6 @@ _BASEMAPS_DICT: dict[str, dict[str, Any]] = {
         "attr": "© Esri, Maxar, Earthstar Geographics",
         "name": "Esri Satellite",
         "max_zoom": 18,
-        "dark": True,
     },
     "OpenTopoMap": {
         "tiles": "https://tile.opentopomap.org/{z}/{x}/{y}.png",

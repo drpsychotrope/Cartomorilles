@@ -5,7 +5,7 @@
    département élargi (107×131 km, Lambert-93).
 
    Analyse multicritère spatialisée : 14 critères pondérés par espèce,
-   masques éliminatoires, lissage, modulation météo du jour (Open-Meteo).
+   masques éliminatoires, lissage. Météo du jour (Open-Meteo) affichée à part.
    Maille automatique selon l'emprise : 50 m pour le département
    (~5,6 M cellules) ; --cell-size pour la forcer.
    Sources : MNT Copernicus, IGN BD Forêt v2, BRGM BDCharm-50, IFN 1997
@@ -115,11 +115,6 @@ _ZONE_LABEL = f"Isère 38 — {_ZONE_DX_KM:.0f}×{_ZONE_DY_KM:.0f} km"
 # ── Garde mémoire (cellules max sans --force) ─────────────────
 _MAX_CELLS = 200_000_000  # 200M — protège contre cell_size=5m accidentel
 _WARN_CELLS = 50_000_000  # 50M — avertit sur temps de calcul TWI D8
-
-# ── Météo : les scores des espèces sont multipliés par un facteur qui
-#    va de _WEATHER_FACTOR_MIN (jour très défavorable) à 1,0 (jour idéal),
-#    linéaire en score météo J+0 ─────────────────────────────────
-_WEATHER_FACTOR_MIN = 0.4
 
 # ── Résumé console / carte ────────────────────────────────────
 _CONSOLE_HOTSPOTS_DEFAULT = 5   # hotspots listés par espèce en fin de run
@@ -1080,14 +1075,6 @@ def save_report(
 # ═══════════════════════════════════════════════════════════════
 
 
-def _weather_multiplier(day_score: float) -> float:
-    """Facteur appliqué aux scores des espèces selon la météo du jour."""
-    s = min(max(float(day_score), 0.0), 1.0)
-    return float(
-        np.float32(_WEATHER_FACTOR_MIN + (1.0 - _WEATHER_FACTOR_MIN) * s),
-    )
-
-
 def _weather_failure_reason(exc: BaseException) -> str:
     """Cause courte d'un échec météo, pour le résumé console."""
     if isinstance(exc, requests.Timeout):
@@ -1204,7 +1191,7 @@ def main(args: argparse.Namespace) -> int:
          f. score_canopy_openness / score_ground_cover / score_disturbance
          g. apply_water_mask
          h. apply_landcover_mask
-      3. Scoring multicritère — une passe par espèce, modulation météo J+0
+      3. Scoring multicritère — une passe par espèce ; météo J+0 à part (D45)
       4. Exports, puis résumé console (fichiers, carte, hotspots par espèce)
 
     Returns:
@@ -1614,15 +1601,13 @@ def main(args: argparse.Namespace) -> int:
     logger.info("🧮 [3/4] Modèle multicritère — %s…", species_names)
     t0 = time.time()
 
-    # ── Météo J+0 (calculée 1× pour toutes espèces) ──
+    # ── Météo J+0 : information à part, jamais mêlée au score (D45) ──
     weather_days: list[Any] | None = None
-    weather_factor: float = 1.0
+    weather_today: dict[str, Any] | None = None
     if getattr(args, "no_weather", False):
         weather_status = "disabled"
-        weather_summary = [
-            "🌤️  Météo désactivée (--no-weather) — scores non modulés",
-        ]
-        logger.debug("🌤️  Météo désactivée (--no-weather)")
+        weather_summary = ["🌤️  Météo non consultée (--no-weather)"]
+        logger.debug("🌤️  Météo non consultée (--no-weather)")
     else:
         days: list[Any] = []
         reason = "aucune prévision"
@@ -1634,29 +1619,24 @@ def main(args: argparse.Namespace) -> int:
         if days:
             weather_days = days
             today = days[0]
-            weather_factor = _weather_multiplier(today.score)
-            weather_status = "modulated"
+            weather_today = {
+                "label": str(today.label), "score": round(float(today.score), 3),
+            }
+            weather_status = "available"
             weather_summary = [
                 f"🌤️  Météo du jour : {today.label} "
-                f"({_fr_num(today.score, 2)}) → scores des espèces "
-                f"multipliés par {_fr_num(weather_factor, 2)}",
-                f"    (facteur de {_fr_num(_WEATHER_FACTOR_MIN, 1)} à 1,0 "
-                f"selon la météo ; --no-weather pour l'ignorer)",
+                f"({_fr_num(today.score, 2)}) — à part du score, qui reste "
+                "le potentiel du terrain (détail 7 jours sur la carte)",
             ]
             logger.info(
-                "   🌤️  Météo du jour : %s (%s) → scores ×%s",
+                "   🌤️  Météo du jour : %s (%s) — hors du score",
                 today.label, _fr_num(today.score, 2),
-                _fr_num(weather_factor, 2),
             )
             logger.debug(WeatherChecker.format_report(days))
         else:
             weather_status = "unavailable"
-            weather_summary = [
-                f"🌤️  Météo indisponible ({reason}) — scores non modulés",
-            ]
-            logger.info(
-                "   🌤️  Météo indisponible (%s) — scores non modulés", reason,
-            )
+            weather_summary = [f"🌤️  Météo indisponible ({reason})"]
+            logger.info("   🌤️  Météo indisponible (%s)", reason)
 
     # ── Boucle scoring par espèce ──
     models: dict[str, MorilleScoring] = {}
@@ -1687,12 +1667,6 @@ def main(args: argparse.Namespace) -> int:
         sp_model.apply_monotony_penalty()
         sp_model.apply_calcdry_penalty()
         sp_model.apply_spatial_smoothing(sigma=args.smoothing_sigma)
-
-        # ── Modulation météo (multiplicative, post-smoothing) ──
-        if weather_factor != 1.0:
-            assert sp_model.final_score is not None
-            sp_model.final_score = sp_model.final_score * np.float32(weather_factor)
-
         sp_model.classify_probability()
 
         sp_hotspots = sp_model.get_hotspots(threshold=args.hotspot_threshold)
@@ -1807,7 +1781,7 @@ def main(args: argparse.Namespace) -> int:
         "no_urban": args.no_urban,
         "no_landcover": args.no_landcover,
         "weather": weather_status,
-        "weather_factor": round(weather_factor, 4),
+        "weather_today": weather_today,
         "weights": dict(WEIGHTS),
         "tree_scores": dict(TREE_SCORES),
         "geology_scores": dict(GEOLOGY_SCORES),
@@ -2140,8 +2114,9 @@ Exemples d'utilisation :
     special_group.add_argument(
         "--no-weather", action="store_true", dest="no_weather",
         help=(
-            "Ne pas moduler les scores par la météo du jour (sinon facteur "
-            f"{_WEATHER_FACTOR_MIN:.1f} à 1.0 selon Open-Meteo ; utile hors ligne)."
+            "Ne pas consulter la météo Open-Meteo (utile hors ligne) : le "
+            "résumé et le panneau de la carte n'affichent alors pas les "
+            "conditions du jour. Le score n'en dépend jamais."
         ),
     )
 

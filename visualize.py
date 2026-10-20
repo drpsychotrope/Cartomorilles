@@ -23,8 +23,9 @@ Refonte UI (audit UI/UX, lots A+B) :
     debug_layers=True (option CLI --debug-layers).
 
 Cohérence (audit UI/UX, lot C) :
-  - Palette séquentielle ambre → brun à luminance monotone, inversée
-    (brun → jaune) sur les fonds sombres (photo aérienne, satellite) — D38.
+  - Une seule échelle de score, les 6 classes config.PROBABILITY_* — D38.
+    Palette rouge → vert, la même sur tous les fonds (D45, remplace la
+    palette ambre → brun de D38).
   - Emprise d'étude (Isère, couverture BDCharm-50) : contour, extérieur
     estompé, pas de score ni de hotspot affiché hors emprise — D39.
   - Libellés lisibles des essences et géologies (config.*_LABELS),
@@ -128,36 +129,20 @@ _ELIM_SMOOTH_SIGMA: float = 1.5
 # Seuil post-reprojection bilinéaire (< 0.5 → couverture légèrement élargie)
 _ELIM_MASK_THRESHOLD: float = 0.3
 
-# Palette séquentielle (D38) : une famille de teinte ambre → brun
-# « morille », luminance OKLab monotone, sûre pour les daltoniens (le
-# classement repose sur la clarté, pas sur la teinte). Fonds clairs :
-# clair → foncé, la meilleure classe est la plus contrastée.
+# Palette rouge → jaune → vert (ColorBrewer RdYlGn, D45) : une couleur
+# par classe, la même sur tous les fonds de carte. Choix de l'utilisateur
+# après la palette ambre → brun de D38.
 _CMAP_STOPS: tuple[tuple[float, str], ...] = (
-    (0.00, "#f3dca1"),
-    (0.15, "#eac266"),
-    (0.30, "#d99a1e"),
-    (0.45, "#b87501"),
-    (0.60, "#965504"),
-    (0.75, "#733803"),
-    (1.00, "#4e1d01"),
-)
-# Fonds sombres (photo aérienne, satellite) : même famille, sens inversé
-# (brun → jaune) pour que les meilleures classes y restent les plus
-# visibles. Choisi via config.BASEMAPS[...]["dark"].
-_CMAP_STOPS_DARK: tuple[tuple[float, str], ...] = (
-    (0.00, "#5b2b12"),
-    (0.15, "#713408"),
-    (0.30, "#965000"),
-    (0.45, "#bd7204"),
-    (0.60, "#e0991a"),
-    (0.75, "#fec348"),
-    (1.00, "#ffeebb"),
+    (0.00, "#d73027"),
+    (0.15, "#f46d43"),
+    (0.30, "#fdae61"),
+    (0.45, "#fee08b"),
+    (0.60, "#a6d96a"),
+    (0.75, "#1a9850"),
+    (1.00, "#006837"),
 )
 
 _CMAP = mcolors.LinearSegmentedColormap.from_list("morilles", list(_CMAP_STOPS))
-_CMAP_DARK = mcolors.LinearSegmentedColormap.from_list(
-    "morilles_sombre", list(_CMAP_STOPS_DARK),
-)
 
 # Couches de diagnostic : zones exclues par facteur éliminatoire
 _ELIM_LABEL_MAP: dict[str, tuple[str, str]] = {
@@ -1085,14 +1070,6 @@ class MorilleVisualizer:
             "scientific": str(params.get("scientific_name", species)),
         }
 
-    def _weather_factor(self) -> float | None:
-        """Facteur que main.py applique aux scores quand la météo est
-        disponible (0,4 + 0,6 × score du jour), annoncé sur la carte comme
-        dans la console. None sans météo."""
-        if not self._weather_days:
-            return None
-        return 0.4 + 0.6 * float(self._weather_days[0].score)
-
     def _page_title(self) -> str:
         names = ", ".join(
             self._species_info(sp)["name"] for sp in self.species_list
@@ -1117,10 +1094,7 @@ class MorilleVisualizer:
         active."""
         labels = list(config.PROBABILITY_LABELS)
         thresholds = [float(t) for t in config.PROBABILITY_THRESHOLDS]
-        palettes = {
-            "light": _palette_cfg(_CMAP_STOPS, _CMAP, thresholds),
-            "dark": _palette_cfg(_CMAP_STOPS_DARK, _CMAP_DARK, thresholds),
-        }
+        palette = _palette_cfg(_CMAP_STOPS, _CMAP, thresholds)
         info = {sp: self._species_info(sp) for sp in self.species_list}
 
         species_radios = "".join(
@@ -1178,14 +1152,16 @@ class MorilleVisualizer:
             f"Isère · maille {float(config.CELL_SIZE):.0f} m · "
             f"générée le {datetime.now():%d/%m/%Y}"
         )
-        # Même facteur que « Météo J+0 … ×0.89 » dans la console
-        factor = self._weather_factor()
+        # La carte montre le potentiel du terrain ; la météo du jour est
+        # une information à part, dans la section météo du panneau (D45).
         weather_hint = ""
-        if factor is not None:
-            factor_txt = f"{factor:.2f}".replace(".", ",")
+        if self._weather_days:
+            today = self._weather_days[0]
+            score_txt = f"{float(today.score):.2f}".replace(".", ",")
             weather_hint = (
-                f'<p class="cs-hint">Scores multipliés par {factor_txt} '
-                "(météo du jour).</p>"
+                '<p class="cs-hint">Potentiel du terrain, hors météo. '
+                f"Aujourd'hui : {html.escape(str(today.label))} ({score_txt}) "
+                "— voir la météo plus bas.</p>"
             )
 
         cfg: dict[str, Any] = {
@@ -1198,7 +1174,7 @@ class MorilleVisualizer:
             "labels": labels,
             "thresholds": thresholds,
             "classAlpha": _class_alphas(len(labels)),
-            "palettes": palettes,
+            "palette": palette,
             "scoreScale": _SCORE_SCALE,
             "outCode": _SCORE_OUT,
             "altOffset": _ALT_OFFSET,
@@ -1423,8 +1399,6 @@ class MorilleVisualizer:
                     <p class="cs-hint">Cliquez une classe pour la masquer ou l'afficher.</p>
                     <ul class="cs-legend" id="cs-legend"></ul>
                     %WEATHER_HINT%
-                    <p class="cs-hint" id="cs-palette-hint" hidden>Sur photo aérienne,
-                        couleurs inversées : plus c'est clair, meilleur c'est.</p>
                     <button type="button" class="cs-link" id="cs-legend-reset" hidden>Tout afficher</button>
                     <div class="cs-row">
                         <label for="cs-opacity">Opacité</label>
@@ -1472,7 +1446,7 @@ class MorilleVisualizer:
 
             var LABELS = CFG.labels, TH = CFG.thresholds, ALPHA = CFG.classAlpha;
             var N = CFG.scoreScale, OUT = CFG.outCode;
-            var SW = [], SWTXT = [];  /* couleurs de classe de la palette active */
+            var SW = CFG.palette.swatches, SWTXT = CFG.palette.swatchText;
             var IDLE = 'Survolez ou touchez la carte';
             var current = CFG.primary;
             var visible = LABELS.map(function (_, i) { return i > 0; });
@@ -1530,17 +1504,9 @@ class MorilleVisualizer:
             L.control.scale({position: 'bottomright', imperial: false, maxWidth: 140}).addTo(map);
 
             /* ═══════ Couleurs : LUT score → couleur continue + classe ═══════ */
-            /* Palette claire → foncée sur les fonds clairs, inversée sur les
-               fonds sombres (photo aérienne) : la meilleure classe reste la
-               plus contrastée avec le fond (D38). */
             var lutRgb = new Uint8ClampedArray((N + 1) * 3), lutCls = new Uint8Array(N + 1);
-            var paletteKey = null;
-            function setPalette(key) {
-                if (key === paletteKey) { return false; }
-                paletteKey = key;
-                var p = CFG.palettes[key];
-                SW = p.swatches; SWTXT = p.swatchText;
-                var stops = p.stops.map(function (s) { return [s[0], hexToRgb(s[1])]; });
+            (function () {
+                var stops = CFG.palette.stops.map(function (s) { return [s[0], hexToRgb(s[1])]; });
                 for (var v = 0; v <= N; v++) {
                     var s = v / N, rgb = stops[stops.length - 1][1];
                     for (var i = 1; i < stops.length; i++) {
@@ -1555,13 +1521,7 @@ class MorilleVisualizer:
                     lutRgb[v * 3] = rgb[0]; lutRgb[v * 3 + 1] = rgb[1]; lutRgb[v * 3 + 2] = rgb[2];
                     lutCls[v] = classOf(s);
                 }
-                document.getElementById('cs-palette-hint').hidden = key !== 'dark';
-                return true;
-            }
-            CFG.basemaps.forEach(function (b) {
-                if (b['default']) { setPalette(b.dark ? 'dark' : 'light'); }
-            });
-            if (!paletteKey) { setPalette('light'); }
+            })();
 
             /* ═══════ Données : score par espèce + terrain (R=pente, G+B=altitude) ═══════ */
             var dataPx = {}, dataW = 0, dataH = 0, terrainPx = null;
@@ -1748,9 +1708,6 @@ class MorilleVisualizer:
                 if (!layer || layer === baseLayer) { return; }
                 if (baseLayer) { map.removeLayer(baseLayer); }
                 layer.addTo(map); layer.bringToBack(); baseLayer = layer;
-                if (setPalette(b.dark ? 'dark' : 'light')) {
-                    buildLegend(); renderProb(); renderHotspots();
-                }
             });
 
             /* Zone étudiée (D39) : contour sur halo blanc + extérieur voilé,
@@ -2176,8 +2133,6 @@ class MorilleVisualizer:
                 "label": label,
                 "var": layer.get_name(),
                 "default": is_default,
-                # Fond sombre → palette inversée (D38)
-                "dark": bool(cfg.get("dark", False)),
             })
         return basemaps
 

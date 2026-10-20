@@ -78,8 +78,9 @@ All thresholds, scoring weights, tree species scores, geology scores, and spatia
 2. **Monotony penalty** — uniform terrain discount
 3. **Calc-dry penalty** (esculenta only)
 4. **Gaussian spatial smoothing** (sigma configurable, default 0.5)
-5. **Weather factor** (`main.py`): scores × (0.4 + 0.6 × today's Open-Meteo weather score), skipped with `--no-weather` or when the API is unavailable — reported in the console summary and in `rapport_{species}.json` (`config.weather_factor`)
-6. **6-class probability classification**: Nul / Très faible / Faible / Moyen / Bon / Excellent (thresholds: 0.15, 0.30, 0.45, 0.60, 0.75)
+5. **6-class probability classification**: Nul / Très faible / Faible / Moyen / Bon / Excellent (thresholds: 0.15, 0.30, 0.45, 0.60, 0.75)
+
+Today's Open-Meteo weather is **never multiplied into the score** (D45): the map shows the terrain potential; the weather (today's class and score, 7-day panel) is reported separately in the console summary, the map sidebar and `rapport_{species}.json` (`config.weather_today`; `--no-weather` skips the API call).
 
 ## Architectural Decisions to Respect
 
@@ -105,11 +106,12 @@ These decisions are documented in `decisions.md` — do not reverse them without
 | **D28** | Landcover `_resample_to_grid()` uses inverse L93→WGS84 mapping with Mercator Y correction (not naive ndizoom) |
 | **D29** | Folium overlays are reprojected to **EPSG:3857** (Web Mercator), not EPSG:4326 — Leaflet stretches ImageOverlay linearly in Mercator space, so pixels must be evenly spaced in Mercator Y |
 | **D37** | Folium map = one JS-rendered probability layer (per-species score PNG + shared terrain PNG), one collapsible sidebar (species, class legend-as-filter, opacity, top-N numbered hotspots from JSON, layers, weather) — no floating panels, no LayerControl; overlays at grid resolution; diagnostic overlays only with `--debug-layers` |
-| **D38** | One score scale = the 6 `config.PROBABILITY_*` classes (map legend, weather panel, console stats and the `weather.py` day classes — D44). Probability palette = one-hue amber→brown ramp with monotone lightness on light basemaps, reversed brown→yellow on dark ones (`dark: True` in `config.BASEMAPS`) |
+| **D38** | One score scale = the 6 `config.PROBABILITY_*` classes (map legend, weather panel, console stats and the `weather.py` day classes — D44). Probability palette: see D45 (the amber→brown ramp and its dark-basemap variant are gone) |
 | **D39** | Study area = BDCharm-50 departmental coverage (Isère) ∩ grid: outlined, exterior faded, no score (data PNG code 254) and no hotspot shown outside; model outputs (GeoTIFF, CSV) unchanged |
 | **D40** | Map in the field: click/tap → point popup (score, copyable WGS 84 coordinates, “Itinéraire” and Google Maps links, also in hotspot popups); “Me localiser” button (`watchPosition`: centres on the first fix, then follows without recentring); browser zoom allowed (no `maximum-scale` / `user-scalable=no`); ≥ 44 px targets on touch or narrow screens; `{species}_hotspots.gpx` = the top `--map-hotspots` hotspots inside the study area (D39), numbered like the map and the CSV |
 | **D41** | Concise console: the console handler shows only the `cartomorilles` logger (main.py) at INFO+ and WARNING+ from every module (`_ConsoleFilter`); module INFO/DEBUG go to `cartomorilles.log`, `--verbose` shows everything. Hotspots are referred to by rank (n°1 = CSV rank = map marker number, as in the marker popup), never by cluster id |
 | **D42** | Weather = Open-Meteo `/v1/forecast` (no key, non-commercial use; CC BY 4.0 data, credited in the console report and the map weather panel) at MAP_CENTER, elevation 400 m (middle of `ALTITUDE_OPTIMAL`), 14 past + 7 forecast days. Day score includes soil temperature (~10 cm) and moisture, then a soil-warming factor ×0.5–1 (last 7 days vs the 7 before) that separates spring from autumn; a missing value is ignored, never replaced. Cache `data/openmeteo_cache.json` (1 h); offline = last cache covering today |
+| **D45** | Map classes are computed on the raw terrain score: today's weather is shown in the sidebar, console and JSON report but never multiplied into `final_score` (the ×0.4–1.0 factor of D42 is gone; in October it hid every Bon/Excellent cell). Probability palette = red→yellow→green (ColorBrewer RdYlGn, `_CMAP_STOPS` in `visualize.py`), one palette for all basemaps |
 | **D44** | Weather days use the map's 6 classes: `ProspectingDay.level` = index in `config.PROBABILITY_LABELS` (rounded score digitized on `PROBABILITY_THRESHOLDS`), `.label` = that label, no emoji; favourable day = Bon or Excellent. The map panel and the console summary read `level` / `label` as they are — no other weather scale |
 
 ## Session / Branch Workflow
