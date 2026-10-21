@@ -33,7 +33,7 @@ import requests
 from rasterio.errors import RasterioIOError
 from rasterio.windows import Window  # type: ignore[call-arg]
 from rasterio.transform import from_bounds
-from rasterio.warp import Resampling, reproject
+from rasterio.warp import Resampling, reproject, transform_bounds
 from shapely.geometry import LineString, MultiPolygon, Polygon, box
 from shapely.validation import make_valid
 
@@ -44,8 +44,6 @@ from config import (
     CELL_SIZE,
     DATA_BUFFER,
     WATER_TYPE_BONUS,
-    get_geology_score,
-    get_tree_score,
     resolve_geology,
     resolve_tree_name,
 )
@@ -148,6 +146,14 @@ def _bbox_hash(bbox_wgs84: Mapping[str, float]) -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:8]
 
 
+# overpass-api.de répond 406 à une requête sans User-Agent identifiable
+# (celui de requests par défaut) : toutes ses réponses étaient perdues (D61)
+_OVERPASS_HEADERS: dict[str, str] = {
+    "Accept": "application/json",
+    "User-Agent": "Cartomorilles (carte de prospection mycologique, usage personnel)",
+}
+
+
 def _overpass_query(query: str, timeout: int = 90) -> dict[str, Any]:
     """Requête Overpass avec fallback multi-serveurs et gestion rate-limit."""
     for server in OVERPASS_SERVERS:
@@ -158,7 +164,7 @@ def _overpass_query(query: str, timeout: int = 90) -> dict[str, Any]:
                 server,
                 data={"data": query},
                 timeout=timeout,
-                headers={"Accept": "application/json"},
+                headers=_OVERPASS_HEADERS,
             )
             if resp.status_code == 200:
                 data: dict[str, Any] = resp.json()
@@ -173,8 +179,12 @@ def _overpass_query(query: str, timeout: int = 90) -> dict[str, Any]:
                 logger.debug("   ⏳ Rate limited: %s", server_name)
                 time.sleep(5)
                 continue
-            elif resp.status_code == 504:
-                logger.debug("   ⏱️ Timeout: %s", server_name)
+            elif resp.status_code in (502, 503, 504):
+                # Serveur saturé (« all query workers are busy ») ou délai
+                logger.debug(
+                    "   ⏱️ HTTP %d (saturé) : %s", resp.status_code, server_name,
+                )
+                time.sleep(5)
                 continue
             else:
                 logger.debug("   ⚠️ HTTP %d: %s", resp.status_code, server_name)
@@ -369,12 +379,22 @@ class DataLoader:
             "xmax": bbox["xmax"] + DATA_BUFFER,
             "ymax": bbox["ymax"] + DATA_BUFFER,
         }
-        buf_deg = DATA_BUFFER / 111000  # approximation degrés
+        # Emprise WGS84 des requêtes (OSM, WFS, MNT) : enveloppe de l'emprise
+        # L93 tamponnée, bords densifiés. BBOX_WGS84 + 500/111 000° ne
+        # couvrait pas deux coins de l'emprise L93 (14 km² sans bâtiments
+        # OSM, au nord vers 45,87° N 5,36° E et au sud vers 44,71° N
+        # 5,77° E — D61). La clé des caches reste celle de BBOX_WGS84.
+        west, south, east, north = transform_bounds(
+            TARGET_CRS, "EPSG:4326",
+            self.bbox_buffered["xmin"], self.bbox_buffered["ymin"],
+            self.bbox_buffered["xmax"], self.bbox_buffered["ymax"],
+            densify_pts=101,
+        )
         self.bbox_wgs84_buffered: dict[str, float] = {
-            "west": bbox_wgs84["west"] - buf_deg,
-            "south": bbox_wgs84["south"] - buf_deg,
-            "east": bbox_wgs84["east"] + buf_deg,
-            "north": bbox_wgs84["north"] + buf_deg,
+            "west": min(west, bbox_wgs84["west"]),
+            "south": min(south, bbox_wgs84["south"]),
+            "east": max(east, bbox_wgs84["east"]),
+            "north": max(north, bbox_wgs84["north"]),
         }
 
         logger.debug(
@@ -523,35 +543,53 @@ class DataLoader:
                 is_l93 = src.crs is not None and "2154" in str(src.crs)
 
                 if is_l93:
-                    # ── Fenêtrage à l'emprise projet via index pixel ──
-                    # src.index(x, y) → (row, col) — y-axis inversé
-                    r_top, c_left = src.index(
-                        self.bbox["xmin"], self.bbox["ymax"],
+                    # ── Recalage exact sur l'emprise projet ──
+                    # compute_terrain étire le MNT sur toute l'emprise : un
+                    # fenêtrage (rogné au raster, dernière ligne perdue)
+                    # étirait un MNT partiel sur 107 × 131 km sans le dire,
+                    # et décalait jusqu'à ~12 m un MNT d'une autre origine.
+                    # Rééchantillonné à sa résolution sur from_bounds(emprise)
+                    # comme _reproject_dem ; le cache, déjà calé, est lu tel
+                    # quel (D61).
+                    res = (abs(src.res[0]) + abs(src.res[1])) / 2
+                    nx = max(1, int(round(
+                        (self.bbox["xmax"] - self.bbox["xmin"]) / res,
+                    )))
+                    ny = max(1, int(round(
+                        (self.bbox["ymax"] - self.bbox["ymin"]) / res,
+                    )))
+                    transform = from_bounds(
+                        self.bbox["xmin"], self.bbox["ymin"],
+                        self.bbox["xmax"], self.bbox["ymax"], nx, ny,
                     )
-                    r_bot, c_right = src.index(
-                        self.bbox["xmax"], self.bbox["ymin"],
-                    )
-
-                    # Clamp aux limites du raster
-                    r0 = max(0, min(r_top, r_bot))
-                    r1 = min(src.height, max(r_top, r_bot))
-                    c0 = max(0, min(c_left, c_right))
-                    c1 = min(src.width, max(c_left, c_right))
-
-                    window = Window(c0, r0, c1 - c0, r1 - r0)  # type: ignore
-
-                    dem = src.read(1, window=window).astype(np.float32)
-                    transform = src.window_transform(window)
-
-                    if dem.shape != (src.height, src.width):
-                        logger.info(
-                            "   Fenêtrage DEM : %d×%d → %d×%d"
-                            " (crop emprise projet)",
-                            src.height,
-                            src.width,
-                            dem.shape[0],
-                            dem.shape[1],
+                    if (src.width, src.height) == (nx, ny) and (
+                        src.transform.almost_equals(transform)
+                    ):
+                        dem = src.read(1).astype(np.float32)
+                    else:
+                        dem = np.full((ny, nx), np.nan, dtype=np.float32)
+                        reproject(
+                            source=rasterio.band(src, 1),
+                            destination=dem,
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            src_nodata=src.nodata,
+                            dst_transform=transform,
+                            dst_crs=TARGET_CRS,
+                            dst_nodata=np.nan,
+                            resampling=Resampling.bilinear,
                         )
+                        covered = float(np.isfinite(dem).mean())
+                        logger.info(
+                            "   MNT recalé sur l'emprise : %d×%d → %d×%d "
+                            "à %.1f m", src.width, src.height, nx, ny, res,
+                        )
+                        if covered < 0.999:
+                            logger.warning(
+                                "⚠️ MNT %s : couvre %.1f %% de l'emprise "
+                                "(le reste sans altitude)",
+                                path.name, covered * 100,
+                            )
                 else:
                     dem = src.read(1).astype(np.float32)
                     transform = src.transform
@@ -2052,17 +2090,25 @@ class DataLoader:
                 gdf["source"] = "file"
                 return gdf
 
-        # 2. Cache
-        cache = self._cache_path("urban")
+        # 2. Cache — v2 : bâtiments, zones bâties, routes et voies ferrées
+        # (le cache v1 n'avait que les bâtiments : ses autres requêtes
+        # échouaient sans bruit et le résultat partiel était gardé, D61)
+        cache = self._cache_path("urban_v2")
         gdf = self._safe_read_cache(cache)
         if gdf is not None:
             return gdf
 
         # 3. OSM
         try:
-            gdf = self._download_urban_osm()
+            gdf, complete = self._download_urban_osm()
             if gdf is not None and len(gdf) > 0:
-                self._save_cache(gdf, cache)
+                if complete:
+                    self._save_cache(gdf, cache)
+                    # Les tuiles ne servaient qu'à reprendre un téléchargement
+                    # interrompu : la couche complète est en cache
+                    if cache.exists():
+                        for tile in (DATA_DIR / "cache" / "osm_urban").glob("*.json"):
+                            tile.unlink(missing_ok=True)
                 return gdf
         except Exception as e:
             logger.warning("⚠️ OSM urbain: %s", e)
@@ -2071,93 +2117,105 @@ class DataLoader:
         logger.warning("⚠️ Urbain → synthétique")
         return self._generate_synthetic_urban()
 
-    def _download_urban_osm(self) -> gpd.GeoDataFrame | None:
+    # Requêtes OSM urbaines : (nom, filtres Overpass, tuiles par côté).
+    # « {bb} » = emprise de la tuile (S,W,N,E) ; « {excl} » = bâtiments
+    # agricoles, ruines et abris exclus.
+    _URBAN_OSM_QUERIES: tuple[tuple[str, str, int], ...] = (
+        ("batiments", 'way["building"]["building"!~"{excl}"]({bb});', 3),
+        ("zones", (
+            'way["landuse"~"residential|commercial|industrial|retail"]({bb});'
+            'relation["landuse"~"residential|commercial|industrial"]({bb});'
+            'way["landuse"="cemetery"]({bb});'
+            'way["amenity"~"parking|school"]({bb});'
+            'way["leisure"~"pitch|sports_centre"]({bb});'
+        ), 2),
+        ("voies", (
+            'way["highway"~"motorway|trunk|primary|secondary"]({bb});'
+            'way["railway"~"rail|light_rail"]({bb});'
+        ), 2),
+    )
+    _URBAN_BUILDING_EXCLUDE: str = (
+        "barn|farm|farm_auxiliary|greenhouse|shed|ruins|hut|silo"
+        "|stable|cowshed|slurry_tank|storage_tank|roof|collapsed"
+    )
+
+    def _overpass_tile(self, name: str, query: str, tile: str) -> list[dict[str, Any]] | None:
+        """Éléments d'une requête Overpass sur une tuile, mis en cache par
+        tuile (data/cache/osm_urban) : un run interrompu reprend où il
+        s'est arrêté. None si tous les serveurs échouent trois fois."""
+        key = hashlib.md5(f"{query}|{tile}".encode()).hexdigest()[:12]
+        cache = DATA_DIR / "cache" / "osm_urban" / f"{name}_{key}.json"
+        if cache.exists():
+            try:
+                return list(json.loads(cache.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                cache.unlink(missing_ok=True)
+        q = f"[out:json][timeout:180];({query});out geom;"
+        for attempt in range(3):
+            try:
+                data = _overpass_query(q, timeout=200)
+            except Exception as e:  # noqa: BLE001 — tous serveurs en échec
+                logger.debug("   %s %s essai %d : %s", name, tile, attempt + 1, e)
+                time.sleep(15 * (attempt + 1))
+                continue
+            elements = [
+                {k: el[k] for k in ("type", "id", "tags", "geometry", "members") if k in el}
+                for el in data.get("elements", [])
+            ]
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(elements), encoding="utf-8")
+            time.sleep(2)
+            return elements
+        return None
+
+    def _download_urban_osm(self) -> tuple[gpd.GeoDataFrame | None, bool]:
         """
-        Télécharge zones urbaines OSM par lots avec gestion rate-limit.
-        Inclut: bâtiments, landuse, routes principales, parkings, etc.
+        Télécharge les zones urbaines OSM par tuiles (bâtiments, zones bâties,
+        parkings, sport, cimetières, routes principales, voies ferrées).
+
+        Retourne (couche, complète) : complète = toutes les tuiles reçues.
+        Une couche incomplète sert au run mais n'est pas mise en cache, et un
+        avertissement le dit (D61).
         """
         b = self.bbox_wgs84_buffered
-        bbox_str = self._wgs84_bbox_str(buffered=True)
-
-        logger.info("🏘️ Urbain OSM (par lots)...")
-
-        # Découper en quadrants pour les bâtiments (volume élevé)
-        mid_lat = (b["south"] + b["north"]) / 2
-        mid_lon = (b["west"] + b["east"]) / 2
-        quadrants = [
-            f"{b['south']},{b['west']},{mid_lat},{mid_lon}",
-            f"{b['south']},{mid_lon},{mid_lat},{b['east']}",
-            f"{mid_lat},{b['west']},{b['north']},{mid_lon}",
-            f"{mid_lat},{mid_lon},{b['north']},{b['east']}",
-        ]
-
-        all_elements: list[dict[str, Any]] = []
-
-        # Types de bâtiments exclus (agricoles, ruines, abris non-urbains)
-        _BUILDING_EXCLUDE = (
-            "barn|farm|farm_auxiliary|greenhouse|shed|ruins|hut|silo"
-            "|stable|cowshed|slurry_tank|storage_tank|roof|collapsed"
-        )
+        logger.info("🏘️ Urbain OSM (par tuiles)...")
         logger.info(
             "   Tags OSM urbain : building (excl. %s), "
-            "landuse=residential|commercial|industrial|retail, "
+            "landuse=residential|commercial|industrial|retail|cemetery, "
             "amenity=parking|school, leisure=pitch|sports_centre, "
             "highway=motorway|trunk|primary|secondary, railway=rail|light_rail",
-            _BUILDING_EXCLUDE,
+            self._URBAN_BUILDING_EXCLUDE,
         )
 
-        # Bâtiments par quadrant (hors bâtiments agricoles/ruraux)
-        for i, quad_bbox in enumerate(quadrants):
-            try:
-                logger.debug("   Bâtiments quadrant %d/4...", i + 1)
-                q = f"""
-                [out:json][timeout:30];
-                way["building"]["building"!~"{_BUILDING_EXCLUDE}"]({quad_bbox});
-                out geom;
-                """
-                data = _overpass_query(q, timeout=45)
-                all_elements.extend(data.get("elements", []))
-                time.sleep(3)
-            except Exception as e:
-                logger.debug("   Quadrant %d: %s", i + 1, e)
-                time.sleep(5)
-
-        # Landuse + parkings + sport + cimetières
-        try:
-            logger.debug("   Zones d'occupation du sol...")
-            time.sleep(3)
-            q_landuse = f"""
-            [out:json][timeout:30];
-            (
-              way["landuse"~"residential|commercial|industrial|retail"]({bbox_str});
-              way["amenity"~"parking|school"]({bbox_str});
-              way["leisure"~"pitch|sports_centre"]({bbox_str});
-              way["landuse"="cemetery"]({bbox_str});
-              relation["landuse"~"residential|commercial|industrial"]({bbox_str});
-            );
-            out geom;
-            """
-            data = _overpass_query(q_landuse, timeout=45)
-            all_elements.extend(data.get("elements", []))
-        except Exception as e:
-            logger.debug("   Landuse: %s", e)
-
-        # Routes principales
-        try:
-            logger.debug("   Routes principales...")
-            time.sleep(3)
-            q_roads = f"""
-            [out:json][timeout:20];
-            (
-              way["highway"~"motorway|trunk|primary|secondary"]({bbox_str});
-              way["railway"~"rail|light_rail"]({bbox_str});
-            );
-            out geom;
-            """
-            data = _overpass_query(q_roads, timeout=30)
-            all_elements.extend(data.get("elements", []))
-        except Exception as e:
-            logger.debug("   Routes: %s", e)
+        all_elements: list[dict[str, Any]] = []
+        failed: list[str] = []
+        n_queries = 0
+        for name, template, n in self._URBAN_OSM_QUERIES:
+            lats = np.linspace(b["south"], b["north"], n + 1)
+            lons = np.linspace(b["west"], b["east"], n + 1)
+            for i in range(n):
+                for j in range(n):
+                    tile = (
+                        f"{lats[i]:.5f},{lons[j]:.5f},"
+                        f"{lats[i + 1]:.5f},{lons[j + 1]:.5f}"
+                    )
+                    query = template.format(
+                        bb=tile, excl=self._URBAN_BUILDING_EXCLUDE,
+                    )
+                    n_queries += 1
+                    elements = self._overpass_tile(name, query, tile)
+                    if elements is None:
+                        failed.append(f"{name} {i * n + j + 1}/{n * n}")
+                    else:
+                        all_elements.extend(elements)
+        complete = not failed
+        if failed:
+            logger.warning(
+                "⚠️ OSM urbain incomplet : %d requêtes sur %d en échec (%s) — "
+                "couche utilisée pour ce run mais pas mise en cache ; "
+                "le prochain run reprendra les tuiles manquantes",
+                len(failed), n_queries, ", ".join(failed),
+            )
 
         if not all_elements:
             raise ValueError("Aucun élément urbain OSM")
@@ -2289,7 +2347,7 @@ class DataLoader:
         for ut, cnt in gdf["urban_type"].value_counts().items():
             logger.debug("   • %s: %d", ut, cnt)
 
-        return gdf
+        return gdf, complete
 
     def _generate_synthetic_urban(self) -> gpd.GeoDataFrame:
         """Génère des zones urbaines synthétiques."""

@@ -113,9 +113,14 @@ __all__ = ["MorilleVisualizer"]
 _NODATA: float = -9999.0
 _MAX_HOTSPOT_MARKERS: int = 1000
 
-# Taille max du raster reprojeté (par axe). Le rendu se fait à la
-# résolution de la grille : le navigateur lisse l'image à l'affichage.
-_RENDER_MAX_PX: int = 4000
+# Pixels max d'une image de la carte (rendu Mercator de la grille, D62).
+# Par défaut 4096², la surface max d'un canvas dans Safari iOS : au-delà,
+# getImageData échoue et la carte reste vide sur iPhone (usage terrain,
+# D40). La carte HD (--hd-map) monte à 64 Mpx, ~15 m sur l'Isère : décodage
+# ~0,6 s par image et ~2 Go de mémoire dans Chromium sur ordinateur.
+# Sous le budget, rendu à la résolution de la grille (le navigateur lisse).
+MOBILE_MAX_PIXELS: int = 4096 * 4096
+HD_MAX_PIXELS: int = 64 * 1024 * 1024
 # Hotspots affichés à l'ouverture (le panneau permet d'en montrer plus)
 _DEFAULT_HOTSPOTS_SHOWN: int = 20
 
@@ -147,7 +152,6 @@ _CMAP = mcolors.LinearSegmentedColormap.from_list("morilles", list(_CMAP_STOPS))
 # Couches de diagnostic : zones exclues par facteur éliminatoire
 _ELIM_LABEL_MAP: dict[str, tuple[str, str]] = {
     "urban": ("Exclu : zones urbaines", "#555555"),
-    "urban_proximity": ("Exclu : abords urbains", "#777777"),
     "water": ("Exclu : eau et berge de 5 m", "#0077cc"),
     "nodata": ("Exclu : MNT manquant", "#000000"),
     "species": ("Exclu : essences", "#8b0000"),
@@ -600,6 +604,26 @@ class _ExtraSpec(NamedTuple):
     render: Callable[[], bytes] | None
 
 
+def render_size(
+    nx: int, ny: int,
+    bounds_l93: tuple[float, float, float, float],
+    max_pixels: int,
+) -> tuple[int, int]:
+    """Taille (largeur, hauteur) des images Mercator de la carte : celle que
+    donne la grille nx × ny reprojetée, réduite, proportions gardées, pour
+    ne pas dépasser `max_pixels` (D62)."""
+    xmin, ymin, xmax, ymax = bounds_l93
+    _, w, h = calculate_default_transform(
+        CRS.from_epsg(2154), CRS.from_epsg(3857), nx, ny,
+        left=xmin, bottom=ymin, right=xmax, top=ymax,
+    )
+    assert w is not None and h is not None
+    if w * h > max_pixels:
+        scale = (max_pixels / (w * h)) ** 0.5
+        w, h = max(1, int(w * scale)), max(1, int(h * scale))
+    return int(w), int(h)
+
+
 # ═══════════════════════════════════════════════════════════
 # Classe principale
 # ═══════════════════════════════════════════════════════════
@@ -621,12 +645,16 @@ class MorilleVisualizer:
         default_hotspots_shown: int = _DEFAULT_HOTSPOTS_SHOWN,
         study_area: Any = None,
         forest_gdf: gpd.GeoDataFrame | None = None,
+        max_render_pixels: int = MOBILE_MAX_PIXELS,
     ) -> None:
         """study_area : emprise d'étude (GeoDataFrame dont on fait l'union,
         ou géométrie Lambert-93). Hors emprise, la carte n'affiche ni score
         ni hotspot et estompe le fond (D39). None = pas de restriction.
         forest_gdf : BD Forêt v2, pour le calque des essences telles que
-        publiées (D53) ; sans elle, essences canoniques de la grille."""
+        publiées (D53) ; sans elle, essences canoniques de la grille.
+        max_render_pixels : pixels max de chaque image de la carte (D62) —
+        MOBILE_MAX_PIXELS (téléphone compris) ou HD_MAX_PIXELS (ordinateur)."""
+        self.max_render_pixels = int(max_render_pixels)
         # ── v2.6.0 — accepter dict[species, MorilleScoring] OU instance unique
         if isinstance(scoring_model, dict):
             self.models: dict[str, MorilleScoring] = dict(scoring_model)
@@ -722,10 +750,10 @@ class MorilleVisualizer:
         self._dst_crs = CRS.from_epsg(3857)
 
         # Résolution de rendu = celle de la grille (le suréchantillonnage
-        # n'ajoutait aucune information et multipliait le poids du HTML).
-        render_nx = min(int(self.grid.nx), _RENDER_MAX_PX)
-        render_ny = min(int(self.grid.ny), _RENDER_MAX_PX)
-
+        # n'ajoutait aucune information et multipliait le poids du HTML),
+        # réduite si besoin, proportions gardées, au budget de pixels (D62).
+        # L'ancien plafond de 4 000 px par axe déformait les pixels et ne
+        # garantissait pas la limite des canvas iOS.
         # Emprise WGS84 exacte depuis pyproj (pour bounds Folium)
         _corners_x = [self._xmin_l93, self._xmax_l93, self._xmin_l93, self._xmax_l93]
         _corners_y = [self._ymin_l93, self._ymin_l93, self._ymax_l93, self._ymax_l93]
@@ -742,18 +770,11 @@ class MorilleVisualizer:
         _ymin_merc = float(min(_my))
         _ymax_merc = float(max(_my))
 
-        dst_transform, dst_width, dst_height = calculate_default_transform(
-            self._src_crs,
-            self._dst_crs,
-            render_nx,
-            render_ny,
-            left=self._xmin_l93,
-            bottom=self._ymin_l93,
-            right=self._xmax_l93,
-            top=self._ymax_l93,
+        dst_width, dst_height = render_size(
+            int(self.grid.nx), int(self.grid.ny),
+            (self._xmin_l93, self._ymin_l93, self._xmax_l93, self._ymax_l93),
+            self.max_render_pixels,
         )
-        assert dst_width is not None
-        assert dst_height is not None
 
         # dst_transform depuis bounds Mercator exactes pour alignement
         # pixel-parfait avec le fond de carte Leaflet (Web Mercator).
@@ -1358,10 +1379,11 @@ class MorilleVisualizer:
         de probabilité + lecture de cellule).
 
         R = score × 200 (0–200 → 0.00–1.00), 254 = hors emprise d'étude
-        (D39), 255 = NaN ; G = classe (indice dans PROBABILITY_LABELS) du
-        score non quantifié sur les seuils de l'espèce (D52). Le R tronqué
-        au 1/200 faisait tomber d'une classe 9 à 25 % des cellules Bon et
-        Excellent dont le score est juste au-dessus d'un seuil (D60).
+        (D39), 255 = NaN ; G = 0 si la classe de R / 200 est celle du score
+        exact, sinon 1 + la classe exacte (indice dans PROBABILITY_LABELS,
+        seuils de l'espèce, D52). Le R tronqué au 1/200 faisait tomber d'une
+        classe 9 à 25 % des cellules Bon et Excellent juste au-dessus d'un
+        seuil (D60) ; G presque toujours nul ne pèse presque rien.
         Altitude et pente, communes aux espèces, sont dans le PNG terrain.
 
         v2.6.0 : species kwarg sélectionne le raster source. Si None → primary.
@@ -1385,12 +1407,14 @@ class MorilleVisualizer:
             )],
             dtype=np.float64,
         )
-        cls = np.zeros(score_wgs.shape, dtype=np.uint8)
-        cls[valid_s] = np.digitize(score_wgs[valid_s], thresholds).astype(
-            np.uint8,
-        )
+        fix = np.zeros(score_wgs.shape, dtype=np.uint8)
+        exact = np.digitize(score_wgs[valid_s], thresholds)
+        coded = np.digitize(gray[valid_s].astype(np.float64) / _SCORE_SCALE, thresholds)
+        fix[valid_s] = np.where(exact != coded, exact + 1, 0).astype(np.uint8)
+        if self._study_mask is not None:
+            fix[~self._study_mask] = 0
         rgb[:, :, 0] = gray
-        rgb[:, :, 1] = cls
+        rgb[:, :, 1] = fix
 
         png_bytes = self._encode_opaque_png(rgb)
         h, w = gray.shape
@@ -1975,8 +1999,11 @@ class MorilleVisualizer:
             }
             L.control.scale({position: 'bottomright', imperial: false, maxWidth: 140}).addTo(map);
 
-            /* ═══════ Couleurs : LUT score → couleur continue (classe : canal G) ═══════ */
-            var lutRgb = new Uint8ClampedArray((N + 1) * 3);
+            /* ═══════ Couleurs : LUT score → couleur continue + classe ═══════ */
+            /* Classe d'un pixel : celle de son score R / 200, sauf si le canal G
+               la corrige (G = 1 + classe du score exact, troncature au 1/200) */
+            function clsAt(px, o) { var g = px[o + 1]; return g ? g - 1 : lutCls[px[o]]; }
+            var lutRgb = new Uint8ClampedArray((N + 1) * 3), lutCls = new Uint8Array(N + 1);
             /* Arrêts de la palette calés sur les seuils de l'espèce (0, seuils,
                1) : chaque classe garde sa couleur quels que soient ses seuils. */
             function buildLut() {
@@ -1997,6 +2024,7 @@ class MorilleVisualizer:
                         }
                     }
                     lutRgb[v * 3] = rgb[0]; lutRgb[v * 3 + 1] = rgb[1]; lutRgb[v * 3 + 2] = rgb[2];
+                    lutCls[v] = classOf(s);
                 }
             }
             buildLut();
@@ -2011,9 +2039,23 @@ class MorilleVisualizer:
                 return ctx.getImageData(0, 0, c.width, c.height).data;
             }
 
+            /* ═══════ Calque image = canvas, mis à jour par putImageData ═══════ */
+            /* Sans encodage PNG (toBlob : plusieurs secondes par changement
+               d'espèce ou de filtre sur une grande image, D62) */
+            var CanvasOverlay = L.ImageOverlay.extend({
+                _initImage: function () {
+                    var c = this._image = this._url;
+                    L.DomUtil.addClass(c, 'leaflet-image-layer');
+                    if (this._zoomAnimated) { L.DomUtil.addClass(c, 'leaflet-zoom-animated'); }
+                    if (this.options.className) { L.DomUtil.addClass(c, this.options.className); }
+                    c.onselectstart = L.Util.falseFn;
+                    c.onmousemove = L.Util.falseFn;
+                    if (this.options.zIndex) { this._updateZIndex(); }
+                }
+            });
+
             /* ═══════ Couche de probabilité unique ═══════ */
-            var probLayer = null, probUrl = null, renderSeq = 0;
-            var renderCanvas = document.createElement('canvas');
+            var probLayer = null, probCanvas = null, probImage = null;
             var opInput = document.getElementById('cs-opacity');
             var opOut = document.getElementById('cs-opacity-val');
             function opacity() { return parseInt(opInput.value, 10) / 100; }
@@ -2021,36 +2063,32 @@ class MorilleVisualizer:
             function renderProb() {
                 var src = dataPx[current];
                 if (!src) { return; }
-                renderCanvas.width = dataW; renderCanvas.height = dataH;
-                var ctx = renderCanvas.getContext('2d');
-                var out = ctx.createImageData(dataW, dataH), dd = out.data;
+                if (!probCanvas) {
+                    probCanvas = document.createElement('canvas');
+                    probCanvas.width = dataW; probCanvas.height = dataH;
+                }
+                var ctx = probCanvas.getContext('2d');
+                if (!probImage) { probImage = ctx.createImageData(dataW, dataH); }
+                var out = probImage, dd = out.data;
+                dd.fill(0);
                 var alphaByCls = ALPHA.map(function (a, i) {
                     return visible[i] ? Math.round(a * 255) : 0;
                 });
                 for (var i = 0, n = dataW * dataH; i < n; i++) {
                     var o = i * 4, v = src[o];
                     if (v > N) { continue; }
-                    var a = alphaByCls[src[o + 1]];   /* G = classe exacte (D60) */
+                    var a = alphaByCls[clsAt(src, o)];   /* classe exacte (D60) */
                     if (!a) { continue; }
                     dd[o] = lutRgb[v * 3]; dd[o + 1] = lutRgb[v * 3 + 1];
                     dd[o + 2] = lutRgb[v * 3 + 2]; dd[o + 3] = a;
                 }
                 ctx.putImageData(out, 0, 0);
-                var seq = ++renderSeq;
-                renderCanvas.toBlob(function (blob) {
-                    if (!blob || seq !== renderSeq) { return; }
-                    var url = URL.createObjectURL(blob), old = probUrl;
-                    probUrl = url;
-                    if (probLayer) {
-                        if (old) { probLayer.once('load', function () { URL.revokeObjectURL(old); }); }
-                        probLayer.setUrl(url);
-                    } else {
-                        probLayer = L.imageOverlay(url, CFG.bounds, {
-                            opacity: opacity(), interactive: false, zIndex: 1,
-                            className: 'cs-prob'
-                        }).addTo(map);
-                    }
-                }, 'image/png');
+                if (!probLayer) {
+                    probLayer = new CanvasOverlay(probCanvas, CFG.bounds, {
+                        opacity: opacity(), interactive: false, zIndex: 1,
+                        className: 'cs-prob'
+                    }).addTo(map);
+                }
             }
 
             opInput.addEventListener('input', function () {
@@ -2313,6 +2351,7 @@ class MorilleVisualizer:
                 if (img && !img.getAttribute('src')) {
                     img.addEventListener('load', function () {
                         extraPx[x.key] = pixels(img);
+                        img.removeAttribute('src');   /* image décodée libérée */
                         if (extraKey === x.key) { renderExtra(); }
                         if (pointPopup.isOpen()) { pointPopup.update(); }
                     }, {once: true});
@@ -2335,6 +2374,14 @@ class MorilleVisualizer:
                 var lut = extraLut(x), c = document.createElement('canvas');
                 c.width = dataW; c.height = dataH;
                 var ctx = c.getContext('2d'), out = ctx.createImageData(dataW, dataH), dd = out.data;
+                /* Une seule couche supplémentaire gardée : libérer les autres
+                   (une image pleine grille pèse 4 octets par pixel) */
+                Object.keys(extraOverlays).forEach(function (k) {
+                    if (k !== x.key) { delete extraOverlays[k]; }
+                });
+                Object.keys(extraPx).forEach(function (k) {
+                    if (k !== x.key) { delete extraPx[k]; }
+                });
                 for (var i = 0, n = dataW * dataH; i < n; i++) {
                     var o = i * 4;
                     if (area[o] === OUT) { continue; }
@@ -2343,15 +2390,10 @@ class MorilleVisualizer:
                     dd[o] = lut[k]; dd[o + 1] = lut[k + 1]; dd[o + 2] = lut[k + 2]; dd[o + 3] = 255;
                 }
                 ctx.putImageData(out, 0, 0);
-                var key = x.key;
-                c.toBlob(function (blob) {
-                    if (!blob || extraOverlays[key]) { return; }
-                    extraOverlays[key] = L.imageOverlay(URL.createObjectURL(blob), CFG.bounds, {
-                        opacity: extraOpacity(), interactive: false, zIndex: 2,
-                        className: x.kind === 'cat' ? 'cs-extra-cat' : 'cs-prob'
-                    });
-                    if (extraKey === key) { extraOverlays[key].addTo(map); }
-                }, 'image/png');
+                extraOverlays[x.key] = new CanvasOverlay(c, CFG.bounds, {
+                    opacity: extraOpacity(), interactive: false, zIndex: 2,
+                    className: x.kind === 'cat' ? 'cs-extra-cat' : 'cs-prob'
+                }).addTo(map);
             }
             function shareText(s) {
                 if (s >= 0.095) { return fmt(s * 100, 0) + ' %'; }
@@ -2452,7 +2494,7 @@ class MorilleVisualizer:
                 if (v > N && v !== OUT) { return {state: 'nodata'}; }
                 /* Hors zone étudiée (D39) : pas de score, mais le terrain */
                 var cell = v === OUT ? {state: 'outside'}
-                    : {state: 'ok', s: v / N, cls: d[o + 1]};
+                    : {state: 'ok', s: v / N, cls: clsAt(d, o)};
                 if (terrainPx) {
                     var alt = terrainPx[o + 1] + (terrainPx[o + 2] << 8);
                     if (alt > 0) { cell.alt = Math.round(alt - CFG.altOffset); }
@@ -2709,8 +2751,11 @@ class MorilleVisualizer:
                 if (!imgs.every(ready)) { return; }
                 CFG.speciesList.forEach(function (sp, i) { dataPx[sp] = pixels(imgs[i]); });
                 dataW = imgs[0].naturalWidth; dataH = imgs[0].naturalHeight;
+                /* Pixels copiés : images décodées et chaînes base64 libérées */
+                imgs.forEach(function (img) { img.removeAttribute('src'); });
                 if (ready(terrainImg) && terrainImg.naturalWidth === dataW) {
                     terrainPx = pixels(terrainImg);
+                    terrainImg.removeAttribute('src');
                 } else {   /* calque de pente lu dans le PNG terrain : indisponible */
                     EXTRA.forEach(function (x) {
                         if (x.src !== 'terrain') { return; }
@@ -3260,7 +3305,14 @@ class MorilleVisualizer:
                 crs="EPSG:2154",
                 transform=transform,
                 nodata=_NODATA,
-                compress="lzw",
+                # deflate niveau 6 (D17) + prédicteur flottant, en tuiles :
+                # −29 % par rapport à LZW sans prédicteur, valeurs exactes
+                compress="deflate",
+                zlevel=6,
+                predictor=3,
+                tiled=True,
+                blockxsize=512,
+                blockysize=512,
             ) as dst:
                 dst.write(score.astype(np.float32), 1)
                 dst.update_tags(

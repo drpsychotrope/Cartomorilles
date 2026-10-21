@@ -193,7 +193,7 @@ def test_cpu_filters_match_scipy(monkeypatch):
     assert np.isnan(out).sum() == 25                 # la seule fenêtre 5×5
 
 
-# ── Carte : la classe exacte voyage dans le canal G du data PNG ───────
+# ── Carte : le canal G du data PNG corrige la classe tronquée ────────
 
 def test_data_png_carries_exact_class():
     import io
@@ -216,5 +216,22 @@ def test_data_png_carries_exact_class():
     assert rgb.shape == (1, 4, 3)
     # R = score × 200 tronqué (0,8531 → 170 comme 0,8529), 255 = NaN
     assert rgb[0, :, 0].tolist() == [20, 170, 170, 255]
-    # G = classe du score exact : Bon (3) / Excellent (4) de part et d'autre
-    assert rgb[0, :, 1].tolist() == [0, 3, 4, 0]
+    # G = 0 quand R / 200 donne la bonne classe, sinon 1 + classe exacte :
+    # 0,8531 est Excellent (4) mais 170 / 200 = 0,85 serait Bon
+    assert rgb[0, :, 1].tolist() == [0, 0, 5, 0]
+
+
+# ── Carte : budget de pixels (D62) ─────────────────────────────────────
+
+def test_render_size_respects_pixel_budget():
+    import visualize
+
+    bounds = (857_571.0, 6_403_000.0, 965_000.0, 6_534_209.0)   # Isère
+    w50, h50 = visualize.render_size(2148, 2624, bounds, visualize.MOBILE_MAX_PIXELS)
+    assert w50 * h50 < visualize.MOBILE_MAX_PIXELS              # 50 m : natif
+    w20, h20 = visualize.render_size(5371, 6560, bounds, visualize.MOBILE_MAX_PIXELS)
+    assert 0.97 * visualize.MOBILE_MAX_PIXELS < w20 * h20 <= visualize.MOBILE_MAX_PIXELS
+    w10, h10 = visualize.render_size(10742, 13120, bounds, visualize.HD_MAX_PIXELS)
+    assert 0.97 * visualize.HD_MAX_PIXELS < w10 * h10 <= visualize.HD_MAX_PIXELS
+    # Proportions gardées (pixels carrés en Mercator)
+    assert abs(w20 / h20 - w50 / h50) < 0.01

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from typing import Any
 
 import geopandas as gpd
@@ -45,23 +46,13 @@ from scipy.ndimage import (
 import _accel
 import config
 from config import (
-    ALTITUDE_OPTIMAL,
-    ALTITUDE_RANGE,
-    ASPECT_SCORES,
     DIST_WATER_OPTIMAL,
     DIST_WATER_MAX,
     GEOLOGY_SCORES,
-    SLOPE_MAX,
-    SLOPE_OPTIMAL,
     TREE_SCORES,
     TWI_DRY_FLOOR,
-    TWI_DRY_LIMIT,
-    TWI_OPTIMAL,
-    TWI_WATERLOG,
     TWI_WET_FLOOR,
-    TWI_WET_LIMIT,
     get_geology_score,
-    get_tree_score,
     LANDCOVER_FOREST_FLOOR,
     DIST_WATER_FOREST_FLOOR,
     URBAN_DIST_ELIMINATORY,
@@ -72,10 +63,18 @@ from config import (
 from utils import TO_WGS84, compute_array_stats
 
 try:
-    from _twi_numba import _accumulate_d8
+    from _twi_numba import _accumulate_d8, _priority_flood
     _HAS_NUMBA = True
 except ImportError:
     _HAS_NUMBA = False
+
+# Pente ajoutée par cellule en comblant une cuvette (m) : assez pour que
+# l'écoulement D8 traverse les replats, négligeable devant le MNT (D61)
+_FILL_EPS_M: float = 1e-3
+# Gravure du réseau hydrographique (cours d'eau IGN, surfaces en eau) dans
+# le MNT de routage : sur le MNS, dans les plaines larges, l'écoulement
+# comblé partait à travers champs et forêts au lieu de suivre le lit (D61)
+_STREAM_BURN_M: float = 20.0
 
 logger = logging.getLogger("cartomorilles.grid_builder")
 
@@ -127,6 +126,10 @@ _COVER_SUBCELL_M: float = 10.0
 # BD Forêt v2 : formations sans arbre hôte (landes et pelouses « NC »,
 # forêts sans couvert arboré « NR ») — D57
 _NON_HOST_ESSENCES: frozenset[str] = frozenset({"NC", "NR"})
+# Polygones BD Forêt qui ne sont pas de la forêt : landes (LA4) et
+# formations herbacées (LA6), ESSENCE « NC » (D61). « NR » (FF0, forêt
+# fermée sans couvert arboré : coupe, chablis) reste de la forêt.
+_NON_FOREST_ESSENCES: frozenset[str] = frozenset({"NC"})
 
 
 def _categorical_cache_key(lookup: np.ndarray, codes: np.ndarray) -> str:
@@ -401,9 +404,17 @@ class GridBuilder:
     #  TERRAIN (MNT)
     # ═══════════════════════════════════════════════════════
 
-    def compute_terrain(self, dem_data: dict[str, Any]) -> GridBuilder:
+    def compute_terrain(
+        self,
+        dem_data: dict[str, Any],
+        streams: list[gpd.GeoDataFrame] | None = None,
+    ) -> GridBuilder:
         """
         Calcule altitude, pente, exposition, rugosité et TWI depuis le MNT.
+
+        streams : cours d'eau et surfaces en eau (L93), gravés de
+        _STREAM_BURN_M dans le MNT qui route l'écoulement du TWI (D61) ;
+        la pente du TWI reste celle du MNT d'origine.
 
         Optimisation v2.4.0 : calcul à résolution native du DEM, puis
         resample vers la grille cible. Évite le zoom ×N du DEM brut
@@ -484,9 +495,13 @@ class GridBuilder:
         native_roughness = self._compute_roughness_from(native_slope)
 
         # TWI à résolution native (le gros gain de perf) + aire drainée D8
-        native_twi, native_acc = self._compute_twi_and_area(
-            dem_filled_native, dem_cell_size,
+        burn = self._stream_burn_mask(
+            streams, dem_data.get("transform"), dem_filled_native.shape,
         )
+        native_twi, native_acc = self._compute_twi_and_area(
+            dem_filled_native, dem_cell_size, burn=burn,
+        )
+        del burn
         native_area = np.log10(native_acc).astype(np.float32)
         del native_acc
 
@@ -639,16 +654,53 @@ class GridBuilder:
         """Topographic Wetness Index seul (voir _compute_twi_and_area)."""
         return GridBuilder._compute_twi_and_area(dem, cell_size)[0]
 
+    def _stream_burn_mask(
+        self,
+        streams: list[gpd.GeoDataFrame] | None,
+        transform: Any,
+        shape: tuple[int, ...],
+    ) -> np.ndarray | None:
+        """Cellules du MNT natif touchées par un cours d'eau ou une surface
+        en eau (all_touched) ; None sans données ou sans transform du MNT."""
+        if not streams or transform is None:
+            return None
+        geoms = [
+            g
+            for gdf in streams if gdf is not None and len(gdf)
+            for g in self._ensure_l93(gdf).geometry
+            if g is not None and not g.is_empty
+        ]
+        if not geoms:
+            return None
+        mask = rasterize(
+            [(g, 1) for g in geoms],
+            out_shape=(int(shape[0]), int(shape[1])),
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+            all_touched=True,
+        ).astype(bool)
+        logger.info(
+            "   Réseau hydrographique gravé de %.0f m dans le MNT de routage : "
+            "%d cellules (D61)", _STREAM_BURN_M, int(mask.sum()),
+        )
+        return mask
+
     @staticmethod
     def _compute_twi_and_area(
         dem: np.ndarray,
         cell_size: float,
+        burn: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Calcul du Topographic Wetness Index — TWI = ln(a / tan(β)) — et de
         l'aire drainée D8 a (m², au moins la surface d'une cellule).
 
         D1 : algorithme D8 (pas D∞/MFD).
+        D61 : l'écoulement est routé sur le MNT aux cuvettes comblées
+        (Priority-Flood + ε) — sur le MNS Copernicus brut il s'arrêtait dans
+        1,5 % de creux : aire drainée plafonnée à 16 km² dans toute l'Isère,
+        rivières absentes. La pente β reste celle du MNT d'origine.
 
         Optimisation v2.4.0 :
         - flow_dir parallélisé via Numba (indépendant par pixel)
@@ -664,14 +716,25 @@ class GridBuilder:
         ).astype(np.float32)
         slope_rad = np.maximum(slope_rad, np.radians(0.1))
 
-        # ── 2. Direction d'écoulement D8 ──
-        flow_dir = _accel.compute_flow_dir_d8(
-            dem.astype(np.float64), cell_size,
-        )
+        # ── 2. Réseau gravé, cuvettes comblées, direction d'écoulement D8 ──
+        route = dem.astype(np.float64)
+        if burn is not None and burn.shape == route.shape:
+            route = np.where(burn, route - _STREAM_BURN_M, route)
+        if _HAS_NUMBA:
+            t0 = time.perf_counter()
+            filled = _priority_flood(route, _FILL_EPS_M)
+            raised = float(np.mean(filled > route + 0.01)) * 100
+            route = filled
+            del filled
+            logger.info(
+                "   Cuvettes comblées : %.1f %% des cellules relevées "
+                "(%.1f s, D61)", raised, time.perf_counter() - t0,
+            )
+        flow_dir = _accel.compute_flow_dir_d8(route, cell_size)
         logger.debug("   D8 flow_dir via _accel")
 
         # ── 3. Aire drainée par accumulation D8 ──
-        flat_idx = np.argsort(dem.ravel())[::-1].astype(np.int64)
+        flat_idx = np.argsort(route.ravel())[::-1].astype(np.int64)
 
         if _HAS_NUMBA:
             from _twi_numba import _accumulate_d8
@@ -1499,13 +1562,19 @@ class GridBuilder:
         self._tree_score_lookup = lookup
 
         # ── Construire forest_mask (nécessaire en aval : canopy, disturbance,
-        #    ground_cover, forest_edge) ────────────────────────────
+        #    ground_cover, forest_edge) — sans landes ni pelouses (D61) ──
         if self.forest_mask is None:
-            self.forest_mask = int_raster > 0
-            logger.debug(
-                "   forest_mask : %d cellules forêt (%.1f%%)",
+            stands = self._stand_mask(gdf, _NON_FOREST_ESSENCES)
+            self.forest_mask = (
+                stands & (int_raster > 0) if stands is not None
+                else int_raster > 0
+            )
+            logger.info(
+                "   Forêt : %d cellules (%.1f %%), %d de landes et pelouses "
+                "BD Forêt hors forêt (D61)",
                 int(self.forest_mask.sum()),
-                float(self.forest_mask.sum()) / max(self.forest_mask.size, 1) * 100,
+                float(self.forest_mask.mean()) * 100,
+                int(np.count_nonzero((int_raster > 0) & ~self.forest_mask)),
             )
 
         self.scores[name] = score
@@ -2349,12 +2418,14 @@ class GridBuilder:
         r = int(np.floor(float(config.URBAN_GAP_CLOSE_M) / float(self.cell_size)))
         if r < 1 or not mask.any():
             return mask
-        yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
-        disk = (xx * xx + yy * yy) <= r * r
-        closed = binary_erosion(
-            binary_dilation(mask, structure=disk), structure=disk,
-        )
-        # Le bord de la grille érode à tort : ne jamais retirer une cellule
+        # Fermeture par un disque de rayon r, en deux distances euclidiennes
+        # (GPU si dispo) : dilatation = à ≤ r d'une cellule bâtie, érosion =
+        # à > r de toute cellule hors de la dilatation. Même résultat que
+        # binary_dilation/erosion avec le disque, sans leur coût en
+        # N × surface du disque (141 M cellules à 10 m) — D62
+        dilated = np.asarray(_accel.distance_transform_edt(~mask)) <= r
+        closed = np.asarray(_accel.distance_transform_edt(dilated)) > r
+        # Ne jamais retirer une cellule
         return np.asarray(mask | closed)
 
     def apply_urban_mask(
@@ -2398,7 +2469,8 @@ class GridBuilder:
         )
         # v2 : bandes de rasterisation corrigées et vides comblés (D56) ;
         # v3 : tampons, filtre de densité et fermeture dans la clé —
-        # `--urban-buffer` resservait le masque du tampon précédent (D60)
+        # `--urban-buffer` resservait le masque du tampon précédent (D60) ;
+        # v4 : routes et voies ferrées ajoutées après la fermeture (D61)
         _params = hashlib.md5(
             repr((
                 sorted(buffer_map.items()), int(buffer_m),
@@ -2408,7 +2480,7 @@ class GridBuilder:
         ).hexdigest()[:8]
         cache_path = _accel.raster_cache_path(
             "urban_mask",
-            f"{_src_name}_v3_{_params}",
+            f"{_src_name}_v4_{_params}",
             len(urban_gdf),
             self.cell_size,
             (self.ny, self.nx),
@@ -2484,6 +2556,12 @@ class GridBuilder:
             "sports_centre", "route", "voie_ferree",
         })
 
+        # Routes et voies ferrées : hors de la fermeture des vides (D56),
+        # sinon elle comblerait la forêt entre une route et les maisons
+        # voisines, ou entre deux routes proches (D61)
+        _LINEAR_TYPES = frozenset({"route", "voie_ferree"})
+        linear_mask = np.zeros((self.ny, self.nx), dtype=bool)
+
         if "urban_type" in urban_gdf.columns:
             combined_mask = np.zeros((self.ny, self.nx), dtype=bool)
 
@@ -2515,7 +2593,10 @@ class GridBuilder:
                             binary_dilation(type_raster, iterations=iterations),
                         ).astype(bool)
 
-                combined_mask |= type_raster
+                if utype_lower in _LINEAR_TYPES:
+                    linear_mask |= type_raster
+                else:
+                    combined_mask |= type_raster
 
             self.urban_mask = combined_mask
         else:
@@ -2536,6 +2617,13 @@ class GridBuilder:
                 "   🏙️ Tissu urbain : %d cellules de rues, places et cours "
                 "ajoutées (vides de moins de %.0f m entre bâtiments, D56)",
                 n_added, 2 * config.URBAN_GAP_CLOSE_M,
+            )
+        if linear_mask.any():
+            n_before = int(self.urban_mask.sum())
+            self.urban_mask = self.urban_mask | linear_mask
+            logger.info(
+                "   🛣️ Routes principales et voies ferrées : +%d cellules (D61)",
+                int(self.urban_mask.sum()) - n_before,
             )
 
         # ── Sauvegarder en cache ──
@@ -2619,6 +2707,43 @@ class GridBuilder:
         self._log_score_stats("urban_proximity", score)
         return self
 
+    def _stand_mask(
+        self, gdf: gpd.GeoDataFrame, exclude: frozenset[str],
+    ) -> np.ndarray | None:
+        """Cellules touchées (all_touched, comme la forêt du modèle) par un
+        polygone dont l'ESSENCE brute n'est pas dans `exclude` ; None si la
+        couche n'a pas de colonne ESSENCE (rien à exclure)."""
+        if "ESSENCE" not in gdf.columns:
+            return None
+        geom = gdf.geometry
+        raw = gdf["ESSENCE"].fillna("NR").astype(str).str.strip()
+        keep = geom.notna() & ~geom.is_empty & ~raw.isin(exclude)
+        geoms = list(geom[keep])
+        if not geoms:
+            return np.zeros((self.ny, self.nx), dtype=bool)
+        return _accel.parallel_rasterize_mask(
+            geoms, out_shape=(self.ny, self.nx), transform=self.transform,
+        )
+
+    def apply_forest_water_floor(self) -> GridBuilder:
+        """D9 : dist_water ≥ DIST_WATER_FOREST_FLOOR (0,15) en forêt — cours
+        d'eau temporaires non cartographiés. Appliqué au masque forêt du
+        modèle ; il n'existait que dans apply_landcover_mask, sauté sur le
+        département (pas de landcover), et sur un masque faux (D61)."""
+        fm = self.forest_mask
+        dw = self.scores.get("dist_water")
+        if fm is None or dw is None or dw.shape != fm.shape:
+            return self
+        below = fm & (dw < DIST_WATER_FOREST_FLOOR)
+        self.scores["dist_water"] = np.where(
+            fm, np.maximum(dw, DIST_WATER_FOREST_FLOOR), dw,
+        ).astype(np.float32)
+        logger.info(
+            "   💧 dist_water : plancher %.2f en forêt, %d cellules rehaussées (D9)",
+            DIST_WATER_FOREST_FLOOR, int(below.sum()),
+        )
+        return self
+
     def compute_host_forest(
         self, forest_gdf: gpd.GeoDataFrame | None,
     ) -> GridBuilder:
@@ -2632,25 +2757,26 @@ class GridBuilder:
             logger.info("⏭️  Arbres hôtes : pas de données forêt")
             return self
         gdf = self._ensure_l93(forest_gdf)
-        geom = gdf.geometry
-        keep = geom.notna() & ~geom.is_empty
-        if "ESSENCE" in gdf.columns:
-            raw = gdf["ESSENCE"].fillna("NR").astype(str).str.strip()
-            keep &= ~raw.isin(_NON_HOST_ESSENCES)
-        geoms = list(gdf.geometry[keep])
-        if not geoms:
+        host = self._stand_mask(gdf, _NON_HOST_ESSENCES)
+        if host is None:  # pas de colonne ESSENCE : tous les polygones
+            geom = gdf.geometry
+            geoms = list(geom[geom.notna() & ~geom.is_empty])
+            host = (
+                _accel.parallel_rasterize_mask(
+                    geoms, out_shape=(self.ny, self.nx),
+                    transform=self.transform,
+                )
+                if geoms else np.zeros((self.ny, self.nx), dtype=bool)
+            )
+        if not host.any():
             logger.info("⏭️  Arbres hôtes : aucun peuplement")
             return self
-        host = _accel.parallel_rasterize_mask(
-            geoms, out_shape=(self.ny, self.nx), transform=self.transform,
-        )
         self.host_forest_mask = host
         self.dist_host_forest = (
             np.asarray(_accel.distance_transform_edt(~host)) * self.cell_size
         ).astype(np.float32)
         logger.info(
-            "✅ Arbres hôtes : %d peuplements, %.1f %% de la grille",
-            len(geoms), float(host.mean()) * 100,
+            "✅ Arbres hôtes : %.1f %% de la grille", float(host.mean()) * 100,
         )
         return self
 
@@ -2697,6 +2823,34 @@ class GridBuilder:
             logger.debug("   Pas de masque plans d'eau")
         return self
 
+    def merge_landcover_urban(
+        self, landcover_data: dict[str, Any] | None,
+    ) -> GridBuilder:
+        """Ajoute au masque urbain les zones bâties détectées par couleur
+        (landcover). À appeler juste après apply_urban_mask, avant la
+        proximité urbaine et la perturbation qui lisent le masque (D5) :
+        fusionné dans apply_landcover_mask, en fin d'étape 2, un îlot absent
+        d'OSM était éliminé mais ses voisins gardaient proximité 1,0 (D61)."""
+        if landcover_data is None or self.urban_mask is None:
+            return self
+        lc = np.asarray(landcover_data["urban_mask"])
+        if lc.shape != (self.ny, self.nx):
+            lc = np.asarray(
+                zoom(
+                    lc.astype(np.float32),
+                    (self.ny / lc.shape[0], self.nx / lc.shape[1]),
+                    order=0, grid_mode=True, mode="nearest",
+                ),
+            ) > 0.5
+        old_count = int(self.urban_mask.sum())
+        self.urban_mask = self.urban_mask | lc.astype(bool)
+        logger.info(
+            "   🔗 Fusion masques : %s (vecteur) + %s (couleur) = %s",
+            f"{old_count:,}", f"{int(self.urban_mask.sum()) - old_count:,}",
+            f"{int(self.urban_mask.sum()):,}",
+        )
+        return self
+
     def apply_landcover_mask(
         self, landcover_data: dict[str, Any] | None
     ) -> GridBuilder:
@@ -2741,22 +2895,9 @@ class GridBuilder:
                 )
             ).astype(np.float32)
 
-        # ── Fusionner masque urbain ──
-        _um_val = self.urban_mask
-        if _um_val is not None:
-            _um: np.ndarray = _um_val
-            old_count = int(_um.sum())
-            merged: np.ndarray = _um | urban_mask_lc
-            self.urban_mask = merged
-            new_count = int(merged.sum())
-            added = new_count - old_count
-            logger.info(
-                "   🔗 Fusion masques : %s (vecteur) + %s (couleur) = %s",
-                f"{old_count:,}",
-                f"{added:,}",
-                f"{new_count:,}",
-            )
-        else:
+        # Masque urbain couleur : fusionné par merge_landcover_urban, juste
+        # après apply_urban_mask (avant proximité urbaine et perturbation, D5)
+        if self.urban_mask is None:
             self.urban_mask = urban_mask_lc
 
         # ── Fix #13 : Sauvegarder tree_species brut AVANT modulation ──
@@ -2767,12 +2908,10 @@ class GridBuilder:
         green_clip = np.clip(green_score, 0.0, 1.0)
 
         # ── FIX #36 v2.3.3 : forest floor ───────────────────────
-        _FILL_NO_FOREST = 0.05
-        _raw_ts: np.ndarray | None = getattr(
-            self, "_raw_tree_species", None
-        )  # P4
-        if _raw_ts is not None:
-            forest_mask: np.ndarray = _raw_ts > _FILL_NO_FOREST
+        # Masque forêt du modèle (D61) : `_raw_ts > 0,05` comptait le
+        # hors-forêt (essence 0,5) et ratait la forêt d'essence inconnue (NaN)
+        if self.forest_mask is not None:
+            forest_mask: np.ndarray = self.forest_mask
             n_forest = int(np.sum(forest_mask))
 
             # Green floor pour critères végétation
@@ -2787,27 +2926,10 @@ class GridBuilder:
                 LANDCOVER_FOREST_FLOOR,
             )
 
-            # ── FIX #39 v2.3.4 : dist_water plancher en forêt ───
-            if "dist_water" in self.scores:
-                dw = self.scores["dist_water"]
-                dw_below = forest_mask & (dw < DIST_WATER_FOREST_FLOOR)
-                n_dw = int(np.sum(dw_below))
-                self.scores["dist_water"] = np.where(
-                    forest_mask,
-                    np.maximum(dw, DIST_WATER_FOREST_FLOOR),
-                    dw,
-                ).astype(np.float32)
-                logger.info(
-                    "   💧 dist_water forest floor : %s cellules forêt "
-                    "rehaussées (≥%.2f)",
-                    f"{n_dw:,}",
-                    DIST_WATER_FOREST_FLOOR,
-                )
-            # ── FIN FIX #39 ─────────────────────────────────────
+            # FIX #39 (plancher dist_water en forêt, D9) : appliqué à toutes
+            # les grilles par apply_forest_water_floor (D61)
         else:
-            logger.warning(
-                "   ⚠️ _raw_tree_species absent — forest floors ignorés"
-            )
+            logger.warning("   ⚠️ masque forêt absent — plancher landcover ignoré")
         # ── FIN FIX #36 ─────────────────────────────────────────
 
         # ── Fix #37 v2.3.4 : tree_species N'EST PLUS dans ──

@@ -72,6 +72,7 @@ python main.py --discover-wfs
 | `--seed` | `42` | Reproductibilité |
 | `--output-dir` | `output/` | Répertoire de sortie |
 | `--open` | off | Ouvrir la carte dans le navigateur en fin de run |
+| `--hd-map` | off | Écrire aussi `cartomorilles_hd.html`, carte haute définition pour ordinateur (images jusqu'à 64 Mpx, ~15 m sur l'Isère) ; `cartomorilles.html` reste sous 16,8 Mpx pour s'ouvrir sur téléphone |
 | `--console-hotspots` | `5` | Hotspots listés par espèce dans le résumé console (ancien nom : `--max-hotspots`) ; n'affecte ni la carte ni le CSV |
 | `--map-hotspots` | `20` | Hotspots numérotés affichés à l'ouverture de la carte (réglable ensuite dans le panneau) |
 | `--export-vector` | off | Export GPKG (volumineux) |
@@ -79,7 +80,7 @@ python main.py --discover-wfs
 | `-v` / `--verbose` | off | Tout le détail (DEBUG) à l'écran |
 | `--force` | off | Ignorer les avertissements (poids, taille grille) |
 
-Garde-fous : avertissement à 50 M cellules (TWI > 5 min), limite dure à 200 M sans `--force`.
+Garde-fous : avertissement à 50 M cellules avec la mémoire de pointe estimée (~0,4 Go par million de cellules : 14 Go à 20 m, ~26 Go à 15 m, ~58 Go à 10 m), limite dure à 200 M sans `--force`.
 
 ### Sortie console
 
@@ -96,7 +97,8 @@ Le détail (tableau des poids, statistiques par critère, validation point par p
 ## Sorties (`output/`)
 
 - `cartomorilles.html` — carte interactive : panneau latéral (espèce, légende-filtre par classe, opacité, hotspots numérotés, fonds et couches, météo), lecture du score au survol ou au toucher, popup du point touché (coordonnées à copier, liens *Itinéraire* et *Google Maps*) et bouton *Me localiser*. Le volet *Calques supplémentaires* de la section Couches affiche, un à la fois par-dessus la probabilité, les données du modèle : nature du sol (catégories géologiques BDCharm-50), essences forestières (BD Forêt v2), humidité du sol (TWI), pente et aire drainée (la morphologie qui entre dans le TWI), avec légende, part de la zone étudiée par classe et valeur sous le curseur
-- `{species}_probability.tif` — raster GeoTIFF par espèce (+ alias `morilles_probability.tif`)
+- `cartomorilles_hd.html` — avec `--hd-map` : la même carte en haute définition pour ordinateur (images jusqu'à 64 Mpx au lieu de 16,8 ; fichier ~4 fois plus lourd, ~2 Go de mémoire dans le navigateur)
+- `{species}_probability.tif` — raster GeoTIFF par espèce (+ alias `morilles_probability.tif`, lien physique vers celui de la morille grise : pas de seconde copie sur le disque)
 - `{species}_hotspots.csv` — hotspots triés par score, avec lien Google Maps ; les coordonnées (`lat`/`lon`, `x_l93`/`y_l93`) sont la cellule la mieux notée de l'amas (`max_score`), le point à viser, pas son centre
 - `{species}_hotspots.gpx` — les 20 meilleurs hotspots de la zone étudiée, en waypoints GPX pour les applis GPS (« Morille grise n°3 » = hotspot n°3 de la carte et du CSV, même point que la carte et le CSV)
 - `rapport_{species}.json` — rapport complet et reproductible (config, stats, validation terrain)
@@ -105,7 +107,7 @@ Le détail (tableau des poids, statistiques par critère, validation point par p
 
 ### Sur le terrain : téléphone et hors ligne
 
-- **Sur le téléphone** : copier `cartomorilles.html` et l'ouvrir dans le navigateur. Toucher un point affiche son score, ses coordonnées (bouton *Copier*) et un lien *Itinéraire* vers Google Maps ; les popups des hotspots ont les mêmes actions. Le bouton de localisation, sous le zoom, centre la carte sur votre position et donne le score à cet endroit ; le point bleu suit ensuite vos déplacements (toucher à nouveau : recentrer, ou arrêter si la position est visible). Le navigateur n'autorise la localisation que sur une page sûre : `https`, `localhost` ou fichier local (`file://`). Servie en `http` sur le réseau local (`http://192.168…`), la page ne peut pas localiser et le bandeau du bas le dit.
+- **Sur le téléphone** : copier `cartomorilles.html` (pas la version HD, trop lourde pour un téléphone : un canvas de plus de 16,8 Mpx ne s'ouvre pas dans Safari iOS) et l'ouvrir dans le navigateur. Toucher un point affiche son score, ses coordonnées (bouton *Copier*) et un lien *Itinéraire* vers Google Maps ; les popups des hotspots ont les mêmes actions. Le bouton de localisation, sous le zoom, centre la carte sur votre position et donne le score à cet endroit ; le point bleu suit ensuite vos déplacements (toucher à nouveau : recentrer, ou arrêter si la position est visible). Le navigateur n'autorise la localisation que sur une page sûre : `https`, `localhost` ou fichier local (`file://`). Servie en `http` sur le réseau local (`http://192.168…`), la page ne peut pas localiser et le bandeau du bas le dit.
 - **Pour un usage sans réseau fiable**, importer `{species}_hotspots.gpx` dans une appli GPS à cartes hors ligne (OsmAnd, Organic Maps, IGNrando', Locus Map, Garmin…).
 - **Ce que la carte HTML contient** : scores, pente et altitude, calques supplémentaires (images intégrées), hotspots, cours d'eau, observations iNaturalist, et les bibliothèques qui la font fonctionner : Leaflet, jQuery, leaflet-measure et les feuilles de base de Bootstrap 5 et 3, copiées dans `vendor/` (+0,36 Mo, 1,9 % d'une carte de 18,9 Mo à 50 m ; même rendu qu'avec les CDN). **Ce qu'elle va chercher sur Internet** : seulement les fonds de carte (IGN Géoplateforme `data.geopf.fr`, OpenStreetMap, Esri, OpenTopoMap). Les liens *Itinéraire* et Google Maps des popups ouvrent des sites en ligne.
 - **Hors ligne** (vérifié en rendant injoignables tous les hôtes externes cités par la page) :
@@ -154,7 +156,7 @@ Modules d'appui : `weather.py` (modulation météo J+0), `landcover_detector.py`
 Là où la BD Forêt ne donne pas l'essence, `tree_species` est noté par le mélange régional IFN (région × type de forêt × étage × substrat) et son poids devient, cellule par cellule, la **fiabilité de ce mélange** (D51) : ×1 quand une essence domine ou que les essences du mélange ont le même score, ×0 quand le mélange est aussi dispersé que l'échelle des essences de l'espèce (frênaie ou robineraie, on ne sait) — la cellule est alors notée sur ses 13 autres critères.
 
 Post-traitement :
-1. **Masques éliminatoires** (score → 0), par espèce : urbain (bâtiments ; en maille fine, rues, places et cours de moins de 80 m entre bâtiments comblées — D56) et proximité urbaine (< 15 m), eau et berges (une cellule est éliminée quand l'eau et 5 m de berge en couvrent la moitié : lacs, retenues et lits des rivières larges des surfaces en eau BD TOPO, ruisseaux de la couche hydro IGN supposés larges de 4 m, lacs de la géologie BDCharm-50 ; à 50 m, la cellule traversée par un ruisseau reste notée — D54, D55), NoData du MNT, géologie éliminatoire (morille grise : granite, gneiss, siliceux ; morille noire et cèpe : aucune), absence d'arbre hôte à moins de 30 m (cèpe seulement, mycorhizien strict — D57), pente > 45°, altitude hors plage (morille grise 100–1 400 m, morille noire 300–2 200 m, cèpe 200–2 200 m), engorgement (TWI).
+1. **Masques éliminatoires** (score → 0), par espèce : urbain (bâtiments, zones bâties, parkings, terrains de sport, routes principales et voies ferrées d'OpenStreetMap ; en maille fine, rues, places et cours de moins de 80 m entre bâtiments comblées — D56, D61), eau et berges (une cellule est éliminée quand l'eau et 5 m de berge en couvrent la moitié : lacs, retenues et lits des rivières larges des surfaces en eau BD TOPO, ruisseaux de la couche hydro IGN supposés larges de 4 m, lacs de la géologie BDCharm-50 ; à 50 m, la cellule traversée par un ruisseau reste notée — D54, D55), NoData du MNT, géologie éliminatoire (morille grise : granite, gneiss, siliceux ; morille noire et cèpe : aucune), absence d'arbre hôte à moins de 30 m (cèpe seulement, mycorhizien strict — D57), pente > 45°, altitude hors plage (morille grise 100–1 400 m, morille noire 300–2 200 m, cèpe 200–2 200 m), engorgement (TWI dont l'écoulement suit le réseau hydrographique gravé dans le MNT, cuvettes comblées — D61). La proximité urbaine n'est plus éliminatoire : c'est un critère (D61).
 2. **Pénalité de monotonie** (terrain uniforme).
 3. **Pénalité calc-dry** (chênaies/buis xérothermophiles, morille grise seulement).
 4. **Lissage gaussien spatial** (sigma configurable, défaut 0,5).

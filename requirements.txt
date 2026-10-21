@@ -1,6 +1,7 @@
 # requirements.txt
 numpy>=1.24
 scipy>=1.10
+numba>=0.58
 geopandas>=0.13
 shapely>=2.0
 rasterio>=1.3

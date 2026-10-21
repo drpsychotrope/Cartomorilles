@@ -64,7 +64,6 @@ from config import (
     BBOX_WGS84,
     CELL_SIZE,
     CONFIG_VERSION,
-    N_SCORING_GRIDS,
     PROBABILITY_LABELS,
     PROBABILITY_THRESHOLDS,
     SCORE_THRESHOLD_HIGH,
@@ -80,7 +79,7 @@ from grid_builder import GridBuilder
 from scoring import MorilleScoring
 from species_enricher import SpeciesEnricher
 from utils import TO_L93, compute_array_stats, hotspot_to_export_dict
-from visualize import MorilleVisualizer
+from visualize import HD_MAX_PIXELS, MorilleVisualizer
 from visualize import _display_value as display_label  # libellés de la carte
 from weather import WeatherChecker
 
@@ -109,7 +108,10 @@ _ZONE_LABEL = f"Isère 38 — {_ZONE_DX_KM:.0f}×{_ZONE_DY_KM:.0f} km"
 
 # ── Garde mémoire (cellules max sans --force) ─────────────────
 _MAX_CELLS = 200_000_000  # 200M — protège contre cell_size=5m accidentel
-_WARN_CELLS = 50_000_000  # 50M — avertit sur temps de calcul TWI D8
+_WARN_CELLS = 50_000_000  # 50M — avertit sur la mémoire et la durée
+# Mémoire de pointe mesurée : 14,3 Go pour 35,2 M cellules (20 m, trois
+# espèces, carte HD) ≈ 410 octets par cellule (D62)
+_PEAK_BYTES_PER_CELL = 410
 
 # ── Résumé console / carte ────────────────────────────────────
 _CONSOLE_HOTSPOTS_DEFAULT = 5   # hotspots listés par espèce en fin de run
@@ -546,7 +548,7 @@ def estimate_grid_size(cell_size: float) -> dict[str, Any]:
     nx = int(dx / cell_size)
     ny = int(dy / cell_size)
     n_cells = nx * ny
-    mem_mb = n_cells * 4 * N_SCORING_GRIDS / 1024 / 1024  # float32
+    mem_mb = n_cells * _PEAK_BYTES_PER_CELL / 1e6  # pic mesuré (D62)
 
     return {
         "dx_m": dx, "dy_m": dy,
@@ -1220,7 +1222,8 @@ def _layer_label(gdf: Any, name: str) -> str | None:
 
 # Mentions affichées à côté de certains fichiers du résumé
 _OUTPUT_NOTES: dict[str, str] = {
-    "morilles_probability.tif": "copie de esculenta_probability.tif",
+    "morilles_probability.tif": "même fichier que esculenta_probability.tif",
+    "cartomorilles_hd.html": "carte HD pour ordinateur",
     "cartomorilles.log": "journal détaillé",
 }
 
@@ -1231,11 +1234,14 @@ def display_outputs(output_dir: Path, files: list[Path]) -> None:
     present = [f for f in dict.fromkeys(files) if f.is_file()]
     if not present:
         return
-    sizes = [f.stat().st_size for f in present]
+    stats = [f.stat() for f in present]
+    sizes = [s.st_size for s in stats]
+    # Un lien physique (alias morilles_probability.tif) ne compte qu'une fois
+    total = sum({(s.st_dev, s.st_ino): s.st_size for s in stats}.values())
     width = max(len(f.name) for f in present)
     logger.info("")
     logger.info(
-        "📁 Fichiers produits dans %s (%s) :", output_dir, _fr_size(sum(sizes)),
+        "📁 Fichiers produits dans %s (%s) :", output_dir, _fr_size(total),
     )
     for f, size in zip(present, sizes):
         note = _OUTPUT_NOTES.get(f.name)
@@ -1400,8 +1406,8 @@ def main(args: argparse.Namespace) -> int:
 
     if est["n_cells"] > _WARN_CELLS:
         logger.warning(
-            "⚠️  %s cellules — TWI D8 peut prendre >5 min",
-            f"{est['n_cells']:,}",
+            "⚠️  %s cellules — mémoire de pointe ~%.0f Go, calcul long",
+            f"{est['n_cells']:,}", est["mem_estimate_mb"] / 1000,
         )
 
     # ── Discovery WFS (mode spécial) ─────────────────────────
@@ -1647,7 +1653,10 @@ def main(args: argparse.Namespace) -> int:
     grid = GridBuilder()
 
     # ── 2a. Terrain de base (MNT → altitude, pente, aspect) ──
-    grid.compute_terrain(dem_data)
+    # Cours d'eau et surfaces en eau gravés dans le MNT de routage du TWI
+    grid.compute_terrain(
+        dem_data, streams=[hydro_gdf, water_surfaces_gdf],
+    )
 
     # ── 2b. Scores terrain ────────────────────────────────────
     # Tables de la 1re espèce modélisée, comme l'enrichissement (2c') :
@@ -1669,6 +1678,8 @@ def main(args: argparse.Namespace) -> int:
     grid.score_tree_species(forest_gdf, species=first_species)
     # Peuplements d'arbres hôtes : élimination « sans arbre hôte » (D57)
     grid.compute_host_forest(forest_gdf)
+    # Plancher dist_water en forêt (D9), sur le masque forêt (D61)
+    grid.apply_forest_water_floor()
 
     logger.debug("   ▸ Géologie (%s)...", geology_source)
     grid.score_geology(geology_gdf, species=first_species)
@@ -1696,6 +1707,8 @@ def main(args: argparse.Namespace) -> int:
     logger.debug("   ▸ Application masque urbain...")
     urban_buffer: int = args.urban_buffer if not args.no_urban else 0
     grid.apply_urban_mask(urban_gdf, buffer_m=urban_buffer)
+    # Zones bâties détectées par couleur : avant proximité et perturbation
+    grid.merge_landcover_urban(landcover_data)
 
     # ── 2d'. Score proximité urbaine (EDT sur masque urbain) ──
     logger.debug("   ▸ Score proximité urbaine...")
@@ -1842,6 +1855,13 @@ def main(args: argparse.Namespace) -> int:
         # ── Validation terrain par espèce ──
         concordance_by_species[species] = validate_against_terrain(sp_model)
 
+        # Mémoire : critères de l'espèce et masques par facteur ne servent
+        # plus qu'à l'export vecteur et aux couches de diagnostic (8 grilles
+        # float32 et 9 masques par espèce : ~5 Go par espèce à 10 m, D62)
+        if not (args.export_vector or args.debug_layers):
+            sp_model.scores = {}
+            sp_model.elimination_detail = {}
+
         models[species] = sp_model
         logger.info(
             "   ✓ %s : %s hotspots — %s",
@@ -1889,6 +1909,26 @@ def main(args: argparse.Namespace) -> int:
     html_path = output_dir / "cartomorilles.html"
     _cleanup_files.append(str(html_path))
     produced.append(viz.create_folium_map(html_path))
+    # Carte HD pour ordinateur (D62) : mêmes données, images jusqu'à 64 Mpx
+    hd_path: Path | None = None
+    if args.hd_map:
+        hd_viz = MorilleVisualizer(
+            models,
+            hotspots=hotspots_by_species,
+            hydro_gdf=hydro_gdf,
+            urban_gdf=urban_gdf,
+            inat_observations=_inat_obs,
+            weather_days=weather_days,
+            debug_layers=args.debug_layers,
+            study_area=geology_gdf if geology_source == "bdcharm50" else None,
+            default_hotspots_shown=args.map_hotspots,
+            forest_gdf=forest_gdf,
+            max_render_pixels=HD_MAX_PIXELS,
+        )
+        hd_path = output_dir / "cartomorilles_hd.html"
+        _cleanup_files.append(str(hd_path))
+        produced.append(hd_viz.create_folium_map(hd_path))
+        del hd_viz
 
     # GeoTIFF raster — UN par espèce
     for sp in species_list:
@@ -1905,9 +1945,16 @@ def main(args: argparse.Namespace) -> int:
     src = output_dir / "esculenta_probability.tif"
     if src in produced:
         try:
+            import os
             import shutil
             dst = output_dir / "morilles_probability.tif"
-            shutil.copy2(src, dst)
+            dst.unlink(missing_ok=True)
+            # Lien physique (même fichier, pas de 2e copie de ~100–450 Mo) ;
+            # copie si le système de fichiers ne le permet pas
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
             _cleanup_files.append(str(dst))
             produced.append(dst)
         except Exception as e:
@@ -2023,6 +2070,10 @@ def main(args: argparse.Namespace) -> int:
 
     map_uri = html_path.resolve().as_uri()
     logger.info("")
+    if hd_path is not None:
+        logger.info(
+            "🗺️  Carte HD (ordinateur) : %s", hd_path.resolve().as_uri(),
+        )
     if args.open:
         logger.info("🗺️  Carte : %s", map_uri)
         _open_in_browser(map_uri)
@@ -2220,6 +2271,12 @@ Exemples d'utilisation :
     output_group.add_argument(
         "--export-vector", action="store_true",
         help="Exporter la grille en GPKG vecteur (volumineux).",
+    )
+    output_group.add_argument(
+        "--hd-map", action="store_true",
+        help="Écrit aussi cartomorilles_hd.html : images jusqu'à 64 Mpx "
+             "(~15 m sur l'Isère), pour ordinateur ; la carte par défaut "
+             "reste sous 16,8 Mpx pour s'ouvrir sur téléphone (D62)",
     )
     output_group.add_argument(
         "--open", action="store_true",

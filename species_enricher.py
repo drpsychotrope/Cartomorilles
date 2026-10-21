@@ -33,7 +33,6 @@ import numpy as np
 
 import _accel
 import config
-from utils import TO_L93 as _TO_L93
 
 try:
     import geopandas as gpd

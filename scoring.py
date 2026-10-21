@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from scipy.ndimage import (
-    binary_dilation,
     binary_erosion,
     distance_transform_edt,
     generate_binary_structure,
@@ -468,24 +467,11 @@ class MorilleScoring:
                 int(twi_elim.sum()),
             )
             
-        # ── Proximité urbaine éliminatoire ──
-        dist_urban = getattr(self.grid, "dist_urban_grid", None)
-        if isinstance(dist_urban, np.ndarray) and dist_urban.shape == (ny, nx):
-            _existing_urban = detail.get(
-                "urban", np.zeros((ny, nx), dtype=bool)
-            )
-            urban_prox_elim = (
-                np.isfinite(dist_urban)
-                & (dist_urban < config.URBAN_DIST_ELIMINATORY)
-                & ~_existing_urban
-            )
-            detail["urban_proximity"] = urban_prox_elim
-            combined |= urban_prox_elim
-            logger.info(
-                "  Proximité urb. (<%.0fm) : %8d cellules",
-                config.URBAN_DIST_ELIMINATORY,
-                int(urban_prox_elim.sum()),
-            )
+        # Proximité urbaine (< 15 m) : plus éliminatoire (D61). Distance de
+        # centre à centre en mailles entières, elle n'éliminait rien dès
+        # 15 m de maille (20 et 50 m) et un anneau d'une maille à 10 m ; le
+        # masque urbain déborde déjà des bâtiments (all_touched + tampon) et
+        # le critère urban_proximity garde sa rampe.
 
         # ── Sans arbre hôte (D57) : espèce mycorhizienne stricte ──
         host_max = self.params.get("host_tree_max_dist_m")
