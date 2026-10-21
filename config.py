@@ -90,6 +90,7 @@ __all__ = [
     "WEIGHTS",
     # Espèces (multi-species depuis v2.6.0)
     "SPECIES_PARAMS", "SUPPORTED_SPECIES", "DEFAULT_SPECIES",
+    "get_species_params", "species_with_taxon",
     # Essences
     "TREE_SCORES", "TREE_ALIASES",
     "resolve_tree_name", "get_tree_score",
@@ -284,6 +285,7 @@ _TREE_SCORES_DICT: dict[str, float] = {
     "epicea":             0.45,
     "pin_sylvestre":      0.45,
     "douglas":            0.30,
+    "meleze":             0.30,   # D49 : mélézins = morille noire, pas la grise
     # ── Essences peu/pas favorables ──
     "platane":            0.20,
     "robinier":           0.15,
@@ -366,6 +368,8 @@ _TREE_ALIASES_DICT: dict[str, str] = {
     # ── Châtaignier ──
     "castanea": "chataignier", "châtaignier": "chataignier",
     "castanea_sativa": "chataignier",
+    # ── Mélèze ──
+    "larix": "meleze", "larix_decidua": "meleze",
 }
 
 TREE_SCORES: MappingProxyType[str, float] = MappingProxyType(
@@ -668,6 +672,7 @@ TREE_LABELS: MappingProxyType[str, str] = MappingProxyType({
     "epicea":           "Épicéa",
     "pin_sylvestre":    "Pin sylvestre",
     "douglas":          "Douglas",
+    "meleze":           "Mélèze",
     "platane":          "Platane",
     "robinier":         "Robinier",
     "chene":            "Chêne",
@@ -1045,6 +1050,7 @@ _TREE_SCORES_EDULIS_DICT: dict[str, float] = {
     "epicea":             1.00,   # pessière montagnarde — optimal
     "pin_sylvestre":      0.85,
     "douglas":            0.70,
+    "meleze":             0.70,   # D49 : cèpes des mélézins
     # ── Essences peu/pas favorables ──
     "platane":            0.10,
     "robinier":           0.30,   # allélopathique
@@ -1114,17 +1120,93 @@ _ASPECT_SCORES_EDULIS: MappingProxyType[str, float] = MappingProxyType(
     _ASPECT_SCORES_EDULIS_DICT,
 )
 
+# ── Morille noire (groupe Morchella elata : elata, conica, deliciosa,
+#    purpurascens) — D49. Conifères montagnards optimaux, feuillus de plaine
+#    médiocres ; sols acides notés bas mais pas éliminés.
+_TREE_SCORES_ELATA_DICT: dict[str, float] = {
+    # ── Conifères montagnards : optimum ──
+    "sapin":              0.95,
+    "epicea":             0.95,   # BD Forêt confond « Sapin, épicéa »
+    "meleze":             0.85,   # mélézins (Oisans, Belledonne)
+    "pin_sylvestre":      0.60,   # pins à crochets, cembro, noir y sont résolus
+    "douglas":            0.40,
+    # ── Feuillus de montagne (hêtraies-sapinières) ──
+    "hetre":              0.60,
+    "erable":             0.50,
+    "bouleau":            0.40,   # pionnier après coupe ou chablis
+    "noisetier":          0.40,
+    "tilleul":            0.35,
+    # ── Feuillus de plaine : habitat de la morille grise, pas de la noire ──
+    "frene":              0.30,
+    "orme":               0.30,
+    "pommier":            0.30,
+    "poirier":            0.30,
+    "chataignier":        0.30,
+    "aulne":              0.30,
+    "charme":             0.30,
+    "peuplier":           0.25,
+    "saule":              0.20,
+    "chene":              0.20,
+    "chene_pubescent":    0.10,
+    "robinier":           0.10,
+    "platane":            0.05,
+    "buis":               0.05,
+    # ── Forêt sans essence connue : exclue de la moyenne (D46) ──
+    "unknown":            float("nan"),
+}
+
+_GEOLOGY_SCORES_ELATA_DICT: dict[str, float] = {
+    # ── Calcaires : optimum, comme la grise ──
+    "calcaire":              1.00,
+    "calcaire_marneux":      0.90,
+    "dolomie":               0.85,
+    "eboulis_calcaire":      0.70,
+    "marne":                 0.70,
+    "calcaire_lacustre":     0.70,
+    "alluvions_calcaires":   0.60,
+    # ── Dépôts de montagne : fréquents sous les pessières ──
+    "moraine":               0.80,
+    "colluvions":            0.65,
+    "flysch":                0.60,
+    # ── Alluviaux et intermédiaires ──
+    "alluvions":             0.45,
+    "molasse":               0.45,
+    "schiste":               0.40,
+    "sable":                 0.40,
+    "alluvions_recentes":    0.35,
+    "gres":                  0.35,
+    "hydrographie":          0.30,
+    # ── Sols acides : notés bas, pas éliminatoires (≠ grise) ──
+    "granite":               0.25,
+    "gneiss":                0.25,
+    "siliceux":              0.25,
+    "remblai":               0.10,
+    # ── Par défaut ──
+    "unknown":               0.35,
+}
+
+_TREE_SCORES_ELATA: MappingProxyType[str, float] = MappingProxyType(
+    _TREE_SCORES_ELATA_DICT,
+)
+_GEOLOGY_SCORES_ELATA: MappingProxyType[str, float] = MappingProxyType(
+    _GEOLOGY_SCORES_ELATA_DICT,
+)
+
 # ── Liste des espèces supportées + défaut ──
-SUPPORTED_SPECIES: Final[tuple[str, ...]] = ("esculenta", "edulis")
+SUPPORTED_SPECIES: Final[tuple[str, ...]] = ("esculenta", "elata", "edulis")
 DEFAULT_SPECIES: Final[str] = "esculenta"
 
 # ── SPECIES_PARAMS : dispatch par espèce ──
-# Esculenta = morille (référence existante, ALT/SLOPE/ASPECT/TWI inchangés).
+# Esculenta = morille grise (référence existante, ALT/SLOPE/ASPECT/TWI inchangés).
+# Elata     = morille noire (conifères montagnards, D49).
 # Edulis    = cèpe   (paramètres distincts, validés brainstorming).
+# "taxon" = (nom, rang) GBIF des occurrences naturalistes de l'espèce ; les
+# deux morilles partagent le genre Morchella (observateurs peu fiables entre
+# grise et noire).
 _SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
     "esculenta": MappingProxyType({
-        "common_name":           "Morille",
-        "common_name_plural":    "morilles",
+        "common_name":           "Morille grise",
+        "common_name_plural":    "morilles grises",
         "scientific_name":       "Morchella esculenta",
         "tree_scores":           TREE_SCORES,
         "geology_scores":        GEOLOGY_SCORES,
@@ -1143,6 +1225,30 @@ _SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
         "twi_waterlog":          TWI_WATERLOG,            # 18
         "apply_calcdry":         True,
         "apply_monotony":        True,
+        "taxon":                 ("Morchella", "GENUS"),
+    }),
+    "elata": MappingProxyType({
+        "common_name":           "Morille noire",
+        "common_name_plural":    "morilles noires",
+        "scientific_name":       "Morchella elata (groupe)",
+        "tree_scores":           _TREE_SCORES_ELATA,
+        "geology_scores":        _GEOLOGY_SCORES_ELATA,
+        "eliminatory_geology":   frozenset(),             # ∅ — sols acides notés bas
+        "altitude_optimal":      (800.0, 1500.0),
+        "altitude_range":        (500.0, 1900.0),
+        "alt_eliminatory_min":   300.0,
+        "alt_eliminatory_max":   2200.0,                  # limite des arbres, mélézins
+        "slope_optimal":         (0.0, 30.0),
+        "slope_max":             45.0,
+        "aspect_scores":         ASPECT_SCORES,           # comme la grise
+        "aspect_ref_deg":        180.0,                   # sud
+        "twi_optimal":           TWI_OPTIMAL,             # comme la grise
+        "twi_dry_limit":         TWI_DRY_LIMIT,
+        "twi_wet_limit":         TWI_WET_LIMIT,
+        "twi_waterlog":          TWI_WATERLOG,
+        "apply_calcdry":         False,                   # anti-habitat xérique de plaine
+        "apply_monotony":        True,
+        "taxon":                 ("Morchella", "GENUS"),  # occurrences partagées avec la grise
     }),
     "edulis": MappingProxyType({
         "common_name":           "Cèpe",
@@ -1165,6 +1271,7 @@ _SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
         "twi_waterlog":          16.0,
         "apply_calcdry":         False,                   # OFF — cèpe pas anti-xérique
         "apply_monotony":        True,
+        "taxon":                 ("Boletus edulis", "SPECIES"),
     }),
 }
 
@@ -1176,6 +1283,15 @@ SPECIES_PARAMS: MappingProxyType[str, MappingProxyType[str, Any]] = MappingProxy
 def get_species_params(species: str) -> MappingProxyType[str, Any]:
     """Retourne les paramètres d'une espèce (fallback default si inconnue)."""
     return SPECIES_PARAMS.get(species, SPECIES_PARAMS[DEFAULT_SPECIES])
+
+
+def species_with_taxon(taxon_name: str) -> tuple[str, ...]:
+    """Espèces modélisées (ordre de SUPPORTED_SPECIES) dont le taxon
+    naturaliste porte ce nom : « Morchella » → les deux morilles (D49)."""
+    return tuple(
+        sp for sp in SUPPORTED_SPECIES
+        if SPECIES_PARAMS[sp]["taxon"][0] == taxon_name
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1317,6 +1433,16 @@ def validate_config() -> bool:
             ok = False
             continue
         params = SPECIES_PARAMS[sp_name]
+        taxon = params.get("taxon")
+        if (
+            not isinstance(taxon, tuple) or len(taxon) != 2
+            or not all(isinstance(t, str) and t for t in taxon)
+        ):
+            logger.error(
+                "SPECIES_PARAMS['%s'].taxon doit être (nom, rang) : %r",
+                sp_name, taxon,
+            )
+            ok = False
         # Scores [0,1] ; « unknown » = NaN (exclu de la moyenne, D46)
         for tree_key, tree_val in params["tree_scores"].items():
             if tree_key == "unknown" and math.isnan(tree_val):

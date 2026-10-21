@@ -132,11 +132,11 @@ class EnrichGridScoresBySpecies(unittest.TestCase):
             enricher._observations = [{
                 "nom": "test", "xmin": x0 - 1, "xmax": x0 + 1,
                 "ymin": y0 - 1, "ymax": y0 + 1,
-                "essences": {"hêtre": 0.5, "frêne": 0.3, "mélèze": 0.2},
+                "essences": {"hêtre": 0.5, "frêne": 0.3, "feuillus": 0.2},
             }]
             enricher.enrich_grid_scores(grid, species=species)
             table = config.get_species_params(species)["tree_scores"]
-            # mélèze : sans score (NaN) → ignoré, poids renormalisés (D46)
+            # « feuillus » : sans score (NaN) → ignoré, poids renormalisés (D46)
             expected = (0.5 * table["hetre"] + 0.3 * table["frene"]) / 0.8
             self.assertAlmostEqual(
                 float(grid.scores["tree_species"][1, 1]), expected, places=5,
@@ -150,7 +150,7 @@ class GetTreeScoreBySpecies(unittest.TestCase):
     def test_species_table(self) -> None:
         edulis = config.get_species_params("edulis")["tree_scores"]
         self.assertEqual(config.get_tree_score("hêtre", "edulis"), edulis["hetre"])
-        self.assertTrue(np.isnan(config.get_tree_score("mélèze", "edulis")))
+        self.assertTrue(np.isnan(config.get_tree_score("feuillus", "edulis")))
 
 
 if __name__ == "__main__":
