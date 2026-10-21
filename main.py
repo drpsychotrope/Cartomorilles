@@ -109,9 +109,11 @@ _ZONE_LABEL = f"Isère 38 — {_ZONE_DX_KM:.0f}×{_ZONE_DY_KM:.0f} km"
 # ── Garde mémoire (cellules max sans --force) ─────────────────
 _MAX_CELLS = 200_000_000  # 200M — protège contre cell_size=5m accidentel
 _WARN_CELLS = 50_000_000  # 50M — avertit sur la mémoire et la durée
-# Mémoire de pointe mesurée : 14,3 Go pour 35,2 M cellules (20 m, trois
-# espèces, carte HD) ≈ 410 octets par cellule (D62)
-_PEAK_BYTES_PER_CELL = 410
+# Mémoire de pointe mesurée (trois espèces, carte HD) : 13,0 Go pour 35,2 M
+# cellules (20 m), 36,1 Go pour 140,9 M (10 m) ≈ 5,3 Go fixes (données
+# vectorielles, MNT natif, GPU) + 220 octets par cellule (D62)
+_PEAK_FIXED_BYTES = 5.3e9
+_PEAK_BYTES_PER_CELL = 220
 
 # ── Résumé console / carte ────────────────────────────────────
 _CONSOLE_HOTSPOTS_DEFAULT = 5   # hotspots listés par espèce en fin de run
@@ -548,7 +550,7 @@ def estimate_grid_size(cell_size: float) -> dict[str, Any]:
     nx = int(dx / cell_size)
     ny = int(dy / cell_size)
     n_cells = nx * ny
-    mem_mb = n_cells * _PEAK_BYTES_PER_CELL / 1e6  # pic mesuré (D62)
+    mem_mb = (_PEAK_FIXED_BYTES + n_cells * _PEAK_BYTES_PER_CELL) / 1e6  # D62
 
     return {
         "dx_m": dx, "dy_m": dy,

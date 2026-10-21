@@ -2002,7 +2002,7 @@ class MorilleVisualizer:
             /* ═══════ Couleurs : LUT score → couleur continue + classe ═══════ */
             /* Classe d'un pixel : celle de son score R / 200, sauf si le canal G
                la corrige (G = 1 + classe du score exact, troncature au 1/200) */
-            function clsAt(px, o) { var g = px[o + 1]; return g ? g - 1 : lutCls[px[o]]; }
+            function clsOf(s, i) { var g = s.g[i]; return g ? g - 1 : lutCls[s.v[i]]; }
             var lutRgb = new Uint8ClampedArray((N + 1) * 3), lutCls = new Uint8Array(N + 1);
             /* Arrêts de la palette calés sur les seuils de l'espèce (0, seuils,
                1) : chaque classe garde sa couleur quels que soient ses seuils. */
@@ -2031,12 +2031,38 @@ class MorilleVisualizer:
 
             /* ═══════ Données : score par espèce + terrain (R=pente, G+B=altitude) ═══════ */
             var dataPx = {}, dataW = 0, dataH = 0, terrainPx = null;
-            function pixels(img) {
+            /* Pixels lus par bandes de 512 lignes (petit canvas : ni pic de
+               mémoire ni limite de surface des canvas iOS) ; seuls les canaux
+               utiles sont gardés, 1 octet chacun au lieu de 4 par pixel (D62) */
+            var STRIP = 512;
+            function channels(img, keep) {
+                var w = img.naturalWidth, h = img.naturalHeight, n = w * h;
+                var out = keep.map(function () { return new Uint8Array(n); });
                 var c = document.createElement('canvas');
-                c.width = img.naturalWidth; c.height = img.naturalHeight;
+                c.width = w; c.height = Math.min(STRIP, h);
                 var ctx = c.getContext('2d', {willReadFrequently: true});
-                ctx.drawImage(img, 0, 0);
-                return ctx.getImageData(0, 0, c.width, c.height).data;
+                for (var y0 = 0; y0 < h; y0 += STRIP) {
+                    var hh = Math.min(STRIP, h - y0), base = y0 * w;
+                    ctx.clearRect(0, 0, w, c.height);
+                    ctx.drawImage(img, 0, y0, w, hh, 0, 0, w, hh);
+                    var d = ctx.getImageData(0, 0, w, hh).data;
+                    for (var j = 0; j < keep.length; j++) {
+                        var arr = out[j], ch = keep[j];
+                        for (var i = 0, m = w * hh; i < m; i++) { arr[base + i] = d[i * 4 + ch]; }
+                    }
+                }
+                c.width = 0; c.height = 0;
+                return out;
+            }
+            function scorePixels(img) {          /* R = score × 200, G = correction */
+                var ch = channels(img, [0, 1]);
+                return {v: ch[0], g: ch[1]};
+            }
+            function terrainPixels(img) {        /* R = pente, G + B = altitude */
+                var ch = channels(img, [0, 1, 2]), n = ch[0].length;
+                var alt = new Uint16Array(n), lo = ch[1], hi = ch[2];
+                for (var i = 0; i < n; i++) { alt[i] = lo[i] | (hi[i] << 8); }
+                return {slope: ch[0], alt: alt};
             }
 
             /* ═══════ Calque image = canvas, mis à jour par putImageData ═══════ */
@@ -2074,11 +2100,13 @@ class MorilleVisualizer:
                 var alphaByCls = ALPHA.map(function (a, i) {
                     return visible[i] ? Math.round(a * 255) : 0;
                 });
+                var sv = src.v, sg = src.g;
                 for (var i = 0, n = dataW * dataH; i < n; i++) {
-                    var o = i * 4, v = src[o];
+                    var v = sv[i];
                     if (v > N) { continue; }
-                    var a = alphaByCls[clsAt(src, o)];   /* classe exacte (D60) */
+                    var g = sg[i], a = alphaByCls[g ? g - 1 : lutCls[v]];   /* classe exacte (D60) */
                     if (!a) { continue; }
+                    var o = i * 4;
                     dd[o] = lutRgb[v * 3]; dd[o + 1] = lutRgb[v * 3 + 1];
                     dd[o + 2] = lutRgb[v * 3 + 2]; dd[o + 3] = a;
                 }
@@ -2345,12 +2373,12 @@ class MorilleVisualizer:
                 return (extraLuts[x.key] = lut);
             }
             function extraPixels(x) {
-                if (x.src === 'terrain') { return terrainPx; }
+                if (x.src === 'terrain') { return terrainPx ? terrainPx.slope : null; }
                 if (extraPx[x.key]) { return extraPx[x.key]; }
                 var img = document.getElementById('cartom-extra-img-' + x.key);
                 if (img && !img.getAttribute('src')) {
                     img.addEventListener('load', function () {
-                        extraPx[x.key] = pixels(img);
+                        extraPx[x.key] = channels(img, [0])[0];
                         img.removeAttribute('src');   /* image décodée libérée */
                         if (extraKey === x.key) { renderExtra(); }
                         if (pointPopup.isOpen()) { pointPopup.update(); }
@@ -2370,23 +2398,24 @@ class MorilleVisualizer:
                     return;
                 }
                 var px = extraPixels(x), area = dataPx[current];
-                if (!px || !area || px.length !== area.length) { return; }
+                if (!px || !area || px.length !== area.v.length) { return; }
                 var lut = extraLut(x), c = document.createElement('canvas');
                 c.width = dataW; c.height = dataH;
                 var ctx = c.getContext('2d'), out = ctx.createImageData(dataW, dataH), dd = out.data;
                 /* Une seule couche supplémentaire gardée : libérer les autres
-                   (une image pleine grille pèse 4 octets par pixel) */
+                   (le canvas d'une couche pèse 4 octets par pixel) */
                 Object.keys(extraOverlays).forEach(function (k) {
                     if (k !== x.key) { delete extraOverlays[k]; }
                 });
                 Object.keys(extraPx).forEach(function (k) {
                     if (k !== x.key) { delete extraPx[k]; }
                 });
+                var av = area.v;
                 for (var i = 0, n = dataW * dataH; i < n; i++) {
-                    var o = i * 4;
-                    if (area[o] === OUT) { continue; }
-                    var k = px[o] * 4;
+                    if (av[i] === OUT) { continue; }
+                    var k = px[i] * 4;
                     if (!lut[k + 3]) { continue; }
+                    var o = i * 4;
                     dd[o] = lut[k]; dd[o + 1] = lut[k + 1]; dd[o + 2] = lut[k + 2]; dd[o + 3] = 255;
                 }
                 ctx.putImageData(out, 0, 0);
@@ -2437,13 +2466,13 @@ class MorilleVisualizer:
                 if (m2 >= 1e6) { return fmt(m2 / 1e6, m2 >= 1e7 ? 0 : 1) + ' km²'; }
                 return areaText(m2 / 1e4);
             }
-            /* Valeur du calque affiché au pixel o (texte), dans la zone étudiée */
-            function extraValue(o) {
+            /* Valeur du calque affiché au pixel i (texte), dans la zone étudiée */
+            function extraValue(i) {
                 var x = extraByKey[extraKey];
                 if (!x || x.unit === 'deg') { return null; }   /* pente : déjà lue */
-                var px = x.src === 'terrain' ? terrainPx : extraPx[x.key];
+                var px = x.src === 'terrain' ? (terrainPx && terrainPx.slope) : extraPx[x.key];
                 if (!px) { return null; }
-                var k = px[o];
+                var k = px[i];
                 if (x.kind === 'cat') {
                     var c = k === x.none ? null : x.byCode[k];
                     if (c) { return x.short + ' : ' + c.label; }
@@ -2490,20 +2519,20 @@ class MorilleVisualizer:
                 var py = Math.floor((yN - mercY(ll.lat)) / (yN - yS) * dataH);
                 px = Math.max(0, Math.min(px, dataW - 1));
                 py = Math.max(0, Math.min(py, dataH - 1));
-                var o = (py * dataW + px) * 4, v = d[o];
+                var i = py * dataW + px, v = d.v[i];
                 if (v > N && v !== OUT) { return {state: 'nodata'}; }
                 /* Hors zone étudiée (D39) : pas de score, mais le terrain */
                 var cell = v === OUT ? {state: 'outside'}
-                    : {state: 'ok', s: v / N, cls: clsAt(d, o)};
+                    : {state: 'ok', s: v / N, cls: clsOf(d, i)};
                 if (terrainPx) {
-                    var alt = terrainPx[o + 1] + (terrainPx[o + 2] << 8);
+                    var alt = terrainPx.alt[i], slp = terrainPx.slope[i];
                     if (alt > 0) { cell.alt = Math.round(alt - CFG.altOffset); }
-                    if (terrainPx[o] > 0) {
-                        cell.slope = (terrainPx[o] - CFG.slopeOffset) / CFG.slopeScale;
+                    if (slp > 0) {
+                        cell.slope = (slp - CFG.slopeOffset) / CFG.slopeScale;
                     }
                 }
                 if (v !== OUT) {
-                    var ex = extraValue(o);
+                    var ex = extraValue(i);
                     if (ex) { cell.extra = ex; }
                 }
                 return cell;
@@ -2749,12 +2778,12 @@ class MorilleVisualizer:
             function ready(img) { return img && img.complete && img.naturalWidth > 0; }
             function start() {
                 if (!imgs.every(ready)) { return; }
-                CFG.speciesList.forEach(function (sp, i) { dataPx[sp] = pixels(imgs[i]); });
+                CFG.speciesList.forEach(function (sp, i) { dataPx[sp] = scorePixels(imgs[i]); });
                 dataW = imgs[0].naturalWidth; dataH = imgs[0].naturalHeight;
                 /* Pixels copiés : images décodées et chaînes base64 libérées */
                 imgs.forEach(function (img) { img.removeAttribute('src'); });
                 if (ready(terrainImg) && terrainImg.naturalWidth === dataW) {
-                    terrainPx = pixels(terrainImg);
+                    terrainPx = terrainPixels(terrainImg);
                     terrainImg.removeAttribute('src');
                 } else {   /* calque de pente lu dans le PNG terrain : indisponible */
                     EXTRA.forEach(function (x) {
