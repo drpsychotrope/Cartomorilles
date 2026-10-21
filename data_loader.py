@@ -27,6 +27,7 @@ from typing import Any
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import rasterio
 import requests
 from rasterio.errors import RasterioIOError
@@ -81,6 +82,8 @@ IGN_HYDRO_LAYERS: tuple[str, ...] = (
     "BDTOPO_V3:cours_d_eau",
     "HYDROGRAPHY.HYDROGRAPHY:cours_d_eau",
 )
+# Surfaces en eau (lacs, lits des rivières larges) : rives du masque (D55)
+IGN_WATER_SURFACE_LAYER: str = "BDTOPO_V3:surface_hydrographique"
 
 BRGM_GEOLOGY_LAYERS: tuple[str, ...] = (
     "GEOLOGIE.CARTE_GEOL_HARM_50.V1:polygones",
@@ -1754,6 +1757,81 @@ class DataLoader:
                 continue
 
         raise RuntimeError("Aucune couche hydro IGN via WFS")
+
+    def load_water_surfaces(self) -> gpd.GeoDataFrame | None:
+        """Surfaces en eau BD TOPO (lacs, retenues, mares, lits des rivières
+        de plus de 7,5 m de large) : cache → WFS IGN. Glaciers et névés
+        écartés. None si indisponible : le modèle n'a alors que les lignes
+        de cours d'eau et les lacs de la géologie (D55)."""
+        cache = self._cache_path("hydro_surf")
+        gdf = self._safe_read_cache(cache)
+        if gdf is not None:
+            return gdf
+        try:
+            gdf = self._download_wfs_paged(IGN_WATER_SURFACE_LAYER)
+        except Exception as e:
+            logger.warning("⚠️ Surfaces en eau IGN indisponibles : %s", e)
+            return None
+        if gdf is None or gdf.empty:
+            return None
+        if "nature" in gdf.columns:
+            glacier = gdf["nature"].fillna("").str.contains(
+                "glacier|névé", case=False, regex=True,
+            )
+            gdf = gdf.loc[~glacier]
+        keep = [c for c in ("cleabs", "nature", "persistance") if c in gdf.columns]
+        gdf = gpd.GeoDataFrame(gdf[keep], geometry=gdf.geometry, crs=TARGET_CRS)
+        gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
+        logger.info("✅ Surfaces en eau WFS : %d polygones", len(gdf))
+        self._save_cache(gdf, cache)
+        return gdf
+
+    def _download_wfs_paged(
+        self, layer: str, page: int = 5000,
+    ) -> gpd.GeoDataFrame | None:
+        """Toutes les entités d'une couche WFS IGN dans l'emprise tamponnée,
+        par pages de `page` (le service plafonne une réponse à 5 000)."""
+        bbox_str = (
+            f"{self.bbox_buffered['xmin']},{self.bbox_buffered['ymin']},"
+            f"{self.bbox_buffered['xmax']},{self.bbox_buffered['ymax']}"
+        )
+        frames: list[gpd.GeoDataFrame] = []
+        start = 0
+        while True:
+            params: dict[str, Any] = {
+                "service": "WFS",
+                "version": "2.0.0",
+                "request": "GetFeature",
+                "typeName": layer,
+                "outputFormat": "application/json",
+                "srsName": TARGET_CRS,
+                "bbox": bbox_str + f",{TARGET_CRS}",
+                "count": str(page),
+                "startIndex": str(start),
+            }
+            data = _wfs_request(
+                "https://data.geopf.fr/wfs/ows", params, timeout=180,
+            )
+            features = data["features"]
+            if features:
+                frames.append(
+                    gpd.GeoDataFrame.from_features(features, crs=TARGET_CRS),
+                )
+            logger.info(
+                "💧 WFS %s : %d entités (page %d)",
+                layer, len(features), start // page + 1,
+            )
+            if len(features) < page:
+                break
+            start += page
+        if not frames:
+            return None
+        gdf = gpd.GeoDataFrame(
+            pd.concat(frames, ignore_index=True), crs=TARGET_CRS,
+        )
+        if "cleabs" in gdf.columns:
+            gdf = gdf.drop_duplicates(subset="cleabs")
+        return gdf
 
     def _download_hydro_osm(self) -> gpd.GeoDataFrame | None:
         """

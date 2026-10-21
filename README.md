@@ -29,7 +29,7 @@ Dépendances principales : `numpy`, `scipy`, `geopandas`, `shapely`, `rasterio`,
 | Géologie | `geologie_38/GEO050K_HARM_038_S_FGEOL_2154.shp` | BRGM BDCharm-50 |
 | Régions IFN | `rfifn250_l93.shp` | IFN |
 
-Hydrographie et zones urbaines sont récupérées via WFS IGN à défaut de fichier local. L'occupation du sol est dérivée par analyse couleur des tuiles OSM.
+Hydrographie (cours d'eau, et surfaces en eau BD TOPO pour les rives) et zones urbaines sont récupérées via WFS IGN à défaut de fichier local, puis gardées en cache dans `data/`. L'occupation du sol est dérivée par analyse couleur des tuiles OSM.
 
 ---
 
@@ -154,7 +154,7 @@ Modules d'appui : `weather.py` (modulation météo J+0), `landcover_detector.py`
 Là où la BD Forêt ne donne pas l'essence, `tree_species` est noté par le mélange régional IFN (région × type de forêt × étage × substrat) et son poids devient, cellule par cellule, la **fiabilité de ce mélange** (D51) : ×1 quand une essence domine ou que les essences du mélange ont le même score, ×0 quand le mélange est aussi dispersé que l'échelle des essences de l'espèce (frênaie ou robineraie, on ne sait) — la cellule est alors notée sur ses 13 autres critères.
 
 Post-traitement :
-1. **Masques éliminatoires** (score → 0), par espèce : urbain et proximité urbaine (< 15 m), plans d'eau (cours d'eau de la couche hydro IGN, lacs et retenues de la géologie BDCharm-50 — D54), NoData du MNT, géologie éliminatoire (morille grise : granite, gneiss, siliceux ; morille noire et cèpe : aucune), pente > 45°, altitude hors plage (morille grise 100–1 400 m, morille noire 300–2 200 m, cèpe 200–2 200 m), engorgement (TWI).
+1. **Masques éliminatoires** (score → 0), par espèce : urbain et proximité urbaine (< 15 m), eau et berges (une cellule est éliminée quand l'eau et 5 m de berge en couvrent la moitié : lacs, retenues et lits des rivières larges des surfaces en eau BD TOPO, ruisseaux de la couche hydro IGN supposés larges de 4 m, lacs de la géologie BDCharm-50 ; à 50 m, la cellule traversée par un ruisseau reste notée — D54, D55), NoData du MNT, géologie éliminatoire (morille grise : granite, gneiss, siliceux ; morille noire et cèpe : aucune), pente > 45°, altitude hors plage (morille grise 100–1 400 m, morille noire 300–2 200 m, cèpe 200–2 200 m), engorgement (TWI).
 2. **Pénalité de monotonie** (terrain uniforme).
 3. **Pénalité calc-dry** (chênaies/buis xérothermophiles, morille grise seulement).
 4. **Lissage gaussien spatial** (sigma configurable, défaut 0,5).

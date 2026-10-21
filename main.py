@@ -1497,6 +1497,8 @@ def main(args: argparse.Namespace) -> int:
 
     # ── 1e. Autres couches vectorielles ───────────────────────
     hydro_gdf = loader.load_hydro(args.hydro)
+    # Surfaces en eau BD TOPO : rives des lacs et des rivières larges (D55)
+    water_surfaces_gdf = loader.load_water_surfaces()
 
     urban_gdf = None
     if not args.no_urban:
@@ -1555,6 +1557,7 @@ def main(args: argparse.Namespace) -> int:
         "MNT", forest_label,
         _layer_label(geology_gdf, geology_label),
         _layer_label(hydro_gdf, "hydrographie"),
+        _layer_label(water_surfaces_gdf, "surfaces en eau"),
         _layer_label(urban_gdf, "urbain"),
         "occupation du sol OSM" if landcover_data else None,
     ]
@@ -1610,7 +1613,7 @@ def main(args: argparse.Namespace) -> int:
 
     # ── 2c. Scores écologiques (données vectorielles) ─────────
     logger.debug("   ▸ Distance eau...")
-    grid.score_distance_water(hydro_gdf)
+    grid.score_distance_water(hydro_gdf, water_surfaces_gdf)
 
     logger.debug("   ▸ Essences forestières...")
     grid.score_tree_species(forest_gdf)

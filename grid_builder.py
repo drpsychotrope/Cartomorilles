@@ -30,6 +30,7 @@ from typing import Any
 
 import geopandas as gpd
 import numpy as np
+import shapely
 from affine import Affine
 from pyproj import Transformer
 from rasterio.features import rasterize
@@ -120,6 +121,10 @@ _CANOPY_BASE_INTERIOR: float = 0.55       # v2.5.3 : 0.45 → 0.55 — relève p
 _CANOPY_SLOPE_BONUS: float = 0.10         # trouées naturelles 10-30°
 _CANOPY_ALT_BONUS: float = 0.05           # structure montagnarde 300-800m
 _CANOPY_SPECIES_BONUS: float = 0.05       # essences favorables (score > 0.40)
+
+# Taille maximale des sous-cellules qui mesurent la part d'une cellule
+# couverte par l'eau et sa berge (D55)
+_COVER_SUBCELL_M: float = 10.0
 
 
 def _categorical_cache_key(lookup: np.ndarray, codes: np.ndarray) -> str:
@@ -1058,12 +1063,47 @@ class GridBuilder:
     #  SCORES ÉCOLOGIQUES (données vectorielles)
     # ═══════════════════════════════════════════════════════
 
+    def _cover_fraction(self, geoms: np.ndarray) -> np.ndarray:
+        """Part de chaque cellule couverte par des polygones (0–1), mesurée
+        sur des sous-cellules de ≤ _COVER_SUBCELL_M (centre dedans)."""
+        k = max(1, int(np.ceil(float(self.cell_size) / _COVER_SUBCELL_M)))
+        shapes = [(g, 1) for g in geoms if g is not None and not g.is_empty]
+        if not shapes:
+            return np.zeros((self.ny, self.nx), dtype=np.float32)
+        sub = np.asarray(rasterize(
+            shapes,
+            out_shape=(self.ny * k, self.nx * k),
+            transform=from_bounds(
+                self.bbox["xmin"], self.bbox["ymin"],
+                self.bbox["xmax"], self.bbox["ymax"],
+                self.nx * k, self.ny * k,
+            ),
+            fill=0,
+            dtype=np.uint8,
+            all_touched=False,
+        ))
+        counts = sub.reshape(self.ny, k, self.nx, k).sum(
+            axis=(1, 3), dtype=np.uint16,
+        )
+        return counts.astype(np.float32) / float(k * k)
+
     def score_distance_water(
-        self, hydro_gdf: gpd.GeoDataFrame | None
+        self,
+        hydro_gdf: gpd.GeoDataFrame | None,
+        surfaces_gdf: gpd.GeoDataFrame | None = None,
     ) -> GridBuilder:
-        """Score de distance aux cours d'eau et plans d'eau."""
+        """Score de distance à l'eau, et masque des bords de l'eau (D55).
+
+        Eau = cours d'eau linéaires de la couche hydro (tamponnés de leur
+        demi-largeur supposée STREAM_HALF_WIDTH_M) et surfaces en eau
+        (polygones de la couche hydro et surfaces BD TOPO `surfaces_gdf` :
+        lacs, lits des rivières larges). Une cellule est éliminée quand l'eau
+        et sa berge de WATER_BANK_EXCLUSION_M en couvrent au moins la
+        moitié ; une cellule touchée par l'eau sans être éliminée est une
+        berge, notée, à la distance moyenne de sa partie non exclue.
+        """
         if self._skip_zero_weight("dist_water"):
-            return self        
+            return self
         self._require_terrain()
 
         if hydro_gdf is None or hydro_gdf.empty:
@@ -1080,23 +1120,21 @@ class GridBuilder:
 
         hydro_gdf = self._ensure_l93(hydro_gdf)
 
-        # ── Rasteriser TOUTES les entités hydro ──
-        water_shapes: list[tuple[Any, int]] = []
-        for _, row in hydro_gdf.iterrows():
-            geom = row.geometry
-            if geom is None or geom.is_empty:
-                continue
-            if geom.geom_type in ("LineString", "MultiLineString"):
-                try:
-                    buffered = geom.buffer(2.0)
-                    if buffered.is_valid and not buffered.is_empty:
-                        water_shapes.append((buffered, 1))
-                except Exception:
-                    continue
-            elif geom.geom_type in ("Polygon", "MultiPolygon"):
-                water_shapes.append((geom, 1))
+        # ── Lignes (cours d'eau sans largeur connue) et surfaces en eau ──
+        geoms = list(hydro_gdf.geometry)
+        if surfaces_gdf is not None and not surfaces_gdf.empty:
+            geoms += list(self._ensure_l93(surfaces_gdf).geometry)
+        arr = np.asarray(
+            [g for g in geoms if g is not None and not g.is_empty],
+            dtype=object,
+        )
+        type_ids = (
+            shapely.get_type_id(arr) if arr.size else np.zeros(0, dtype=int)
+        )
+        lines = arr[np.isin(type_ids, (1, 5))]       # (Multi)LineString
+        polys = arr[np.isin(type_ids, (3, 6))]       # (Multi)Polygon
 
-        if not water_shapes:
+        if not lines.size and not polys.size:
             logger.warning("⚠️ Aucune géométrie hydro valide")
             self.scores["dist_water"] = np.full(
                 (self.ny, self.nx), 0.3, dtype=np.float32
@@ -1107,21 +1145,36 @@ class GridBuilder:
             self.water_mask = np.zeros((self.ny, self.nx), dtype=bool)
             return self
 
-        water_raster: np.ndarray = np.asarray(rasterize(
-            water_shapes,
+        half = float(config.STREAM_HALF_WIDTH_M)
+        bank = float(config.WATER_BANK_EXCLUSION_M)
+        water_geoms = np.concatenate([shapely.buffer(lines, half), polys])
+        zone_geoms = np.concatenate([
+            shapely.buffer(lines, half + bank), shapely.buffer(polys, bank),
+        ])
+
+        # Cellules touchées par l'eau : origine de la distance à l'eau
+        water = np.asarray(rasterize(
+            [(g, 1) for g in water_geoms if g is not None and not g.is_empty],
             out_shape=(self.ny, self.nx),
             transform=self.transform,
             fill=0,
             dtype=np.uint8,
             all_touched=True,
-        ))
-        self.water_mask = water_raster.astype(bool)
+        )).astype(bool)
+        # Éliminées : l'eau et sa berge de `bank` m en couvrent la moitié.
+        # À 50 m, un ruisseau (bande de 2 × 7 m) couvre ~30 % de la cellule
+        # qu'il traverse : elle reste notée ; le lit de l'Isère, non (D55).
+        self.water_mask = self._cover_fraction(zone_geoms) >= 0.5
 
-        # Distance euclidienne en mètres (EDT)
+        # Distance euclidienne en mètres (EDT) à toute l'eau
         dist_grid: np.ndarray = (
-            _accel.distance_transform_edt(~self.water_mask)
-            * self.cell_size
+            _accel.distance_transform_edt(~water) * self.cell_size
         )
+        banks = water & ~self.water_mask
+        if banks.any():
+            # Berge : distance moyenne à l'eau de sa partie non exclue,
+            # entre la bande exclue et le bord de la cellule
+            dist_grid[banks] = (half + bank + float(self.cell_size) / 2.0) / 2.0
         self.dist_water_grid = dist_grid
 
         # ── Score de distance (courbe continue) ──
@@ -1184,10 +1237,15 @@ class GridBuilder:
             else 0.0
         )
         logger.info(
-            "   Distance eau : %.0f–%.0fm, %d cellules en eau",
+            "   Distance eau : %.0f–%.0fm, %d cellules éliminées (eau et "
+            "berge de %.0f m), %d berges notées (D55) ; %d lignes, %d surfaces",
             _dist_min,
             float(np.max(dist_grid)),
             int(_wm.sum()),
+            float(config.WATER_BANK_EXCLUSION_M),
+            int(banks.sum()),
+            int(lines.size),
+            int(polys.size),
         )
         self._log_score_stats("dist_water", score)
         return self
@@ -2494,10 +2552,10 @@ class GridBuilder:
         """
         Applique le masque des plans d'eau — Fix #24.
 
-        Met les scores à 0 pour les cellules en eau : entités de la couche
-        hydro (score_distance_water), et lacs ou retenues de la géologie
-        BDCharm-50 (D54) — la couche hydro IGN n'a que des lignes, un lac y
-        était noté comme une terre.
+        Met les scores à 0 pour les cellules en eau : surfaces de la couche
+        hydro, cours d'eau en maille fine seulement (score_distance_water),
+        et lacs ou retenues de la géologie BDCharm-50 (D54) — la couche
+        hydro IGN n'a que des lignes, un lac y était noté comme une terre.
         """
         lakes = self._geology_water_cells()
         if lakes is not None and lakes.any():

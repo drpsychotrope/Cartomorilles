@@ -148,7 +148,7 @@ _CMAP = mcolors.LinearSegmentedColormap.from_list("morilles", list(_CMAP_STOPS))
 _ELIM_LABEL_MAP: dict[str, tuple[str, str]] = {
     "urban": ("Exclu : zones urbaines", "#555555"),
     "urban_proximity": ("Exclu : abords urbains", "#777777"),
-    "water": ("Exclu : plans d'eau", "#0077cc"),
+    "water": ("Exclu : eau et berge de 5 m", "#0077cc"),
     "nodata": ("Exclu : MNT manquant", "#000000"),
     "species": ("Exclu : essences", "#8b0000"),
     "geology": ("Exclu : géologie", "#800080"),

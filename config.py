@@ -108,6 +108,7 @@ __all__ = [
     # Hydrographie
     "DIST_WATER_OPTIMAL", "DIST_WATER_GOOD", "DIST_WATER_MODERATE",
     "DIST_WATER_MAX", "DIST_WATER_FOREST_FLOOR", "WATER_TYPE_BONUS",
+    "STREAM_HALF_WIDTH_M", "WATER_BANK_EXCLUSION_M",
     # TWI
     "TWI_OPTIMAL", "TWI_DRY_LIMIT", "TWI_WET_LIMIT", "TWI_WATERLOG",
     "TWI_DRY_FLOOR", "TWI_WET_FLOOR",
@@ -791,6 +792,15 @@ DIST_WATER_MAX: Final[float] = 1000.0
 # D9 : plancher 0.15 pour cellules forestières (cours d'eau temporaires)
 DIST_WATER_FOREST_FLOOR: Final[float] = 0.15
 
+# Bords de l'eau (D55) : la berge est exclue sur WATER_BANK_EXCLUSION_M
+# depuis la rive (choix de l'utilisateur : 5 m, pas la maille entière).
+# Une cellule est éliminée si son centre tombe dans l'eau ou dans cette
+# bande. Rive = contour des surfaces en eau BD TOPO (lacs, lits des
+# rivières de plus de 7,5 m) ; un cours d'eau sans surface est une ligne,
+# de demi-largeur supposée STREAM_HALF_WIDTH_M.
+STREAM_HALF_WIDTH_M: Final[float] = 2.0
+WATER_BANK_EXCLUSION_M: Final[float] = 5.0
+
 _WATER_TYPE_BONUS_DICT: dict[str, float] = {
     "bras_mort":        1.30,
     "plan_eau":         1.20,
@@ -1381,6 +1391,14 @@ def validate_config() -> bool:
     # ── BBOX valide ──
     if BBOX["xmin"] >= BBOX["xmax"] or BBOX["ymin"] >= BBOX["ymax"]:
         logger.error("BBOX dégénéré : %s", dict(BBOX))
+        ok = False
+
+    # ── Bords de l'eau (D55) ──
+    if STREAM_HALF_WIDTH_M <= 0 or WATER_BANK_EXCLUSION_M < 0:
+        logger.error(
+            "STREAM_HALF_WIDTH_M=%.1f / WATER_BANK_EXCLUSION_M=%.1f invalides",
+            STREAM_HALF_WIDTH_M, WATER_BANK_EXCLUSION_M,
+        )
         ok = False
 
     # ── Cell size raisonnable ──

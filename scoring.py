@@ -400,7 +400,7 @@ class MorilleScoring:
         if isinstance(water, np.ndarray) and water.shape == (ny, nx):
             detail["water"] = water.copy()
             combined |= water
-            logger.info("  Plans d'eau      : %8d cellules", int(water.sum()))
+            logger.info("  Eau et berges    : %8d cellules", int(water.sum()))
 
         # ── NoData ──
         nodata = getattr(self.grid, "nodata_mask", None)
