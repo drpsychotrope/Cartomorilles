@@ -18,6 +18,7 @@ v2.4.1 — Rasterisation parallèle + cache (forêt type, substrat depuis
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -467,6 +468,20 @@ _CY: float = 6_458_800.0
 
 
 # ═══════════════════════════════════════════════════════════════════
+# FIABILITÉ DU MÉLANGE IFN — poids par cellule de tree_species (D51)
+# ═══════════════════════════════════════════════════════════════════
+
+@functools.lru_cache(maxsize=None)
+def _table_variance(species: str) -> float:
+    """Variance des scores notés de la table d'essences de l'espèce : la
+    dispersion de l'échelle sur laquelle un mélange doit situer la cellule.
+    Un mélange aussi dispersé que l'échelle ne la situe nulle part (D51)."""
+    table = config.get_species_params(species)["tree_scores"]
+    scores = [float(v) for v in table.values() if not np.isnan(v)]
+    return float(np.var(scores)) if len(scores) > 1 else 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════
 class SpeciesEnricher:
     """
     Enrichit les essences forestières via cascade A→B→C→D.
@@ -671,6 +686,10 @@ class SpeciesEnricher:
         Appelé APRÈS score_tree_species(), AVANT apply_landcover_mask(),
         puis après chaque recompute_species_scores() : celui-ci réécrit le
         critère depuis la table brute et perd l'enrichissement.
+
+        Pose aussi `grid.weight_factors["tree_species"]` (D51) : 1 partout
+        sauf sur les cellules notées par un mélange IFN (niveaux B+D), qui
+        reçoivent la fiabilité du mélange (`_mix_score_strength`).
         """
         t0 = _time.perf_counter()
 
@@ -790,13 +809,24 @@ class SpeciesEnricher:
                 )
 
         # ── Niveaux B+D — vectorisé par combo keys ────────────────
-        enriched = self._compute_regional_scores(
+        enriched, strength = self._compute_regional_scores(
             _alt, rg_grid, ft_grid, enrichable,
             substrate_grid=sub_grid, species=species,
         )
 
         n_final = int(np.count_nonzero(enrichable))
         tree_scores[enrichable] = enriched[enrichable]
+
+        # ── Poids par cellule de tree_species = fiabilité du mélange (D51) ──
+        # Essence connue, lande, observation : poids plein ; mélange IFN :
+        # sa fiabilité (0 = critère exclu de la cellule, comme D46)
+        weight = np.ones_like(tree_scores, dtype=np.float32)
+        weight[enrichable] = strength[enrichable]
+        factors = getattr(grid, "weight_factors", None)
+        if factors is None:
+            factors = {}
+            grid.weight_factors = factors
+        factors["tree_species"] = weight
 
         # Propager dans _raw_tree_species si présent
         raw = getattr(grid, "_raw_tree_species", None)
@@ -811,6 +841,7 @@ class SpeciesEnricher:
             "%d sans essence notée → exclues de la moyenne (D46)",
             n_scored, mean_s, n_final - n_scored,
         )
+        self._log_mix_strength(strength[scored], species)
 
         # ── Stats finales ──────────────────────────────────────────
         if int_raster is not None and code_to_name is not None:
@@ -850,6 +881,23 @@ class SpeciesEnricher:
         dt = _time.perf_counter() - t0
         logger.info("   ⏱️  Enrichissement : %.1fs", dt)
 
+    @staticmethod
+    def _log_mix_strength(rel: np.ndarray, species: str) -> None:
+        """Résumé de la fiabilité des mélanges IFN notés (D51)."""
+        n = int(rel.size)
+        if n == 0:
+            return
+        n_zero = int(np.count_nonzero(rel <= 0.0))
+        n_full = int(np.count_nonzero(rel >= 0.999))
+        logger.info(
+            "  Fiabilité des mélanges IFN [%s] (D51) : poids ×%.2f en "
+            "moyenne — %d cellules à ×0 (prior exclu, %.0f %%), "
+            "%d entre les deux, %d à ×1 ; σ table = %.3f",
+            species, float(rel.mean()), n_zero, n_zero / n * 100,
+            n - n_zero - n_full, n_full,
+            float(np.sqrt(_table_variance(species))),
+        )
+
     # ═══════════════════════════════════════════════════════════════
     # SCORES RÉGIONAUX — vectorisé par combo keys (v2.4.1)
     # ═══════════════════════════════════════════════════════════════
@@ -862,16 +910,20 @@ class SpeciesEnricher:
         mask: np.ndarray,
         substrate_grid: np.ndarray | None = None,
         species: str = config.DEFAULT_SPECIES,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Calcule les scores enrichis — vectorisé par combo keys.
 
         Encode (region, forest_type, altitude_band, substrate) en clé int32,
         itère uniquement sur les combinaisons présentes dans le masque.
         Table d'essences de l'espèce modélisée `species` (D47).
-        NaN là où le mélange régional n'apporte aucune essence notée (D46).
+
+        Retourne (scores, fiabilités) : score NaN là où le mélange régional
+        n'apporte aucune essence notée (D46) ; fiabilité du mélange retenu
+        (`_mix_score_strength`, D51), 0 sans essence notée. NaN hors masque.
         """
         result = np.full_like(altitude, np.nan, dtype=np.float32)
+        strength = np.full_like(altitude, np.nan, dtype=np.float32)
 
         # ── Bande altitudinale ─────────────────────────────────────
         alt_idx = np.zeros_like(altitude, dtype=np.int8)
@@ -883,8 +935,8 @@ class SpeciesEnricher:
             and np.any(substrate_grid > 0)
         )
 
-        # ── Pré-calcul lookup (region_key, ft, band, sub) → score ─
-        lookup: dict[tuple[str, int, int, int], float] = {}
+        # ── Pré-calcul lookup (region_key, ft, band, sub) → (score, fiabilité) ─
+        lookup: dict[tuple[str, int, int, int], tuple[float, float]] = {}
         all_keys = set(self._region_key_map.values()) | {"_default"}
 
         for rk in all_keys:
@@ -894,7 +946,7 @@ class SpeciesEnricher:
             for ft in range(_FT_LANDE):  # 0..3
                 filtered = self._filter_by_forest_type(props, ft)
                 for bi in range(len(_ALT_BANDS)):
-                    lookup[(rk, ft, bi, 0)] = self._weighted_morel_score(
+                    lookup[(rk, ft, bi, 0)] = self._mix_score_strength(
                         filtered, bi, species,
                     )
                     if has_substrate:
@@ -904,7 +956,7 @@ class SpeciesEnricher:
                                 filtered, sub_key,
                             )
                             lookup[(rk, ft, bi, sub_code)] = (
-                                self._weighted_morel_score(
+                                self._mix_score_strength(
                                     modulated, bi, species,
                                 )
                             )
@@ -923,9 +975,12 @@ class SpeciesEnricher:
 
         # ── Unique keys sur le masque uniquement ───────────────────
         keys_in_mask = combo[mask]
-        unique_keys = np.unique(keys_in_mask)
+        unique_keys, inverse = np.unique(keys_in_mask, return_inverse=True)
+        score_lut = np.full(unique_keys.size, np.nan, dtype=np.float32)
+        strength_lut = np.zeros(unique_keys.size, dtype=np.float32)
+        no_mix: tuple[float, float] = (float("nan"), 0.0)
 
-        for key in unique_keys:
+        for i, key in enumerate(unique_keys):
             r_int = int(key // 1000)
             ft = int((key % 1000) // 100)
             bi = int((key % 100) // 10)
@@ -934,20 +989,24 @@ class SpeciesEnricher:
             rk = self._region_key_map.get(r_int, "_default")
 
             # Mélange le plus précis qui ait un score, sinon régional,
-            # sinon défaut ; NaN si aucun n'en a
+            # sinon défaut ; NaN si aucun n'en a. La fiabilité suit le
+            # mélange retenu.
             candidates = (
-                lookup.get((rk, ft, bi, sv), np.nan),
-                lookup.get((rk, ft, bi, 0), np.nan),
-                lookup.get(("_default", ft, bi, 0), np.nan),
+                lookup.get((rk, ft, bi, sv), no_mix),
+                lookup.get((rk, ft, bi, 0), no_mix),
+                lookup.get(("_default", ft, bi, 0), no_mix),
             )
-            score = next(
-                (c for c in candidates if not np.isnan(c)), float("nan"),
+            score, rel = next(
+                (c for c in candidates if not np.isnan(c[0])), no_mix,
             )
+            score_lut[i] = score
+            strength_lut[i] = rel
 
-            group_mask = mask & (combo == key)
-            result[group_mask] = np.float32(score)
+        # Une seule affectation par grille (au lieu d'un masque par combo)
+        result[mask] = score_lut[inverse.ravel()]
+        strength[mask] = strength_lut[inverse.ravel()]
 
-        return result
+        return result, strength
 
     @staticmethod
     def _apply_substrate_modifiers(
@@ -1011,30 +1070,68 @@ class SpeciesEnricher:
         Les essences sans score (« feuillus », « conifères »… → NaN, D46)
         n'apportent aucune information : ignorées, poids renormalisés sur
         les autres. NaN si aucune essence du mélange n'a de score."""
-        w_sum = 0.0
-        w_total = 0.0
+        return SpeciesEnricher._mix_score_strength(
+            proportions, band_idx, species,
+        )[0]
+
+    @staticmethod
+    def _mix_score_strength(
+        proportions: dict[str, float],
+        band_idx: int,
+        species: str = config.DEFAULT_SPECIES,
+    ) -> tuple[float, float]:
+        """Score d'un mélange d'essences (`_weighted_morel_score`) et sa
+        fiabilité ∈ [0, 1], poids du critère tree_species dans la cellule
+        (D51).
+
+        Poids de chaque essence w = proportion × affinité de la bande.
+        Fiabilité = part notée × max(0, 1 − σ² / σ²_table), où la part notée
+        est Σw des essences notées / Σw de tout le mélange, σ² la variance
+        de leurs scores (mêmes poids) et σ²_table la variance de la table
+        d'essences de l'espèce (`_table_variance`). C'est la part de la
+        dispersion de l'échelle que le mélange lève, une essence sans score
+        pouvant être n'importe où sur l'échelle :
+          - une essence dominante, ou des essences de même score → 1 :
+            le prior régional pèse comme une essence connue (D47) ;
+          - un mélange aussi dispersé que l'échelle (frênaie ou robineraie,
+            on ne sait) → 0 : le critère est exclu de la moyenne de la
+            cellule, comme une essence inconnue (D46).
+        Score NaN et fiabilité 0 si aucune essence du mélange n'a de score."""
+        w_all = 0.0
+        weighted: list[tuple[float, float]] = []
 
         for essence, proportion in proportions.items():
             if proportion <= 0:
                 continue
+
+            aff = _ALT_AFFINITY.get(essence)
+            affinity = aff[band_idx] if aff and band_idx < len(aff) else 1.0
+            w = proportion * affinity
+            if w <= 0:
+                continue
+            w_all += w
 
             score = config.get_tree_score(essence, species)
             if np.isnan(score):
                 continue
             if score < 0:
                 score = 0.25
+            weighted.append((w, score))
 
-            aff = _ALT_AFFINITY.get(essence)
-            affinity = aff[band_idx] if aff and band_idx < len(aff) else 1.0
-
-            w = proportion * affinity
-            w_sum += w * score
-            w_total += w
-
+        w_total = sum(w for w, _ in weighted)
         if w_total < 1e-10:
-            return float("nan")
+            return float("nan"), 0.0
 
-        return float(np.clip(w_sum / w_total, 0.05, 1.0))
+        mean = sum(w * s for w, s in weighted) / w_total
+        var = sum(w * (s - mean) ** 2 for w, s in weighted) / w_total
+        var_ref = _table_variance(species)
+        explained = 1.0 - var / var_ref if var_ref > 0 else 1.0
+        strength = (w_total / w_all) * max(0.0, explained)
+
+        return (
+            float(np.clip(mean, 0.05, 1.0)),
+            float(np.clip(strength, 0.0, 1.0)),
+        )
 
     # ═══════════════════════════════════════════════════════════════
     # GRILLE SUBSTRAT — depuis geology int raster (zéro rasterisation)

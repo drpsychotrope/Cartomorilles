@@ -38,6 +38,31 @@ def _expected_mix_score(region_key: str, species: str) -> float:
     return float(np.clip(num / den, 0.05, 1.0))
 
 
+def _table_var(species: str) -> float:
+    """Variance des scores notés de la table d'essences de l'espèce."""
+    table = config.get_species_params(species)["tree_scores"]
+    return float(np.var([v for v in table.values() if not np.isnan(v)]))
+
+
+def _expected_mix_strength(region_key: str, species: str) -> float:
+    """Part notée × (1 − σ²/σ²_table), poids p × affinité (bande 0), D51."""
+    table = config.get_species_params(species)["tree_scores"]
+    scored: list[tuple[float, float]] = []
+    w_all = 0.0
+    for essence, p in se._REGIONAL_PROPORTIONS[region_key].items():
+        w = p * se._ALT_AFFINITY.get(essence, (1.0,))[0]
+        if w <= 0:
+            continue
+        w_all += w
+        score = float(table.get(config.resolve_tree_name(essence), table["unknown"]))
+        if not np.isnan(score):
+            scored.append((w, score))
+    w_sc = sum(w for w, _ in scored)
+    mean = sum(w * s for w, s in scored) / w_sc
+    var = sum(w * (s - mean) ** 2 for w, s in scored) / w_sc
+    return max(0.0, w_sc / w_all * (1.0 - var / _table_var(species)))
+
+
 def _fake_grid(ny: int = 3, nx: int = 4) -> SimpleNamespace:
     """Grille minimale : ligne 0 = hêtre, lignes 1-2 = essence inconnue,
     colonne 0 = hors forêt (code 0)."""
@@ -152,6 +177,106 @@ class EnrichGridScoresBySpecies(unittest.TestCase):
             self.assertAlmostEqual(
                 float(grid.scores["tree_species"][1, 1]), expected, places=5,
             )
+
+
+class MixStrength(unittest.TestCase):
+    """Fiabilité d'un mélange d'essences (D51) : part notée × (1 − σ²/σ²_table)."""
+
+    def test_essences_of_equal_score_give_full_strength(self) -> None:
+        # Tilleul et érable : 0,65 tous deux pour la morille grise → σ = 0
+        score, strength = SpeciesEnricher._mix_score_strength(
+            {"tilleul": 0.5, "érable_champêtre": 0.5}, 0, "esculenta",
+        )
+        self.assertAlmostEqual(score, 0.65, places=6)
+        self.assertAlmostEqual(strength, 1.0, places=6)
+
+    def test_split_between_extremes_gives_zero_strength(self) -> None:
+        # Frêne 1,0 (aff. 1,8) / robinier 0,15 (aff. 1,5) à parts égales :
+        # moyenne 0,6136, σ² = 0,179, plus que la table entière (≈ 0,082)
+        score, strength = SpeciesEnricher._mix_score_strength(
+            {"frêne": 0.5, "robinier": 0.5}, 0, "esculenta",
+        )
+        self.assertAlmostEqual(score, 0.6136, places=4)
+        self.assertEqual(strength, 0.0)
+
+    def test_unscored_share_scales_strength(self) -> None:
+        # « Feuillus » : sans score (D46), affinité 1 → part notée
+        # 0,75 / (0,75 + 0,5) = 0,6 ; tilleul seul noté → σ = 0
+        score, strength = SpeciesEnricher._mix_score_strength(
+            {"tilleul": 0.5, "feuillus": 0.5}, 0, "esculenta",
+        )
+        self.assertAlmostEqual(score, 0.65, places=6)
+        self.assertAlmostEqual(strength, 0.6, places=6)
+
+    def test_partial_dispersion_interpolates(self) -> None:
+        # Montagnard inférieur : hêtre 0,75 (aff. 1,5), tilleul 0,65 (aff. 0,5)
+        # → parts 0,75 / 0,25, moyenne 0,725, σ² = 0,001875
+        score, strength = SpeciesEnricher._mix_score_strength(
+            {"hêtre": 0.5, "tilleul": 0.5}, 1, "esculenta",
+        )
+        self.assertAlmostEqual(score, 0.725, places=6)
+        self.assertAlmostEqual(
+            strength, 1.0 - 0.001875 / _table_var("esculenta"), places=6,
+        )
+        self.assertTrue(0.9 < strength < 1.0)
+
+    def test_no_scored_essence_gives_nan_score_and_zero_strength(self) -> None:
+        score, strength = SpeciesEnricher._mix_score_strength(
+            {"feuillus": 1.0}, 0, "esculenta",
+        )
+        self.assertTrue(np.isnan(score))
+        self.assertEqual(strength, 0.0)
+
+
+class EnrichGridWeightFactors(unittest.TestCase):
+    """Poids par cellule de tree_species posé par l'enrichissement (D51)."""
+
+    def test_ifn_cells_weighted_by_mix_strength(self) -> None:
+        for species in ("esculenta", "elata", "edulis"):
+            grid = _fake_grid()
+            _Enricher().enrich_grid_scores(grid, species=species)
+            unknown = grid._tree_species_int_raster == _CODE_UNKNOWN
+            np.testing.assert_allclose(
+                grid.weight_factors["tree_species"][unknown],
+                _expected_mix_strength("gresivaudan", species), atol=1e-6,
+            )
+
+    def test_gresivaudan_collineen_mix_carries_no_weight_for_grey_morel(self) -> None:
+        # σ = 0,30 du mélange (frêne 1,0 … robinier 0,15) > σ de la table :
+        # le prior reste posé mais ne pèse plus (exclusion D46)
+        grid = _fake_grid()
+        _Enricher().enrich_grid_scores(grid, species="esculenta")
+        unknown = grid._tree_species_int_raster == _CODE_UNKNOWN
+        np.testing.assert_array_equal(
+            grid.weight_factors["tree_species"][unknown], 0.0,
+        )
+        self.assertTrue(np.all(np.isfinite(grid.scores["tree_species"][unknown])))
+        # Morille noire : feuillus de plaine tous médiocres → prior fiable
+        grid = _fake_grid()
+        _Enricher().enrich_grid_scores(grid, species="elata")
+        self.assertTrue(
+            np.all(grid.weight_factors["tree_species"][unknown] > 0.3),
+        )
+
+    def test_known_no_forest_lande_and_observed_cells_keep_full_weight(self) -> None:
+        grid = _fake_grid()
+        enricher = _Enricher()
+        ft = np.zeros((grid.ny, grid.nx), dtype=np.int8)
+        ft[2, :] = se._FT_LANDE
+        enricher._forest_type_grid = ft
+        x0, y0 = float(grid.x_coords[1]), float(grid.y_coords[1])
+        enricher._observations = [{
+            "nom": "test", "xmin": x0 - 1, "xmax": x0 + 1,
+            "ymin": y0 - 1, "ymax": y0 + 1, "essences": {"hêtre": 1.0},
+        }]
+        enricher.enrich_grid_scores(grid, species="esculenta")
+        w = grid.weight_factors["tree_species"]
+        raster = grid._tree_species_int_raster
+        np.testing.assert_array_equal(w[raster == _CODE_HETRE], 1.0)
+        np.testing.assert_array_equal(w[raster == 0], 1.0)
+        np.testing.assert_array_equal(w[2, 1:], 1.0)   # lande 0,10
+        self.assertEqual(float(w[1, 1]), 1.0)           # observation terrain
+        np.testing.assert_array_equal(w[1, 2:], 0.0)   # mélange IFN seul
 
 
 class GetTreeScoreBySpecies(unittest.TestCase):

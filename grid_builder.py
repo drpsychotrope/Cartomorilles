@@ -213,6 +213,12 @@ class GridBuilder:
         # Scores par critère (chaque valeur = array (ny, nx) dans [0, 1])
         self.scores: dict[str, np.ndarray] = {}
 
+        # Poids par cellule (D51) : multiplicateur (ny, nx) ∈ [0, 1] de
+        # config.WEIGHTS[critère], lu par MorilleScoring.compute_weighted_score
+        # (absent = poids plein). tree_species seul : fiabilité du mélange
+        # IFN des cellules enrichies, posée par SpeciesEnricher.
+        self.weight_factors: dict[str, np.ndarray] = {}
+
         # Masques
         self.nodata_mask: np.ndarray | None = None
         self.urban_mask: np.ndarray | None = None
@@ -708,7 +714,8 @@ class GridBuilder:
 
         tree_species est réécrit depuis la table brute de l'espèce :
         l'appelant rejoue ensuite SpeciesEnricher.enrich_grid_scores(
-        species=…), sinon l'enrichissement IFN et la lande sont perdus (D47).
+        species=…), sinon l'enrichissement IFN et la lande sont perdus (D47),
+        ainsi que la fiabilité des mélanges IFN (poids par cellule, D51).
         """
         logger.info(
             "🔄 Recompute species scores [%s] — 6 critères species-aware",
@@ -1213,6 +1220,10 @@ class GridBuilder:
         (D27) : caches distincts par espèce et par ordre de brûlage.
         """
         name = "tree_species"
+        # Réécrit depuis la table brute (connue = poids plein, inconnue =
+        # NaN) : la fiabilité IFN d'un enrichissement précédent ne vaut plus,
+        # SpeciesEnricher.enrich_grid_scores la repose (D51)
+        self.weight_factors.pop(name, None)
         if self._skip_zero_weight(name):
             return self
 
@@ -2647,6 +2658,20 @@ class GridBuilder:
                     score.shape,
                     self.ny,
                     self.nx,
+                )
+                ok = False
+
+        for name, factor in self.weight_factors.items():
+            if factor.shape != (self.ny, self.nx):
+                logger.error(
+                    "❌ Poids par cellule '%s' mauvaise forme : %s ≠ (%d, %d)",
+                    name, factor.shape, self.ny, self.nx,
+                )
+                ok = False
+            elif float(np.nanmin(factor)) < 0.0 or float(np.nanmax(factor)) > 1.0:
+                logger.error(
+                    "❌ Poids par cellule '%s' hors [0,1] : min=%.4f, max=%.4f",
+                    name, float(np.nanmin(factor)), float(np.nanmax(factor)),
                 )
                 ok = False
 

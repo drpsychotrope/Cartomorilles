@@ -140,8 +140,15 @@ class MorilleScoring:
 
         v2.4.0 : float32 strict — évite promotion float64 sur 73.6M cells.
         Fix #23 : pénalité de couverture NaN-safe floor=0.5 (D10).
+        D51 : poids par cellule — `grid.weight_factors[critère]` ∈ [0, 1]
+        multiplie config.WEIGHTS[critère] cellule par cellule (facteur 0 =
+        critère exclu comme une valeur NaN ; la couverture D10 compte le
+        poids effectif).
         """
         self.grid.validate_scores()
+        weight_factors: dict[str, np.ndarray] = (
+            getattr(self.grid, "weight_factors", None) or {}
+        )
 
         shape: tuple[int, int] = next(iter(self.scores.values())).shape
         ny, nx = shape
@@ -189,21 +196,54 @@ class MorilleScoring:
             if arr.dtype != np.float32:
                 arr = arr.astype(np.float32)
 
+            # Poids par cellule (D51) : facteur ∈ [0, 1], 0 ≡ valeur NaN (D46)
+            cell_factor: np.ndarray | None = None
+            raw_factor = weight_factors.get(factor)
+            if raw_factor is not None and raw_factor.shape == shape:
+                cell_factor = np.clip(
+                    np.nan_to_num(np.asarray(raw_factor, dtype=np.float32)),
+                    0.0, 1.0,
+                )
+            elif raw_factor is not None:
+                logger.warning(
+                    "  %-22s | poids par cellule %s ≠ %s — ignoré",
+                    factor, raw_factor.shape, shape,
+                )
+
             # Accumulation NaN-safe (float32)
-            valid = np.isfinite(arr)
-            total = np.where(valid, total + arr * w32, total)
-            weight_sum = np.where(valid, weight_sum + w32, weight_sum)
+            finite = np.isfinite(arr)
+            if cell_factor is None:
+                total = np.where(finite, total + arr * w32, total)
+                weight_sum = np.where(finite, weight_sum + w32, weight_sum)
+            else:
+                w_cell = w32 * cell_factor
+                valid = finite & (w_cell > 0)
+                total = np.where(valid, total + arr * w_cell, total)
+                weight_sum = np.where(valid, weight_sum + w_cell, weight_sum)
 
             self._criteria_used.append(factor)
 
-            v = arr[valid]
-            logger.info(
-                "  %-22s | w=%.2f | moy=%.3f | max=%.3f | NaN=%d",
+            v = arr[finite]
+            line = "  %-22s | w=%.2f | moy=%.3f | max=%.3f | NaN=%d"
+            line_args: list[Any] = [
                 factor, weight,
                 float(v.mean()) if v.size else 0.0,
                 float(v.max()) if v.size else 0.0,
-                int((~valid).sum()),
-            )
+                int((~finite).sum()),
+            ]
+            if cell_factor is not None:
+                reduced = finite & (cell_factor < 0.999)
+                n_reduced = int(reduced.sum())
+                line += (
+                    " | poids par cellule (D51) : %d réduites (×%.2f en "
+                    "moyenne), %d à ×0"
+                )
+                line_args += [
+                    n_reduced,
+                    float(cell_factor[reduced].mean()) if n_reduced else 1.0,
+                    int((finite & (cell_factor <= 0.0)).sum()),
+                ]
+            logger.info(line, *line_args)
 
         # Division par le cumul de poids effectif par cellule
         with np.errstate(invalid="ignore", divide="ignore"):

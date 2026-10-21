@@ -218,6 +218,15 @@ class TreeSpeciesRasterCache(_CategoricalRasterCacheMixin, unittest.TestCase):
         self.assertEqual(config.resolve_tree_name(self.raw_whole), "unknown")
         self.assertEqual(config.resolve_tree_name(self.raw_left), "hetre")
 
+    def test_rewrite_from_table_drops_ifn_weight(self) -> None:
+        # Critère réécrit depuis la table brute (connue = poids plein,
+        # inconnue = NaN) : le poids IFN d'une espèce précédente ne survit
+        # pas au recalcul de l'espèce suivante (D51)
+        grid = _tiny_grid()
+        grid.weight_factors["tree_species"] = np.zeros(_SHAPE, dtype=np.float32)
+        self._run(grid)
+        self.assertNotIn("tree_species", grid.weight_factors)
+
 
 class GeologyRasterCache(_CategoricalRasterCacheMixin, unittest.TestCase):
     name = "geology"
