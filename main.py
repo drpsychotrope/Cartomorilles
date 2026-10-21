@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from types import FrameType
+from collections.abc import Sequence
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -251,6 +252,7 @@ TERRAIN_CHECKPOINTS_EDULIS: tuple[dict[str, Any], ...] = (
 # Dispatch checkpoints par espèce
 TERRAIN_CHECKPOINTS_BY_SPECIES: dict[str, tuple[dict[str, Any], ...]] = {
     "esculenta": TERRAIN_CHECKPOINTS_ESCULENTA,
+    "elata": (),   # pas encore de points terrain : validation sautée (D49)
     "edulis": TERRAIN_CHECKPOINTS_EDULIS,
 }
 
@@ -390,6 +392,16 @@ def _fr_area(size_m2: float) -> str:
     if ha >= 1:
         return f"{_fr_num(ha, 1)} ha"
     return f"{_fr_num(ha * 10_000)} m²"
+
+
+def _enumerate_fr(items: Sequence[str]) -> str:
+    """« a », « a et b », « a, b et c »."""
+    items = list(items)
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " et " + items[-1]
 
 
 def _species_label(species: str) -> str:
@@ -693,13 +705,18 @@ def validate_against_terrain(
     Compare le score modèle aux observations de terrain (détail par point
     dans le log). Retourne la concordance, ou None si impossible.
 
-    v2.6.0 : checkpoints species-aware — fallback sur les checkpoints de
-    l'espèce du modèle (TERRAIN_CHECKPOINTS_BY_SPECIES[model.species]).
+    v2.6.0 : checkpoints species-aware (TERRAIN_CHECKPOINTS_BY_SPECIES
+    [model.species]) ; une espèce sans points de contrôle saute la
+    validation (None), sans retomber sur ceux d'une autre espèce (D49).
     """
     if checkpoints is None:
-        checkpoints = TERRAIN_CHECKPOINTS_BY_SPECIES.get(
-            model.species, TERRAIN_CHECKPOINTS_ESCULENTA,
+        checkpoints = TERRAIN_CHECKPOINTS_BY_SPECIES.get(model.species, ())
+    if not checkpoints:
+        logger.debug(
+            "📍 Validation croisée terrain [%s] : aucun point de contrôle",
+            model.species,
         )
+        return None
     try:
         grid = model.grid
 
@@ -1874,12 +1891,12 @@ def main(args: argparse.Namespace) -> int:
     else:
         logger.info("🗺️  Carte : %s  (--open pour l'ouvrir)", map_uri)
 
-    hunted = " et aux ".join(
-        str(config.get_species_params(sp).get("common_name_plural", sp))
+    hunted = _enumerate_fr([
+        "aux " + str(config.get_species_params(sp).get("common_name_plural", sp))
         for sp in species_list
-    )
+    ])
     logger.info("")
-    logger.info("🧺 Bonne chasse aux %s !", hunted)
+    logger.info("🧺 Bonne chasse %s !", hunted)
 
     _cleanup_files.clear()
 
