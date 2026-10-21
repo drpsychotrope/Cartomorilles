@@ -2297,6 +2297,24 @@ class GridBuilder:
         ("cemetery", 5),
     )
 
+    def _close_urban_gaps(self, mask: np.ndarray) -> np.ndarray:
+        """Comble les vides de moins de 2 × URBAN_GAP_CLOSE_M entre
+        bâtiments (rues, places, cours) : fermeture morphologique par un
+        disque de rayon floor(URBAN_GAP_CLOSE_M / maille) cellules. Le bord
+        extérieur des zones bâties ne bouge pas ; rien à faire quand le
+        rayon tombe sous une cellule (50 m), où une cellule touchée par un
+        bâtiment couvre déjà la rue (D56)."""
+        r = int(np.floor(float(config.URBAN_GAP_CLOSE_M) / float(self.cell_size)))
+        if r < 1 or not mask.any():
+            return mask
+        yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+        disk = (xx * xx + yy * yy) <= r * r
+        closed = binary_erosion(
+            binary_dilation(mask, structure=disk), structure=disk,
+        )
+        # Le bord de la grille érode à tort : ne jamais retirer une cellule
+        return np.asarray(mask | closed)
+
     def apply_urban_mask(
         self,
         urban_gdf: gpd.GeoDataFrame | None,
@@ -2330,9 +2348,11 @@ class GridBuilder:
             if _src_col is not None and len(_src_col) > 0
             else "unknown"
         )
+        # v2 : bandes de rasterisation corrigées et vides comblés (D56) ;
+        # le rayon de fermeture fait partie de la clé
         cache_path = _accel.raster_cache_path(
             "urban_mask",
-            _src_name,
+            f"{_src_name}_v2_ferm{config.URBAN_GAP_CLOSE_M:g}",
             len(urban_gdf),
             self.cell_size,
             (self.ny, self.nx),
@@ -2456,6 +2476,17 @@ class GridBuilder:
                         binary_dilation(base_raster, iterations=iterations),
                     ).astype(bool)
             self.urban_mask = base_raster
+
+        # ── Rues, places et cours en maille fine (D56) ──
+        n_before = int(self.urban_mask.sum())
+        self.urban_mask = self._close_urban_gaps(self.urban_mask)
+        n_added = int(self.urban_mask.sum()) - n_before
+        if n_added:
+            logger.info(
+                "   🏙️ Tissu urbain : %d cellules de rues, places et cours "
+                "ajoutées (vides de moins de %.0f m entre bâtiments, D56)",
+                n_added, 2 * config.URBAN_GAP_CLOSE_M,
+            )
 
         # ── Sauvegarder en cache ──
         _accel.raster_cache_save(cache_path, self.urban_mask)

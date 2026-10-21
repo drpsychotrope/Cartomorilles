@@ -122,7 +122,7 @@ __all__ = [
     "LANDCOVER_AUTO_MAX_KM2",
     # Urbain
     "URBAN_DIST_ELIMINATORY", "URBAN_DIST_PENALTY",
-    "URBAN_DIST_FULL", "URBAN_PROXIMITY_FLOOR",
+    "URBAN_DIST_FULL", "URBAN_PROXIMITY_FLOOR", "URBAN_GAP_CLOSE_M",
     # Phénologie
     "PHENOLOGY_ENABLED", "PHENOLOGY_GRADIENT",
     "PHENOLOGY_BASE_MONTH", "PHENOLOGY_BASE_ALT",
@@ -256,6 +256,12 @@ URBAN_PROXIMITY_FLOOR: Final[float] = 0.05     # plancher zone tampon
 URBAN_DENSITY_RADIUS_M: Final[float] = 30.0
 URBAN_DENSITY_FRACTION: Final[float] = 30.0 / 49.0
 URBAN_DENSITY_MIN_WINDOW: Final[int] = 5  # px — plancher pour grandes cellules
+# Tissu urbain en maille fine (D56) : la couche urbaine n'a que des
+# bâtiments ; les vides de moins de 2 × URBAN_GAP_CLOSE_M entre eux (rues,
+# places, cours) sont comblés par fermeture morphologique. Rayon en cellules
+# arrondi vers le bas : rien à combler à 50 m, où une cellule touchée par
+# un bâtiment couvre déjà la rue.
+URBAN_GAP_CLOSE_M: Final[float] = 40.0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1391,6 +1397,11 @@ def validate_config() -> bool:
     # ── BBOX valide ──
     if BBOX["xmin"] >= BBOX["xmax"] or BBOX["ymin"] >= BBOX["ymax"]:
         logger.error("BBOX dégénéré : %s", dict(BBOX))
+        ok = False
+
+    # ── Tissu urbain (D56) ──
+    if URBAN_GAP_CLOSE_M < 0:
+        logger.error("URBAN_GAP_CLOSE_M=%.1f négatif", URBAN_GAP_CLOSE_M)
         ok = False
 
     # ── Bords de l'eau (D55) ──

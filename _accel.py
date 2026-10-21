@@ -862,10 +862,12 @@ def parallel_rasterize_mask(
         r0, r1 = int(rows[0]), int(rows[-1]) + 1
         band_h = r1 - r0
 
-        band_ymax = f + r0 * e - margin
-        band_ymin = f + r1 * e + margin
-        if band_ymin > band_ymax:
-            band_ymin, band_ymax = band_ymax, band_ymin
+        # Boîte de la bande élargie de `margin` en haut et en bas (le signe
+        # de e varie selon l'orientation) : une géométrie qui touche la
+        # bande sans la traverser est bien brûlée (D56)
+        y_a, y_b = f + r0 * e, f + r1 * e
+        band_ymin = min(y_a, y_b) - margin
+        band_ymax = max(y_a, y_b) + margin
         band_xmin = c - margin
         band_xmax = c + nx * a + margin
 
