@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 pip install -r requirements.txt
 
-# Default run (both species, auto cell-size, default data paths, weather J+0)
+# Default run (all three species, auto cell-size, default data paths, weather J+0)
 python main.py
 
 # Same, then open the map in the browser

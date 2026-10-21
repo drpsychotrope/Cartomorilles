@@ -12,9 +12,9 @@
    (enrichissement essences), WFS IGN / OSM (hydrographie, urbain).
 
 Usage :
-    python main.py                              # Deux espèces, maille auto
+    python main.py                              # Trois espèces, maille auto
     python main.py --open                       # Idem + ouvre la carte
-    python main.py --species esculenta          # Morille seule
+    python main.py --species esculenta          # Morille grise seule
     python main.py --dry-run                    # Vérif données seulement
     python main.py --cell-size 25 --verbose     # Test rapide, logs détaillés
 
@@ -405,7 +405,7 @@ def _enumerate_fr(items: Sequence[str]) -> str:
 
 
 def _species_label(species: str) -> str:
-    """« Morille (Morchella esculenta) » — sans emoji d'espèce : 🍄 est
+    """« Morille grise (Morchella esculenta) » — sans emoji d'espèce : 🍄 est
     l'amanite tue-mouches, 🌰 une châtaigne (essence du modèle)."""
     params = config.SPECIES_PARAMS.get(species, {})
     return (
@@ -960,7 +960,7 @@ def save_hotspots_gpx(
     """Exporte les meilleurs hotspots en GPX 1.1 (un waypoint chacun) pour
     les applis GPS — `{species}_hotspots.gpx`, à côté du CSV.
 
-    Le waypoint « Morille n°3 » est le hotspot n°3 de la carte et du CSV.
+    Le waypoint « Morille grise n°3 » est le hotspot n°3 de la carte et du CSV.
     `inside` (masque booléen aligné sur `hotspots`) écarte, comme la carte,
     les hotspots hors de la zone étudiée (D39) ; les numéros restent ceux
     du CSV.
@@ -1231,6 +1231,11 @@ def main(args: argparse.Namespace) -> int:
     logger.info("=" * 60)
     logger.info("🍄 CARTOMORILLES v%s — %s", VERSION, _ZONE_LABEL)
     logger.info("=" * 60)
+
+    # ── Configuration : tables et paramètres par espèce cohérents (D49) ──
+    if not config.validate_config():
+        logger.error("❌ Configuration incohérente — détail dans %s", log_path)
+        return 1
 
     # ── Purge cache (conditionnel) ────────────────────────────
     if args.purge_cache:

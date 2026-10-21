@@ -5,10 +5,13 @@ Exécution : .venv/Scripts/python.exe -m unittest tests.test_main_helpers
 
 from __future__ import annotations
 
+import logging
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -31,6 +34,31 @@ class TerrainValidation(unittest.TestCase):
         self.assertGreater(
             len(main.TERRAIN_CHECKPOINTS_BY_SPECIES["esculenta"]), 0,
         )
+
+
+class ConfigValidation(unittest.TestCase):
+    def test_invalid_config_stops_run_with_code_1(self) -> None:
+        # validate_config() doit être appelé au démarrage : une config
+        # incohérente arrête le run (code 1 = erreur config) avant les données
+        args = main.build_parser().parse_args(["--no-weather"])
+        with tempfile.TemporaryDirectory() as tmp:
+            args.output_dir = tmp
+            try:
+                # Garde-fou : si la validation n'arrête pas le run, la
+                # résolution des données ne doit jamais être atteinte
+                with mock.patch.object(
+                    main.config, "validate_config", return_value=False,
+                ) as validate, mock.patch.object(
+                    main, "_resolve_data_path",
+                    side_effect=AssertionError("pipeline lancé malgré la config"),
+                ):
+                    self.assertEqual(main.main(args), 1)
+                validate.assert_called_once_with()
+            finally:
+                root = logging.getLogger("cartomorilles")
+                for handler in list(root.handlers):
+                    handler.close()
+                    root.removeHandler(handler)
 
 
 class Enumerate(unittest.TestCase):

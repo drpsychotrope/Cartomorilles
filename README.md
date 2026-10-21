@@ -36,7 +36,7 @@ Hydrographie et zones urbaines sont récupérées via WFS IGN à défaut de fich
 ## Démarrage rapide
 
 ```bash
-# Run par défaut (maille auto, les deux espèces, météo J+0)
+# Run par défaut (maille auto, les trois espèces, météo J+0)
 python main.py
 
 # Idem, puis ouvrir la carte dans le navigateur
@@ -98,7 +98,7 @@ Le détail (tableau des poids, statistiques par critère, validation point par p
 - `cartomorilles.html` — carte interactive : panneau latéral (espèce, légende-filtre par classe, opacité, hotspots numérotés, fonds et couches, météo), lecture du score au survol ou au toucher, popup du point touché (coordonnées à copier, liens *Itinéraire* et *Google Maps*) et bouton *Me localiser*
 - `{species}_probability.tif` — raster GeoTIFF par espèce (+ alias `morilles_probability.tif`)
 - `{species}_hotspots.csv` — hotspots triés par score, avec lien Google Maps
-- `{species}_hotspots.gpx` — les 20 meilleurs hotspots de la zone étudiée, en waypoints GPX pour les applis GPS (« Morille n°3 » = hotspot n°3 de la carte et du CSV)
+- `{species}_hotspots.gpx` — les 20 meilleurs hotspots de la zone étudiée, en waypoints GPX pour les applis GPS (« Morille grise n°3 » = hotspot n°3 de la carte et du CSV)
 - `rapport_{species}.json` — rapport complet et reproductible (config, stats, validation terrain)
 - `cartomorilles.log` — journal détaillé
 - `{species}_grid.gpkg` — grille vecteur (avec `--export-vector`)
