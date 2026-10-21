@@ -69,7 +69,7 @@ visualize.py            → Folium HTML map (all species), GeoTIFF, GeoPackage
 
 ## Key Configuration (`config.py`)
 
-All thresholds, scoring weights, tree species scores, geology scores, and spatial bounds live in `config.py`. The **`WEIGHTS`** dict (14 criteria, sum ≈ 1.0) is the primary tuning surface; `SPECIES_PARAMS` holds the per-species tree/geology scores, altitude/slope/aspect/TWI optima and eliminatory limits. Changing them invalidates cached rasters only if the lookup hash changes (MD5-keyed cache — D23).
+All thresholds, scoring weights, tree species scores, geology scores, and spatial bounds live in `config.py`. The **`WEIGHTS`** dict (14 criteria, sum ≈ 1.0) is the primary tuning surface; `SPECIES_PARAMS` holds the per-species tree/geology scores, altitude/slope/aspect/TWI optima and eliminatory limits. Changing them invalidates the cached categorical rasters when the lookup hash changes (MD5-keyed cache — D23); a change of polygon burn order invalidates them too (D48).
 
 ## Scoring Model
 
@@ -114,6 +114,7 @@ These decisions are documented in `decisions.md` — do not reverse them without
 | **D46** | Unknown tree species (`tree_scores["unknown"]`, both species) = NaN: excluded from the weighted mean (D10 coverage penalty), never scored as a mediocre species; unknown polygons are burned first so a known species wins overlaps (D22); the IFN enrichment skips unscored species. Raising weights or lowering the Excellent threshold were measured and rejected |
 | **D45** | Map classes are computed on the raw terrain score: today's weather is shown in the sidebar, console and JSON report but never multiplied into `final_score` (the ×0.4–1.0 factor of D42 is gone; in October it hid every Bon/Excellent cell). Probability palette = red→yellow→green (ColorBrewer RdYlGn, `_CMAP_STOPS` in `visualize.py`), one palette for all basemaps |
 | **D44** | Weather days use the map's 6 classes: `ProspectingDay.level` = index in `config.PROBABILITY_LABELS` (rounded score digitized on `PROBABILITY_THRESHOLDS`), `.label` = that label, no emoji; favourable day = Bon or Excellent. The map panel and the console summary read `level` / `label` as they are — no other weather scale |
+| **D48** | Categorical raster cache key (`tree_species`, `geology_cat`) = MD5 of the lookup (D23) **and** of the code sequence in burn order (`_categorical_cache_key`), plus the bbox (D27): a change of polygon sort order (e.g. `na_position="first"`, D46) invalidates the cache by itself — never salt the key by hand. `tests/test_grid_builder_cache.py` |
 
 ## Session / Branch Workflow
 
@@ -129,4 +130,4 @@ Active development uses a multi-session system tracked in `.sessions/`:
 - Grid size: warn at 50M cells (TWI >5 min), hard limit at 200M unless `--force`. Bbox dept élargi @10m = 169M (sous limite mais lourd)
 - Avoid adding string matching inside scoring loops — use int-coded raster lookups (D6, D25)
 - PNG overlays use `compress_level=1` (parallel speed); data GeoTIFFs use level 6 (D17)
-- Cache files live in `data/cache/` — keyed by MD5 of lookup arrays so config changes auto-invalidate (D23)
+- Cache files live in `data/cache/` — categorical rasters keyed by MD5 of the lookup array and of the burn order, so config and sort-order changes auto-invalidate (D23, D48)
