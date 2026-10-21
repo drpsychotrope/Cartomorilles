@@ -8,7 +8,9 @@ main.py, lit {species}_probability.tif, restreint le fond à l'emprise
 d'étude (couverture BDCharm-50, D39) et imprime occurrence_metrics par
 espèce : P/E par classe, indice de Boyce, AUC présence contre fond, part
 des occurrences en Nul, parts cumulées par seuil. Avec plusieurs --run,
-les colonnes se comparent côte à côte.
+les colonnes se comparent côte à côte. --combine SP SP… évalue le maximum
+cellule à cellule de plusieurs couches de même taxon (les deux morilles),
+avec les occurrences de la première.
 
 Usage (cwd = checkout principal, pour data/cache et la géologie) :
     .venv/Scripts/python.exe tools/evaluate_occurrences.py --run output
@@ -21,6 +23,7 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +37,7 @@ import shapely  # noqa: E402
 from rasterio.features import geometry_mask  # noqa: E402
 
 import config  # noqa: E402
-from occurrences import occurrence_metrics, occurrences_by_species  # noqa: E402
+from occurrences import occurrence_metrics, occurrences_by_species, taxon_for  # noqa: E402
 from species_enricher import SpeciesEnricher  # noqa: E402
 
 _DEFAULT_GEOLOGY = "data/geologie_38/GEO050K_HARM_038_S_FGEOL_2154.shp"
@@ -72,6 +75,59 @@ def study_mask(geology: Path, shape: tuple[int, int], transform: Any) -> np.ndar
         int(mask.sum()), mask.mean() * 100,
     )
     return np.asarray(mask, dtype=bool)
+
+
+def combine_scores(scores: Sequence[np.ndarray]) -> np.ndarray:
+    """Maximum cellule à cellule de plusieurs couches ; NaN seulement là où
+    toutes le sont (np.fmax)."""
+    out = np.asarray(scores[0], dtype=np.float32)
+    for score in scores[1:]:
+        out = np.fmax(out, np.asarray(score, dtype=np.float32))
+    return out
+
+
+def combination_label(species: Sequence[str]) -> str:
+    return "+".join(species)
+
+
+def shared_taxon(species: Sequence[str]) -> tuple[str, str]:
+    """Taxon commun des espèces combinées ; refus si leurs occurrences ne
+    sont pas les mêmes (taxons différents)."""
+    taxa = {taxon_for(sp) for sp in species}
+    if len(taxa) != 1:
+        sys.exit(
+            f"--combine {' '.join(species)} : taxons différents "
+            f"{sorted(taxa)}, occurrences non comparables",
+        )
+    return taxa.pop()
+
+
+def evaluate_layer(
+    label: str,
+    tifs_by_run: dict[str, list[Path]],
+    occurrences: list[dict[str, Any]],
+    masks: dict[tuple[Any, ...], np.ndarray | None],
+    geology: Path,
+) -> dict[str, dict[str, Any]]:
+    """Métriques d'une couche (ou du maximum de plusieurs) pour chaque run."""
+    results: dict[str, dict[str, Any]] = {}
+    for run_name, tifs in tifs_by_run.items():
+        missing = [t for t in tifs if not t.exists()]
+        if missing:
+            logger.warning("%s absent — run ignoré pour %s", missing[0], label)
+            continue
+        loaded = [load_score(t) for t in tifs]
+        score = combine_scores([s for s, _ in loaded])
+        transform = loaded[0][1]
+        key = (score.shape, tuple(np.round(np.asarray(transform)[:6], 6)))
+        if key not in masks:
+            masks[key] = study_mask(geology, score.shape, transform)
+        results[run_name] = occurrence_metrics(
+            score, transform, occurrences, study_mask=masks[key],
+        )
+    if results:
+        print_report(label, results)
+    return results
 
 
 def _pct(value: float | None) -> str:
@@ -128,6 +184,9 @@ def main() -> int:
     parser.add_argument("--geology", default=_DEFAULT_GEOLOGY,
                         help="shapefile BDCharm-50 (emprise d'étude)")
     parser.add_argument("--cache-dir", default="data/cache")
+    parser.add_argument("--combine", action="append", nargs="+", metavar="SP",
+                        help="maximum de plusieurs couches de même taxon, p. ex. "
+                             "--combine esculenta elata (répétable)")
     parser.add_argument("--json", metavar="PATH", help="écrit toutes les métriques en JSON")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -139,29 +198,35 @@ def main() -> int:
     runs = [Path(r) for r in (args.run or ["output"])]
     cache_dir = Path(args.cache_dir)
 
+    combos: list[list[str]] = [list(c) for c in (args.combine or [])]
+    for combo in combos:
+        shared_taxon(combo)
+    needed = list(dict.fromkeys([*args.species, *(sp for c in combos for sp in c)]))
+
     enricher = SpeciesEnricher()
     inat = enricher._fetch_inaturalist(config.BBOX_WGS84, cache_dir=cache_dir)
-    occurrences = occurrences_by_species(args.species, inat, cache_dir=cache_dir)
+    occurrences = occurrences_by_species(needed, inat, cache_dir=cache_dir)
 
     masks: dict[tuple[Any, ...], np.ndarray | None] = {}
     all_results: dict[str, dict[str, dict[str, Any]]] = {}
+    geology = Path(args.geology)
     for species in args.species:
-        results: dict[str, dict[str, Any]] = {}
-        for run in runs:
-            tif = run / f"{species}_probability.tif"
-            if not tif.exists():
-                logger.warning("%s absent — run ignoré pour %s", tif, species)
-                continue
-            score, transform = load_score(tif)
-            key = (score.shape, tuple(np.round(np.asarray(transform)[:6], 6)))
-            if key not in masks:
-                masks[key] = study_mask(Path(args.geology), score.shape, transform)
-            results[run.name] = occurrence_metrics(
-                score, transform, occurrences[species], study_mask=masks[key],
-            )
+        results = evaluate_layer(
+            species,
+            {run.name: [run / f"{species}_probability.tif"] for run in runs},
+            occurrences[species], masks, geology,
+        )
         if results:
-            print_report(species, results)
             all_results[species] = results
+    for combo in combos:
+        label = combination_label(combo)
+        results = evaluate_layer(
+            label,
+            {run.name: [run / f"{sp}_probability.tif" for sp in combo] for run in runs},
+            occurrences[combo[0]], masks, geology,
+        )
+        if results:
+            all_results[label] = results
 
     if args.json:
         Path(args.json).write_text(
