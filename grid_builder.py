@@ -37,6 +37,7 @@ from rasterio.transform import from_bounds
 from scipy.ndimage import (
     binary_dilation,
     binary_erosion,
+    maximum_filter,
     uniform_filter,
     zoom,
 )
@@ -229,7 +230,9 @@ class GridBuilder:
         self.slope: np.ndarray | None = None
         self.aspect: np.ndarray | None = None
         self.roughness: np.ndarray | None = None
-        self.twi: np.ndarray | None = None 
+        self.twi: np.ndarray | None = None
+        # Aire drainée D8 (log10 m²) du calcul du TWI, pour la carte (D53)
+        self.drained_area_log10: np.ndarray | None = None
         self.dist_water_grid: np.ndarray | None = None
 
         # Rasters intermédiaires (pour diagnostics)
@@ -470,8 +473,12 @@ class GridBuilder:
         # Rugosité à résolution native
         native_roughness = self._compute_roughness_from(native_slope)
 
-        # TWI à résolution native (le gros gain de perf)
-        native_twi = self._compute_twi(dem_filled_native, dem_cell_size)
+        # TWI à résolution native (le gros gain de perf) + aire drainée D8
+        native_twi, native_acc = self._compute_twi_and_area(
+            dem_filled_native, dem_cell_size,
+        )
+        native_area = np.log10(native_acc).astype(np.float32)
+        del native_acc
 
         # ── Restaurer NaN dans les dérivées natives ──
         if np.any(nan_mask_native):
@@ -479,6 +486,7 @@ class GridBuilder:
             native_aspect[nan_mask_native] = np.nan
             native_roughness[nan_mask_native] = np.nan
             native_twi[nan_mask_native] = np.nan
+            native_area[nan_mask_native] = np.nan
 
         # ── Resample vers grille cible ──
         if needs_resample:
@@ -494,11 +502,18 @@ class GridBuilder:
             self.twi = self._zoom_grid(
                 native_twi, nan_mask_native, order=1,
             )
+            # Affichage seul : maximum local avant le sous-échantillonnage,
+            # sinon les talwegs (larges d'un pixel natif) deviennent pointillés
+            self.drained_area_log10 = self._zoom_grid(
+                self._max_before_zoom(native_area), nan_mask_native, order=0,
+            )
         else:
             self.slope = native_slope
             self.aspect = native_aspect
             self.roughness = native_roughness
             self.twi = native_twi
+            self.drained_area_log10 = native_area
+        del native_area
 
         # P3 : narrowing pour Pylance
         assert self.slope is not None
@@ -512,6 +527,8 @@ class GridBuilder:
             self.aspect[self.nodata_mask] = np.nan
             self.roughness[self.nodata_mask] = np.nan
             self.twi[self.nodata_mask] = np.nan
+            if self.drained_area_log10 is not None:
+                self.drained_area_log10[self.nodata_mask] = np.nan
 
         self._terrain_computed = True
         self._log_terrain_stats()
@@ -560,6 +577,20 @@ class GridBuilder:
             zoom(grid, (zy, zx), order=order),
         ).astype(np.float32)
 
+    def _max_before_zoom(self, grid: np.ndarray) -> np.ndarray:
+        """Maximum local sur la taille d'une maille cible avant un
+        sous-échantillonnage au plus proche voisin : une ligne large d'un
+        pixel natif (talweg) reste continue sur la grille. NaN ignorés."""
+        size = int(np.ceil(max(
+            grid.shape[0] / max(self.ny, 1), grid.shape[1] / max(self.nx, 1),
+        )))
+        if size < 2:
+            return grid
+        filled = np.where(np.isnan(grid), -np.inf, grid).astype(np.float32)
+        pooled = np.asarray(maximum_filter(filled, size=size))
+        pooled[~np.isfinite(pooled)] = np.nan
+        return pooled
+
     @staticmethod
     def _compute_roughness_from(slope: np.ndarray) -> np.ndarray:
         """Rugosité = écart-type local de la pente.
@@ -587,8 +618,17 @@ class GridBuilder:
         dem: np.ndarray,
         cell_size: float,
     ) -> np.ndarray:
+        """Topographic Wetness Index seul (voir _compute_twi_and_area)."""
+        return GridBuilder._compute_twi_and_area(dem, cell_size)[0]
+
+    @staticmethod
+    def _compute_twi_and_area(
+        dem: np.ndarray,
+        cell_size: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Calcul du Topographic Wetness Index — TWI = ln(a / tan(β)).
+        Calcul du Topographic Wetness Index — TWI = ln(a / tan(β)) — et de
+        l'aire drainée D8 a (m², au moins la surface d'une cellule).
 
         D1 : algorithme D8 (pas D∞/MFD).
 
@@ -645,7 +685,7 @@ class GridBuilder:
         ratio = np.maximum(specific_area / tan_beta, 1e-6)
         twi: np.ndarray = np.log(ratio).astype(np.float32)
 
-        return twi
+        return twi, np.asarray(acc)
 
     def _log_terrain_stats(self) -> None:
         """Affiche les statistiques terrain."""

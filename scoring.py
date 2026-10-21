@@ -54,6 +54,39 @@ _PROB_LABELS: list[str] = list(
     )
 )
 
+_RANK_QUANTILES: tuple[float, ...] = tuple(
+    getattr(config, "CLASS_RANK_QUANTILES", (0.40, 0.70, 0.90, 0.98))
+)
+# Sous ce nombre de cellules notées, les quantiles ne veulent rien dire :
+# repli sur les seuils absolus
+_RANK_MIN_CELLS: int = 100
+
+
+def rank_class_thresholds(
+    score: np.ndarray,
+    inside: np.ndarray | None = None,
+) -> list[float]:
+    """Seuils des 6 classes par rang (D52).
+
+    Nul : sous le seuil absolu PROBABILITY_THRESHOLDS[0] (cellule éliminée).
+    Les autres bornes sont les quantiles CLASS_RANK_QUANTILES des cellules
+    notées (score ≥ ce seuil), dans la zone étudiée si `inside` est donné.
+    Repli sur les seuils absolus s'il y a trop peu de cellules notées.
+    """
+    nul = float(_PROB_THRESHOLDS[0])
+    valid = np.isfinite(score) & (score >= nul)
+    if inside is not None:
+        valid &= inside
+    scored = score[valid]
+    if scored.size < _RANK_MIN_CELLS:
+        return list(_PROB_THRESHOLDS)
+    thresholds = [nul]
+    for q in np.quantile(scored, _RANK_QUANTILES):
+        # strictement croissant, même si deux quantiles tombent ensemble
+        thresholds.append(max(float(q), thresholds[-1] + 1e-3))
+    return thresholds
+
+
 _ALT_ELIM_MIN: float = getattr(config, "ALT_ELIMINATORY_MIN", 100.0)
 _ALT_ELIM_MAX: float = getattr(config, "ALT_ELIMINATORY_MAX", 1400.0)
 _SOFT_ELIM_BUFFER_M: float = getattr(config, "SOFT_ELIM_BUFFER", 15.0)
@@ -105,6 +138,8 @@ class MorilleScoring:
         self.elimination_mask: np.ndarray | None = None
         self.elimination_detail: dict[str, np.ndarray] = {}
         self.probability_classes: np.ndarray | None = None
+        # Seuils des classes : absolus jusqu'à set_rank_thresholds (D52)
+        self.class_thresholds: list[float] = list(_PROB_THRESHOLDS)
 
         # État du pipeline
         self._step_weighted: bool = False
@@ -914,9 +949,24 @@ class MorilleScoring:
     # 4. CLASSIFICATION
     # ═══════════════════════════════════════════════════════════════
 
+    def set_rank_thresholds(
+        self, inside: np.ndarray | None = None,
+    ) -> MorilleScoring:
+        """Remplace les seuils absolus par les seuils par rang de l'espèce,
+        calculés sur ses cellules notées de la zone étudiée (D52)."""
+        self._require_step("_step_smoothed", "set_rank_thresholds")
+        assert self.final_score is not None
+        self.class_thresholds = rank_class_thresholds(self.final_score, inside)
+        logger.debug(
+            "Seuils par rang [%s] : %s", self.species,
+            " | ".join(f"{t:.3f}" for t in self.class_thresholds),
+        )
+        return self
+
     def classify_probability(self) -> MorilleScoring:
         """
-        Classification en niveaux de probabilité.
+        Classification en niveaux de probabilité, avec les seuils de
+        l'espèce (par rang après set_rank_thresholds, D52).
         """
         self._require_step("_step_smoothed", "classify_probability")
         assert self.final_score is not None, "final_score is None before classify"
@@ -926,7 +976,7 @@ class MorilleScoring:
             self.final_score,
             -1.0,
         )
-        classes = np.digitize(safe_score, _PROB_THRESHOLDS).astype(np.int8)
+        classes = np.digitize(safe_score, self.class_thresholds).astype(np.int8)
 
         # NaN → classe -1
         classes[~np.isfinite(self.final_score)] = -1

@@ -38,6 +38,7 @@ from rasterio.features import geometry_mask  # noqa: E402
 
 import config  # noqa: E402
 from occurrences import occurrence_metrics, occurrences_by_species, taxon_for  # noqa: E402
+from scoring import rank_class_thresholds  # noqa: E402
 from species_enricher import SpeciesEnricher  # noqa: E402
 
 _DEFAULT_GEOLOGY = "data/geologie_38/GEO050K_HARM_038_S_FGEOL_2154.shp"
@@ -122,8 +123,10 @@ def evaluate_layer(
         key = (score.shape, tuple(np.round(np.asarray(transform)[:6], 6)))
         if key not in masks:
             masks[key] = study_mask(geology, score.shape, transform)
+        # Classes de la carte : par rang dans l'emprise d'étude (D52)
         results[run_name] = occurrence_metrics(
             score, transform, occurrences, study_mask=masks[key],
+            thresholds=rank_class_thresholds(score, masks[key]),
         )
     if results:
         print_report(label, results)
@@ -159,6 +162,9 @@ def print_report(species: str, results: dict[str, dict[str, Any]]) -> None:
         print(f"{label:24s}" + "".join(f"{fn(results[r]):>{width + 2}s}" for r in runs))
     print(f"\n{'classe':12s}" + "".join(
         f"{'surf.':>8s}{'occ.':>8s}{'P/E':>6s} |" for _ in runs))
+    for r in runs:
+        cuts = " | ".join(f"{t:.3f}" for t in results[r].get("class_thresholds", []))
+        print(f"seuils {r} : {cuts}")
     for i, cls in enumerate(first["classes"]):
         line = f"{cls['label']:12s}"
         for r in runs:

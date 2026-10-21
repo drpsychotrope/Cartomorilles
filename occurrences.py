@@ -36,7 +36,7 @@ import json
 import logging
 import re
 import time as _time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
@@ -355,11 +355,14 @@ def occurrence_metrics(
     *,
     study_mask: np.ndarray | None = None,
     bands: tuple[float, ...] = _BANDS,
+    thresholds: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Qualité du score mesurée sur les occurrences précises (présence
     seule), complément de occurrence_check :
 
-    - classes : par classe de config.PROBABILITY_LABELS, part de la surface
+    - classes : par classe de config.PROBABILITY_LABELS (bornes
+      `thresholds`, celles de la carte — par rang depuis D52 ; seuils
+      absolus config.PROBABILITY_THRESHOLDS à défaut), part de la surface
       étudiée (area_share), nombre et part des occurrences (n_occ,
       occ_share), P/E = occ_share / area_share (1 = pas mieux que le
       hasard) ;
@@ -390,13 +393,16 @@ def occurrence_metrics(
     s_occ = np.asarray(score[rows[kept], cols[kept]], dtype=np.float32)
     n_used = int(s_occ.size)
 
-    thresholds = np.asarray(config.PROBABILITY_THRESHOLDS, dtype=np.float32)
+    cuts = np.asarray(
+        thresholds if thresholds is not None else config.PROBABILITY_THRESHOLDS,
+        dtype=np.float32,
+    )
     labels = list(config.PROBABILITY_LABELS)
     area_counts = np.bincount(
-        np.digitize(background, thresholds), minlength=len(labels),
+        np.digitize(background, cuts), minlength=len(labels),
     )
     occ_counts = np.bincount(
-        np.digitize(s_occ, thresholds), minlength=len(labels),
+        np.digitize(s_occ, cuts), minlength=len(labels),
     )
 
     classes: list[dict[str, Any]] = []
@@ -457,6 +463,7 @@ def occurrence_metrics(
         "n_used": n_used,
         "n_area": n_area,
         "precise_max_m": PRECISE_MAX_M,
+        "class_thresholds": [round(float(t), 4) for t in cuts],
         "classes": classes,
         "boyce": _round(_spearman(ranks, ratios), 3),
         "auc": _round(auc, 3),

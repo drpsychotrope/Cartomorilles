@@ -414,6 +414,21 @@ def _species_label(species: str) -> str:
     )
 
 
+# Index de la classe « Bon » : son seuil inférieur est le seuil par défaut
+# des hotspots de chaque espèce (D52)
+_BON_INDEX: int = PROBABILITY_LABELS.index("Bon")
+
+
+def _study_area_mask(grid: Any, geology_source: str) -> np.ndarray | None:
+    """Zone étudiée sur la grille L93 (D39) : cellules couvertes par la
+    géologie BDCharm-50 départementale. None sans BDCharm-50 (toute la
+    grille compte alors pour les classes par rang)."""
+    int_raster = getattr(grid, "_geology_int_raster", None)
+    if geology_source != "bdcharm50" or int_raster is None:
+        return None
+    return np.asarray(int_raster) > 0
+
+
 # ═══════════════════════════════════════════════════════════════
 #  RÉSOLUTION INTELLIGENTE DES CHEMINS DE DONNÉES
 # ═══════════════════════════════════════════════════════════════
@@ -587,34 +602,51 @@ def summarize_data(
 def compute_statistics(
     final_score: np.ndarray,
     threshold: float,
+    class_thresholds: list[float] | None = None,
+    inside: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Calcule les statistiques du score final.
 
-    `classes` = répartition dans les 6 classes de la carte
-    (config.PROBABILITY_*), en % des cellules avec données. Les clés
-    n_high / n_medium / n_low (seuils 0.7 / 0.4) restent dans le rapport
-    JSON pour comparer avec les calibrations passées (D35).
+    `classes` = répartition dans les 6 classes de la carte, avec les seuils
+    de l'espèce (`class_thresholds`, par rang depuis D52 ; seuils absolus
+    config.PROBABILITY_THRESHOLDS à défaut), en % des cellules avec données
+    de toute la grille ; `classes_study_area` = la même chose sur la zone
+    étudiée (`inside`), ce que montre la carte. Les clés n_high / n_medium /
+    n_low (seuils 0.7 / 0.4) restent dans le rapport JSON pour comparer avec
+    les calibrations passées (D35).
     """
+    thresholds = list(
+        class_thresholds if class_thresholds is not None
+        else config.PROBABILITY_THRESHOLDS,
+    )
     base = compute_array_stats(final_score, decimals=4)
     finite = np.isfinite(final_score)
     n_valid = int(np.count_nonzero(finite))
-    counts = np.bincount(
-        np.digitize(final_score[finite], config.PROBABILITY_THRESHOLDS),
-        minlength=len(config.PROBABILITY_LABELS),
-    )
-    bounds = [0.0, *config.PROBABILITY_THRESHOLDS, 1.0]
-    classes = [
-        {
-            "label": label,
-            "min": lo,
-            "max": hi,
-            "n": int(n),
-            "pct": round(float(n) / max(n_valid, 1) * 100, 2),
-        }
-        for label, lo, hi, n in zip(
-            config.PROBABILITY_LABELS, bounds[:-1], bounds[1:], counts,
+    bounds = [0.0, *thresholds, 1.0]
+
+    def class_shares(values: np.ndarray) -> list[dict[str, Any]]:
+        counts = np.bincount(
+            np.digitize(values, thresholds),
+            minlength=len(config.PROBABILITY_LABELS),
         )
-    ]
+        return [
+            {
+                "label": label,
+                "min": round(lo, 4),
+                "max": round(hi, 4),
+                "n": int(n),
+                "pct": round(float(n) / max(values.size, 1) * 100, 2),
+            }
+            for label, lo, hi, n in zip(
+                config.PROBABILITY_LABELS, bounds[:-1], bounds[1:], counts,
+            )
+        ]
+
+    classes = class_shares(final_score[finite])
+    classes_study_area = (
+        class_shares(final_score[finite & inside]) if inside is not None
+        else None
+    )
     return {
         "n_cells": int(final_score.size),
         "n_valid": n_valid,
@@ -623,7 +655,10 @@ def compute_statistics(
         "score_mean": base["mean"],
         "score_median": base["median"],
         "score_std": base["std"],
+        "class_thresholds": [round(t, 4) for t in thresholds],
+        "class_rank_quantiles": list(config.CLASS_RANK_QUANTILES),
         "classes": classes,
+        "classes_study_area": classes_study_area,
         "n_high": int(np.sum(final_score >= SCORE_THRESHOLD_HIGH)),
         "n_medium": int(np.sum(
             (final_score >= SCORE_THRESHOLD_MEDIUM)
@@ -653,9 +688,13 @@ def _class_range(lo: float, hi: float) -> str:
     return f"{lo:.2f}–{hi:.2f}"
 
 
-def _score_class(score: float) -> str:
-    """Classe de probabilité (libellé) d'un score."""
-    idx = int(np.digitize(score, config.PROBABILITY_THRESHOLDS))
+def _score_class(score: float, thresholds: list[float] | None = None) -> str:
+    """Classe de probabilité (libellé) d'un score, avec les seuils de son
+    espèce (par rang, D52) ou, à défaut, les seuils absolus."""
+    idx = int(np.digitize(
+        score, thresholds if thresholds is not None
+        else config.PROBABILITY_THRESHOLDS,
+    ))
     return config.PROBABILITY_LABELS[idx]
 
 
@@ -779,11 +818,15 @@ def validate_against_terrain(
 # ═══════════════════════════════════════════════════════════════
 
 
-def _hotspot_facts(h: dict[str, Any]) -> str:
+def _hotspot_facts(
+    h: dict[str, Any], thresholds: list[float] | None = None,
+) -> str:
     """Score et classe, surface, altitude, pente, essence et géologie d'un
     hotspot, avec les arrondis de son popup sur la carte."""
     score = round(float(h.get("mean_score", 0.0)), 3)
-    label = PROBABILITY_LABELS[bisect_right(PROBABILITY_THRESHOLDS, score)]
+    label = PROBABILITY_LABELS[
+        bisect_right(thresholds or list(PROBABILITY_THRESHOLDS), score)
+    ]
     parts: list[str] = [
         f"score {_fr_num(score, 2)} ({label})",
         _fr_area(float(h.get("size_m2", 0.0))),
@@ -816,6 +859,7 @@ def display_species_summary(
     threshold: float,
     n_show: int,
     inside: np.ndarray | None = None,
+    thresholds: list[float] | None = None,
 ) -> None:
     """Top hotspots d'une espèce puis sa concordance terrain.
 
@@ -848,7 +892,7 @@ def display_species_summary(
         )
         for rank, h in ranked[:n]:
             pt = hotspot_to_export_dict(h)
-            logger.info("   n°%-2d %s", rank, _hotspot_facts(h))
+            logger.info("   n°%-2d %s", rank, _hotspot_facts(h, thresholds))
             logger.info(
                 "        %.5f, %.5f · %s",
                 pt["lat"], pt["lon"], pt["google_maps"],
@@ -959,6 +1003,7 @@ def save_hotspots_gpx(
     species: str = "esculenta",
     max_waypoints: int = GPX_MAX_WAYPOINTS,
     inside: np.ndarray | None = None,
+    thresholds: list[float] | None = None,
 ) -> Path:
     """Exporte les meilleurs hotspots en GPX 1.1 (un waypoint chacun) pour
     les applis GPS — `{species}_hotspots.gpx`, à côté du CSV.
@@ -1016,7 +1061,8 @@ def save_hotspots_gpx(
 
         score = float(h.get("mean_score", 0.0))
         facts = [
-            f"Score moyen {_fr_decimal(score, 2)} ({_score_class(score)})",
+            f"Score moyen {_fr_decimal(score, 2)} "
+            f"({_score_class(score, thresholds)})",
             _area_text(float(h.get("size_m2", 0.0))),
         ]
         slope = h.get("mean_slope")
@@ -1674,6 +1720,7 @@ def main(args: argparse.Namespace) -> int:
     # ── Boucle scoring par espèce ──
     models: dict[str, MorilleScoring] = {}
     hotspots_by_species: dict[str, list[dict[str, Any]]] = {}
+    hotspot_threshold_by_species: dict[str, float] = {}
     stats_by_species: dict[str, dict[str, Any]] = {}
     concordance_by_species: dict[str, TerrainConcordance | None] = {}
 
@@ -1707,15 +1754,27 @@ def main(args: argparse.Namespace) -> int:
         sp_model.apply_monotony_penalty()
         sp_model.apply_calcdry_penalty()
         sp_model.apply_spatial_smoothing(sigma=args.smoothing_sigma)
+        # Classes par rang sur les cellules notées de la zone étudiée (D52)
+        study_mask = _study_area_mask(grid, geology_source)
+        sp_model.set_rank_thresholds(inside=study_mask)
         sp_model.classify_probability()
 
-        sp_hotspots = sp_model.get_hotspots(threshold=args.hotspot_threshold)
+        # Hotspots : seuil de la classe Bon de l'espèce, sauf seuil imposé
+        sp_threshold = (
+            args.hotspot_threshold if args.hotspot_threshold is not None
+            else sp_model.class_thresholds[_BON_INDEX - 1]
+        )
+        hotspot_threshold_by_species[species] = sp_threshold
+        sp_hotspots = sp_model.get_hotspots(threshold=sp_threshold)
         hotspots_by_species[species] = sp_hotspots
 
         # ── Statistiques par espèce ──
         _final = sp_model.final_score
         assert _final is not None
-        sp_stats = compute_statistics(_final, args.hotspot_threshold)
+        sp_stats = compute_statistics(
+            _final, sp_threshold,
+            class_thresholds=sp_model.class_thresholds, inside=study_mask,
+        )
         sp_stats["n_hotspots"] = len(sp_hotspots)
         sp_stats["species"] = species
         stats_by_species[species] = sp_stats
@@ -1765,6 +1824,7 @@ def main(args: argparse.Namespace) -> int:
         # géologie ni BD Forêt → pas de score affiché (D39)
         study_area=geology_gdf if geology_source == "bdcharm50" else None,
         default_hotspots_shown=args.map_hotspots,
+        forest_gdf=forest_gdf,
     )
     # Carte Folium HTML — UN SEUL fichier multi-espèces avec toggle
     html_path = output_dir / "cartomorilles.html"
@@ -1846,6 +1906,13 @@ def main(args: argparse.Namespace) -> int:
         # Snapshot enrichi avec params espèce
         sp_snapshot = dict(config_snapshot)
         sp_snapshot["species"] = sp
+        # Seuil réellement appliqué (classe Bon de l'espèce si non imposé)
+        sp_snapshot["hotspot_threshold"] = round(
+            hotspot_threshold_by_species[sp], 4,
+        )
+        sp_snapshot["class_thresholds"] = [
+            round(t, 4) for t in models[sp].class_thresholds
+        ]
         sp_snapshot["species_params"] = {
             k: (list(v) if isinstance(v, tuple)
                 else dict(v) if hasattr(v, "items")
@@ -1867,6 +1934,7 @@ def main(args: argparse.Namespace) -> int:
                 output_dir, hotspots_by_species[sp], species=sp,
                 max_waypoints=args.map_hotspots,
                 inside=viz.inside_study_area(hotspots_by_species[sp]),
+                thresholds=models[sp].class_thresholds,
             ))
         except OSError as e:
             logger.warning("GPX [%s] échoué : %s", sp, e)
@@ -1888,8 +1956,10 @@ def main(args: argparse.Namespace) -> int:
     for sp in species_list:
         display_species_summary(
             sp, hotspots_by_species[sp], concordance_by_species[sp],
-            threshold=args.hotspot_threshold, n_show=args.console_hotspots,
+            threshold=hotspot_threshold_by_species[sp],
+            n_show=args.console_hotspots,
             inside=viz.inside_study_area(hotspots_by_species[sp]),
+            thresholds=models[sp].class_thresholds,
         )
 
     display_outputs(output_dir, [*produced, log_path])
@@ -2055,8 +2125,12 @@ Exemples d'utilisation :
         ),
     )
     model_group.add_argument(
-        "--hotspot-threshold", type=float, default=0.60, metavar="T",
-        help="Seuil de score pour les hotspots (défaut: 0.60).",
+        "--hotspot-threshold", type=float, default=None, metavar="T",
+        help=(
+            "Seuil de score des hotspots (défaut : seuil de la classe Bon de "
+            "chaque espèce, soit ses 10 %% de cellules les mieux notées de "
+            "la zone étudiée)."
+        ),
     )
     model_group.add_argument(
         "--smoothing-sigma", type=float, default=0.5, metavar="S",

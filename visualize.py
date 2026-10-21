@@ -94,7 +94,6 @@ from shapely.geometry import box as shapely_box  # noqa: E402
 
 import _accel  # noqa: E402
 import config  # noqa: E402
-from config import TWI_WATERLOG  # noqa: E402
 from utils import TO_MERC, TO_WGS84  # noqa: E402
 
 if TYPE_CHECKING:
@@ -157,7 +156,99 @@ _ELIM_LABEL_MAP: dict[str, tuple[str, str]] = {
     "altitude": ("Exclu : altitude", "#8b4513"),
     "twi": ("Exclu : sol engorgé (TWI)", "#1f4e9c"),
 }
-_TWI_SWATCH: str = "#4575b4"
+
+# ── Calques supplémentaires (D53) : PNG de codes 8 bits, colorés en JS ──
+_EXTRA_NONE: int = 255   # pas de valeur, ou hors emprise d'étude
+# Géologie : teintes des cartes géologiques (calcaires en bleus, formations
+# meubles en jaunes et beiges, socle cristallin en roses)
+_GEOLOGY_COLORS: dict[str, str] = {
+    "calcaire": "#3f6fb5",
+    "calcaire_marneux": "#76a1d6",
+    "marne": "#93c9c3",
+    "calcaire_lacustre": "#4aa6cc",
+    "eboulis_calcaire": "#a9b7c9",
+    "dolomie": "#7d6bba",
+    "alluvions_calcaires": "#cfe3a0",
+    "alluvions": "#f0e08a",
+    "alluvions_recentes": "#fff3b5",
+    "colluvions": "#e5cd9b",
+    "moraine": "#bfb58d",
+    "flysch": "#8c9a46",
+    "sable": "#f2c35f",
+    "molasse": "#e0995a",
+    "gres": "#c4824c",
+    "schiste": "#6e9277",
+    "remblai": "#9a9a9a",
+    "hydrographie": "#2c7fb8",
+    "granite": "#e0607e",
+    "gneiss": "#f08c6a",
+    "siliceux": "#c27ba0",
+    "unknown": "#d4d4d4",
+}
+# Essences BD Forêt v2 (champ ESSENCE) : feuillus en verts et bruns,
+# conifères en bleus, classes sans essence précise en gris ou pastel
+_TREE_RAW_LABELS: dict[str, tuple[str, str]] = {
+    "Feuillus": ("Feuillus sans essence précise", "#b3cf99"),
+    "Conifères": ("Conifères sans essence précise", "#9fb8d6"),
+    "Mixte": ("Mélange feuillus et conifères", "#c7c0a3"),
+    "NC": ("Lande ou pelouse", "#e8d9b0"),
+    "NR": ("Forêt sans couvert arboré", "#d9d9d9"),
+}
+_TREE_COLORS: dict[str, str] = {
+    "chene": "#4d9221",
+    "chene_pubescent": "#b5a63a",
+    "hetre": "#1b7837",
+    "chataignier": "#a6611a",
+    "robinier": "#e6ab02",
+    "frene": "#66bd63",
+    "orme": "#a6d96a",
+    "charme": "#7fbc41",
+    "erable": "#fdae61",
+    "tilleul": "#d9ef8b",
+    "bouleau": "#fee08b",
+    "noisetier": "#dfc27d",
+    "pommier": "#f1b6da",
+    "poirier": "#de77ae",
+    "platane": "#c2e699",
+    "buis": "#00441b",
+    "peuplier": "#5ab4ac",
+    "aulne": "#35978f",
+    "saule": "#80cdc1",
+    "sapin": "#2166ac",
+    "epicea": "#4393c3",
+    "douglas": "#053061",
+    "pin_sylvestre": "#8073ac",
+    "meleze": "#92c5de",
+    "unknown": "#bdbdbd",
+}
+_EXTRA_FALLBACK_COLORS: tuple[str, ...] = (
+    "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628", "#f781bf",
+)
+# Rampes continues : (valeur, couleur) ; repères de légende régulièrement
+# espacés sur la rampe. TWI : du sec (brun) à l'engorgé (bleu nuit).
+_TWI_STOPS: tuple[tuple[float, str], ...] = (
+    (2.0, "#8c510a"), (5.0, "#d8b365"), (8.0, "#f6e8c3"), (11.0, "#c7eae5"),
+    (14.0, "#5ab4ac"), (17.0, "#01665e"), (20.0, "#08306b"),
+)
+_TWI_TICKS: tuple[tuple[float, str], ...] = (
+    (2.0, "2"), (8.0, "8"), (14.0, "14"), (20.0, "20"),
+)
+_SLOPE_STOPS: tuple[tuple[float, str], ...] = (
+    (0.0, "#ffffcc"), (10.0, "#ffeda0"), (20.0, "#feb24c"), (30.0, "#f03b20"),
+    (45.0, "#bd0026"), (60.0, "#54278f"),
+)
+_SLOPE_TICKS: tuple[tuple[float, str], ...] = (
+    (0.0, "0°"), (15.0, "15°"), (30.0, "30°"), (45.0, "45°"), (60.0, "60°"),
+)
+# Aire drainée D8 en log10(m²) : crêtes (orangé), versants (pâle), talwegs
+# et rivières (bleus)
+_AREA_STOPS: tuple[tuple[float, str], ...] = (
+    (3.0, "#f4a259"), (4.0, "#fff5c2"), (5.0, "#c6dbef"), (6.0, "#6baed6"),
+    (7.0, "#2171b5"), (9.0, "#08306b"),
+)
+_AREA_TICKS: tuple[tuple[float, str], ...] = (
+    (3.0, "0,1 ha"), (5.0, "10 ha"), (7.0, "10 km²"), (9.0, "1 000 km²"),
+)
 # Couleur des observations iNaturalist (hors de la palette des scores)
 _INAT_COLOR: str = "#6a3d9a"
 # Les observations iNaturalist sont des Morchella (species_enricher) :
@@ -500,6 +591,14 @@ class _OverlaySpec(NamedTuple):
     log_msg: str
 
 
+class _ExtraSpec(NamedTuple):
+    """Calque supplémentaire (D53) : description pour le panneau et le JS,
+    et rendu de son PNG de codes (None = lu dans le PNG terrain)."""
+
+    cfg: dict[str, Any]
+    render: Callable[[], bytes] | None
+
+
 # ═══════════════════════════════════════════════════════════
 # Classe principale
 # ═══════════════════════════════════════════════════════════
@@ -520,10 +619,13 @@ class MorilleVisualizer:
         debug_layers: bool = False,
         default_hotspots_shown: int = _DEFAULT_HOTSPOTS_SHOWN,
         study_area: Any = None,
+        forest_gdf: gpd.GeoDataFrame | None = None,
     ) -> None:
         """study_area : emprise d'étude (GeoDataFrame dont on fait l'union,
         ou géométrie Lambert-93). Hors emprise, la carte n'affiche ni score
-        ni hotspot et estompe le fond (D39). None = pas de restriction."""
+        ni hotspot et estompe le fond (D39). None = pas de restriction.
+        forest_gdf : BD Forêt v2, pour le calque des essences telles que
+        publiées (D53) ; sans elle, essences canoniques de la grille."""
         # ── v2.6.0 — accepter dict[species, MorilleScoring] OU instance unique
         if isinstance(scoring_model, dict):
             self.models: dict[str, MorilleScoring] = dict(scoring_model)
@@ -560,6 +662,7 @@ class MorilleVisualizer:
         self.max_hotspot_markers = max_hotspot_markers
         self._hydro_gdf = hydro_gdf
         self._urban_gdf = urban_gdf
+        self._forest_gdf = forest_gdf
         self._inat_observations: list[dict[str, Any]] = inat_observations or []
         self._weather_days: list[Any] = weather_days or []
         self.debug_layers = debug_layers
@@ -741,10 +844,12 @@ class MorilleVisualizer:
         arr: np.ndarray,
         *,
         is_mask: bool = False,
+        nearest: bool = False,
     ) -> np.ndarray:
-        """Reprojette un array 2D L93 → WGS84.
+        """Reprojette un array 2D L93 → grille de rendu Web Mercator.
 
-        Bilinéaire systématique. Masques seuillés à 0.5 après reprojection.
+        Bilinéaire, ou plus proche voisin (`nearest`, codes catégoriels).
+        Masques seuillés à 0.5 après reprojection.
         """
         oriented = self._orient_for_overlay(arr)
         src = oriented.astype(np.float32)
@@ -766,7 +871,7 @@ class MorilleVisualizer:
             src_crs=self._src_crs,
             dst_transform=self._dst_transform,
             dst_crs=self._dst_crs,
-            resampling=Resampling.bilinear,
+            resampling=Resampling.nearest if nearest else Resampling.bilinear,
         )
         if is_mask:
             return np.asarray(np.nan_to_num(dst, nan=0.0) > 0.5)
@@ -859,22 +964,6 @@ class MorilleVisualizer:
         return rgba
 
     @staticmethod
-    def _colorize_twi_raw(reprojected: np.ndarray) -> np.ndarray:
-        """Colorise TWI brut → RGBA uint8 (RdYlBu)."""
-        vmin, vmax = 0.0, float(TWI_WATERLOG) + 2.0
-        valid = np.isfinite(reprojected)
-        norm = np.zeros_like(reprojected, dtype=np.float32)
-        norm[valid] = np.clip(
-            (reprojected[valid] - vmin) / (vmax - vmin), 0.0, 1.0,
-        )
-        cmap = matplotlib.colormaps["RdYlBu"]
-        colored = cmap(norm)
-        rgba = np.zeros((*reprojected.shape, 4), dtype=np.uint8)
-        rgba[..., :3] = (colored[..., :3] * 255).astype(np.uint8)
-        rgba[..., 3] = np.where(valid, 200, 0).astype(np.uint8)
-        return rgba
-
-    @staticmethod
     def _png_to_data_uri(png_bytes: bytes) -> str:
         b64 = base64.b64encode(png_bytes).decode("ascii")
         return f"data:image/png;base64,{b64}"
@@ -913,7 +1002,7 @@ class MorilleVisualizer:
     def _prepare_diagnostics(self) -> list[_OverlaySpec]:
         """Couches de diagnostic : zones exclues par espèce (un seul
         exemplaire quand le masque est identique pour toutes les espèces,
-        ex. urbain ou eau) et TWI brut."""
+        ex. urbain ou eau). Le TWI est un calque supplémentaire (D53)."""
         specs: list[_OverlaySpec] = []
 
         masks: dict[str, dict[str, np.ndarray]] = {}
@@ -954,32 +1043,292 @@ class MorilleVisualizer:
                     ),
                 ))
 
-        twi_raw = getattr(self.grid, "twi", None)
-        if isinstance(twi_raw, np.ndarray) and np.any(np.isfinite(twi_raw)):
-            rep_twi = self._reproject_to_wgs84(
-                np.asarray(twi_raw, dtype=np.float32),
-            )
-            rng = (
-                f"[{float(np.nanmin(twi_raw)):.1f}, "
-                f"{float(np.nanmax(twi_raw)):.1f}]"
-            )
-
-            def render_twi(_r: np.ndarray = rep_twi) -> bytes:
-                return _encode_rgba(MorilleVisualizer._colorize_twi_raw(_r))
-
-            specs.append(_OverlaySpec(
-                key="twi-raw",
-                group="twi-raw",
-                label="TWI brut (humidité du sol)",
-                species=None,
-                render=render_twi,
-                opacity=0.65,
-                swatch=_TWI_SWATCH,
-                log_msg=f"Diagnostic TWI brut — plage {rng}",
-            ))
-
         logger.info("✅ %d couches de diagnostic préparées", len(specs))
         return specs
+
+    # ──────────────────────────────────────────────────────
+    # Calques supplémentaires (D53) : un PNG de codes 8 bits par calque,
+    # coloré par le JS ; 255 = pas de valeur ou hors emprise d'étude
+    # ──────────────────────────────────────────────────────
+    def _extra_codes(
+        self,
+        arr: np.ndarray,
+        *,
+        nearest: bool = False,
+        vmin: float = 0.0,
+        step: float = 1.0,
+        max_code: int = _EXTRA_NONE - 1,
+    ) -> np.ndarray:
+        """Grille L93 → codes uint8 sur la grille de rendu Mercator :
+        round((valeur − vmin) / step) borné à [0, max_code]."""
+        rep = self._reproject_to_wgs84(
+            np.asarray(arr, dtype=np.float32), nearest=nearest,
+        )
+        codes = np.full(rep.shape, _EXTRA_NONE, dtype=np.uint8)
+        ok = np.isfinite(rep)
+        codes[ok] = np.clip(
+            np.rint((rep[ok] - vmin) / step), 0, max_code,
+        ).astype(np.uint8)
+        if self._study_mask is not None:
+            codes[~self._study_mask] = _EXTRA_NONE
+        return codes
+
+    def _extra_shares(self, codes: np.ndarray) -> np.ndarray:
+        """Part de la zone étudiée couverte par chaque code (sans emprise
+        d'étude : part de la zone renseignée)."""
+        counts = np.bincount(codes.ravel(), minlength=256).astype(np.float64)
+        total = (
+            float(np.count_nonzero(self._study_mask))
+            if self._study_mask is not None
+            else float(counts[:_EXTRA_NONE].sum())
+        )
+        return counts / max(total, 1.0)
+
+    def _categorical_extra(
+        self,
+        cfg: dict[str, Any],
+        raster: np.ndarray,
+        classes: dict[int, tuple[str, str]],
+    ) -> _ExtraSpec | None:
+        """Calque catégoriel : `raster` = codes > 0 sur la grille (0 = rien),
+        `classes` = code → (libellé, couleur). Légende triée par part de
+        la zone étudiée, classes absentes de la zone omises."""
+        src = np.asarray(raster)
+        if src.shape != self._final_score.shape or not classes:
+            return None
+        if max(classes) >= _EXTRA_NONE:
+            logger.warning("Calque %s : trop de classes, ignoré", cfg["label"])
+            return None
+        codes = self._extra_codes(
+            np.where(src > 0, src, np.nan), nearest=True,
+        )
+        shares = self._extra_shares(codes)
+        legend = [
+            {"code": int(code), "label": label, "color": color,
+             "share": round(float(shares[code]), 4)}
+            for code, (label, color) in classes.items()
+            if shares[code] > 0
+        ]
+        if not legend:
+            return None
+        legend.sort(key=lambda c: -float(c["share"]))
+        cfg = {**cfg, "kind": "cat", "none": _EXTRA_NONE, "classes": legend}
+        logger.info(
+            "✅ Calque %s : %d classes, %.0f %% de la zone étudiée",
+            cfg["label"], len(legend), sum(float(c["share"]) for c in legend) * 100,
+        )
+        return _ExtraSpec(cfg, lambda _c=codes: self._encode_opaque_png(_c))
+
+    def _numeric_extra(
+        self,
+        cfg: dict[str, Any],
+        arr: np.ndarray | None,
+        *,
+        vmin: float,
+        step: float,
+        vmax: float,
+    ) -> _ExtraSpec | None:
+        """Calque continu : valeur = vmin + code × step (code ≤ 254)."""
+        if not isinstance(arr, np.ndarray) or arr.shape != self._final_score.shape:
+            return None
+        if not np.any(np.isfinite(arr)):
+            return None
+        max_code = int(round((vmax - vmin) / step))
+        codes = self._extra_codes(arr, vmin=vmin, step=step, max_code=max_code)
+        cfg = {**cfg, "kind": "num", "none": _EXTRA_NONE, "vmin": vmin,
+               "step": step, "maxCode": max_code}
+        logger.info("✅ Calque %s préparé", cfg["label"])
+        return _ExtraSpec(cfg, lambda _c=codes: self._encode_opaque_png(_c))
+
+    def _tree_extra_classes(self) -> tuple[np.ndarray, dict[int, tuple[str, str]]] | None:
+        """Essences BD Forêt v2 telles que publiées (champ ESSENCE : une
+        essence, ou feuillus / conifères / mélange sans essence précise,
+        lande ou pelouse), rasterisées comme le modèle (all_touched) ; les
+        classes sans essence précise d'abord, une essence l'emporte en cas
+        de chevauchement. Sans ce champ : essences canoniques du modèle."""
+        gdf = self._forest_gdf
+        if gdf is not None and not gdf.empty and "ESSENCE" in gdf.columns:
+            if gdf.crs is not None and gdf.crs.to_epsg() != 2154:
+                gdf = gdf.to_crs(epsg=2154)
+            geom = gdf.geometry
+            gdf = gdf.loc[geom.notna() & ~geom.is_empty & geom.is_valid]
+            raw = gdf["ESSENCE"].fillna("NR").astype(str).str.strip()
+            names = sorted(set(raw), key=lambda r: (r not in _TREE_RAW_LABELS, r))
+            if len(names) < _EXTRA_NONE:
+                code_of = {name: i + 1 for i, name in enumerate(names)}
+                codes = raw.map(code_of).to_numpy(dtype=np.int16)
+                order = np.argsort(codes, kind="stable")
+                geoms = gdf.geometry.to_numpy()[order]
+                raster = _accel.parallel_rasterize_categorical(
+                    geometries=list(geoms),
+                    category_codes=codes[order],
+                    out_shape=(int(self.grid.ny), int(self.grid.nx)),
+                    transform=self.grid.transform,
+                    all_touched=True,
+                    nodata=0,
+                )
+                fallback = iter(_EXTRA_FALLBACK_COLORS * 4)
+                classes: dict[int, tuple[str, str]] = {}
+                for name, code in code_of.items():
+                    if name in _TREE_RAW_LABELS:
+                        classes[code] = _TREE_RAW_LABELS[name]
+                    else:
+                        canon = config.resolve_tree_name(name)
+                        classes[code] = (
+                            name,
+                            _TREE_COLORS.get(canon) or next(fallback),
+                        )
+                return np.asarray(raster), classes
+        raster = getattr(self.grid, "_tree_species_int_raster", None)
+        names_by_code = getattr(self.grid, "_tree_code_to_name", None) or {}
+        if not isinstance(raster, np.ndarray) or not names_by_code:
+            return None
+        fallback = iter(_EXTRA_FALLBACK_COLORS * 4)
+        return raster, {
+            int(code): (
+                "Essence non précisée" if name == "unknown"
+                else config.tree_label(name) or str(name),
+                _TREE_COLORS.get(str(name)) or next(fallback),
+            )
+            for code, name in names_by_code.items()
+        }
+
+    def _species_groups(self, key: Callable[[dict[str, Any]], Any]) -> list[tuple[Any, str]]:
+        """Espèces de la carte regroupées par valeur de paramètre :
+        [(valeur, « Morille grise et Morille noire »), …]."""
+        groups: dict[Any, list[str]] = {}
+        for sp in self.species_list:
+            value = key(dict(config.get_species_params(sp)))
+            groups.setdefault(value, []).append(self._species_info(sp)["name"])
+        return [
+            (value, " et ".join(
+                [", ".join(names[:-1]), names[-1]] if len(names) > 1 else names,
+            ))
+            for value, names in groups.items()
+        ]
+
+    def _prepare_extra_layers(self) -> list[_ExtraSpec]:
+        """Calques supplémentaires du panneau (D53) : nature du sol,
+        essences forestières, humidité du sol (TWI), pente et aire drainée
+        (la morphologie du calcul du TWI). Un seul est affiché à la fois."""
+        specs: list[_ExtraSpec | None] = []
+
+        def num(value: float) -> str:
+            return f"{value:g}".replace(".", ",")
+
+        # ── Nature du sol : catégories géologiques du modèle ──
+        geo_raster = getattr(self.grid, "_geology_int_raster", None)
+        geo_names = getattr(self.grid, "_geology_code_to_name", None) or {}
+        if isinstance(geo_raster, np.ndarray) and geo_names:
+            fallback = iter(_EXTRA_FALLBACK_COLORS * 4)
+            excluded = [
+                f"{names} : "
+                + ", ".join(
+                    (config.geology_label(g) or g).lower() for g in sorted(geos)
+                )
+                for geos, names in self._species_groups(
+                    lambda p: frozenset(p.get("eliminatory_geology", ())),
+                )
+                if geos
+            ]
+            specs.append(self._categorical_extra(
+                {
+                    "key": "geology", "label": "Nature du sol (géologie)",
+                    "short": "Sol",
+                    "hint": "Carte géologique harmonisée BDCharm-50 (BRGM), "
+                            "regroupée dans les catégories du modèle."
+                            + (" Exclu pour " + " ; ".join(excluded) + "."
+                               if excluded else ""),
+                },
+                geo_raster,
+                {
+                    int(code): (
+                        "Non classée" if name == "unknown"
+                        else config.geology_label(name) or str(name),
+                        _GEOLOGY_COLORS.get(str(name)) or next(fallback),
+                    )
+                    for code, name in geo_names.items()
+                },
+            ))
+
+        # ── Essences forestières (BD Forêt v2) ──
+        trees = self._tree_extra_classes()
+        if trees is not None:
+            specs.append(self._categorical_extra(
+                {
+                    "key": "trees", "label": "Essences forestières",
+                    "short": "Végétation", "noneText": "hors forêt",
+                    "hint": "BD Forêt v2 (IGN) : essence du peuplement. Sans "
+                            "essence précise (feuillus, conifères, mélange), "
+                            "le modèle l'estime par la composition régionale "
+                            "de l'inventaire forestier (IFN).",
+                },
+                trees[0], trees[1],
+            ))
+
+        # ── Humidité du sol : TWI ──
+        twi_text = " ; ".join(
+            f"{names} : optimum {num(opt[0])}–{num(opt[1])}, exclu au-delà "
+            f"de {num(wl)}"
+            for (opt, wl), names in self._species_groups(
+                lambda p: (tuple(p.get("twi_optimal", (6.0, 10.0))),
+                           float(p.get("twi_waterlog", 18.0))),
+            )
+        )
+        specs.append(self._numeric_extra(
+            {
+                "key": "twi", "label": "Humidité du sol (TWI)", "unit": "twi",
+                "hint": "Indice topographique d'humidité TWI = ln(aire drainée "
+                        "/ tan pente) : faible sur les crêtes et les pentes "
+                        "raides, fort dans les creux et replats où l'eau "
+                        f"converge. {twi_text}.",
+                "stops": [list(s) for s in _TWI_STOPS],
+                "ticks": [list(t) for t in _TWI_TICKS],
+                "ends": ["sec", "engorgé"],
+            },
+            getattr(self.grid, "twi", None), vmin=0.0, step=0.1, vmax=25.0,
+        ))
+
+        # ── Pente : lue dans le PNG terrain (déjà dans la page) ──
+        slope = getattr(self.grid, "slope", None)
+        if isinstance(slope, np.ndarray) and slope.shape == self._final_score.shape:
+            opt_text = " ; ".join(
+                f"{names} : optimum {num(opt[0])}–{num(opt[1])}°, exclu "
+                f"au-delà de {num(smax)}°"
+                for (opt, smax), names in self._species_groups(
+                    lambda p: (tuple(p.get("slope_optimal", (0.0, 15.0))),
+                               float(p.get("slope_max", 45.0))),
+                )
+            )
+            specs.append(_ExtraSpec({
+                "key": "slope", "label": "Pente", "unit": "deg", "kind": "num",
+                "src": "terrain", "none": 0,
+                "vmin": -_SLOPE_OFFSET / _SLOPE_SCALE, "step": 1 / _SLOPE_SCALE,
+                "maxCode": 181,
+                "hint": "Pente du MNT Copernicus (méthode de Horn), en degrés. "
+                        f"{opt_text}.",
+                "stops": [list(s) for s in _SLOPE_STOPS],
+                "ticks": [list(t) for t in _SLOPE_TICKS],
+                "ends": ["plat", "falaise"],
+            }, None))
+
+        # ── Aire drainée D8 : la morphologie du calcul du TWI ──
+        specs.append(self._numeric_extra(
+            {
+                "key": "area", "label": "Aire drainée (morphologie)",
+                "unit": "log10m2",
+                "hint": "Surface en amont dont l'eau s'écoule vers chaque "
+                        "point (écoulement D8 du MNT) : minimale sur les "
+                        "crêtes, maximale dans les talwegs et les vallées. "
+                        "Avec la pente, elle donne le TWI.",
+                "stops": [list(s) for s in _AREA_STOPS],
+                "ticks": [list(t) for t in _AREA_TICKS],
+                "ends": ["crêtes", "talwegs, rivières"],
+            },
+            getattr(self.grid, "drained_area_log10", None),
+            vmin=2.0, step=0.05, vmax=11.0,
+        ))
+        return [s for s in specs if s is not None]
 
     # ──────────────────────────────────────────────────────
     # Data PNG (score par espèce) + PNG terrain (pente + altitude)
@@ -1096,14 +1445,28 @@ class MorilleVisualizer:
         diag_layers: list[dict[str, Any]],
         hotspots: dict[str, list[dict[str, Any]]],
         weather_html: str,
+        extra_layers: list[dict[str, Any]] | None = None,
+        extra_uris: dict[str, str] | None = None,
     ) -> None:
         """Injecte le panneau latéral (espèce, légende-filtre, opacité,
         hotspots, couches, météo), la lecture de cellule et le JS qui rend
         l'unique couche de probabilité depuis le data PNG de l'espèce
         active."""
         labels = list(config.PROBABILITY_LABELS)
-        thresholds = [float(t) for t in config.PROBABILITY_THRESHOLDS]
-        palette = _palette_cfg(_CMAP_STOPS, _CMAP, thresholds)
+        # Couleurs des classes : palette de référence aux seuils absolus ;
+        # le JS cale ses arrêts sur les seuils par rang de chaque espèce
+        # (D52), donc chaque classe garde sa couleur.
+        palette = _palette_cfg(
+            _CMAP_STOPS, _CMAP,
+            [float(t) for t in config.PROBABILITY_THRESHOLDS],
+        )
+        thresholds = {
+            sp: [float(t) for t in getattr(
+                self.models[sp], "class_thresholds",
+                config.PROBABILITY_THRESHOLDS,
+            )]
+            for sp in self.species_list
+        }
         info = {sp: self._species_info(sp) for sp in self.species_list}
 
         species_radios = "".join(
@@ -1149,8 +1512,15 @@ class MorilleVisualizer:
         diag_block = (
             '<details class="cs-diag"><summary>Couches de diagnostic</summary>'
             '<p class="cs-hint">Zones exclues du modèle pour l\'espèce '
-            'affichée, et TWI brut.</p><div id="cs-diag-list"></div></details>'
+            'affichée.</p><div id="cs-diag-list"></div></details>'
             if diag_layers else ""
+        )
+        extra_layers = extra_layers or []
+        extra_uris = extra_uris or {}
+        extra_imgs = "\n".join(
+            f'<img id="cartom-extra-img-{html.escape(key)}" data-src="{uri}" '
+            f'alt="" hidden>'
+            for key, uri in extra_uris.items()
         )
         data_imgs = "\n".join(
             f'<img id="cartom-data-img-{html.escape(sp)}" src="{uri}" '
@@ -1160,6 +1530,44 @@ class MorilleVisualizer:
         subtitle = (
             f"Isère · maille {float(config.CELL_SIZE):.0f} m · "
             f"générée le {datetime.now():%d/%m/%Y}"
+        )
+        # Classes par rang (D52) : rappel du principe sous la légende, si
+        # toutes les espèces ont bien leurs seuils par rang
+        rank_hint = ""
+        if all(thresholds[sp] != [float(t) for t in config.PROBABILITY_THRESHOLDS]
+               for sp in self.species_list):
+            q = list(config.CLASS_RANK_QUANTILES)
+            shares = [q[0], *(b - a for a, b in zip(q, q[1:])), 1.0 - q[-1]]
+            pct = [f"{round(s * 100)} %" for s in shares]
+            rank_hint = (
+                '<p class="cs-hint">Classes par rang, propres à chaque '
+                f"espèce : Excellent = les {pct[4]} de cellules notées de la "
+                f"zone étudiée les mieux classées, Bon = {pct[3]} suivants, "
+                f"Moyen = {pct[2]}, Faible = {pct[1]}, Très faible = "
+                f"{pct[0]}.</p>"
+            )
+        # Calques supplémentaires (D53) : un à la fois, par-dessus la
+        # probabilité, dans un volet repliable de la section Couches
+        extra_radios = "".join(
+            f'<label class="cs-check"><input type="radio" name="cs-extra" '
+            f'value="{html.escape(str(x["key"]))}"><span>'
+            f'{html.escape(str(x["label"]))}</span></label>'
+            for x in extra_layers
+        )
+        extra_block = (
+            '<details class="cs-diag cs-extra" id="cs-extra"><summary>Calques '
+            'supplémentaires</summary><div class="cs-extra-list" '
+            'role="radiogroup" aria-label="Calque supplémentaire">'
+            '<label class="cs-check"><input type="radio" name="cs-extra" '
+            f'value="" checked><span>Aucun</span></label>{extra_radios}</div>'
+            '<p class="cs-hint" id="cs-extra-hint" hidden></p>'
+            '<ul class="cs-legend cs-extra-legend" id="cs-extra-legend"></ul>'
+            '<div class="cs-row" id="cs-extra-oprow" hidden>'
+            '<label for="cs-extra-op">Opacité</label>'
+            '<input type="range" id="cs-extra-op" min="0" max="100" value="80">'
+            '<output id="cs-extra-op-val" for="cs-extra-op">80 %</output></div>'
+            "</details>"
+            if extra_layers else ""
         )
         # La carte montre le potentiel du terrain ; la météo du jour est
         # une information à part, dans la section météo du panneau (D45).
@@ -1182,6 +1590,7 @@ class MorilleVisualizer:
             "east": self._east,
             "labels": labels,
             "thresholds": thresholds,
+            "rankQuantiles": list(config.CLASS_RANK_QUANTILES),
             "classAlpha": _class_alphas(len(labels)),
             "palette": palette,
             "scoreScale": _SCORE_SCALE,
@@ -1208,6 +1617,7 @@ class MorilleVisualizer:
                 "veilOpacity": _AREA_VEIL_OPACITY,
             },
             "diag": diag_layers,
+            "extra": extra_layers,
         }
 
         block = r"""
@@ -1308,6 +1718,27 @@ class MorilleVisualizer:
         .cs-dot { width: 12px; height: 12px; border-radius: 50%; flex: none;
                   border: 1px solid rgba(0,0,0,.25); }
         .cs-diag summary { cursor: pointer; color: #4a554a; margin: 6px 0; }
+        .cs-extra summary { color: #1f2a1f; font-weight: 600; }
+        .cs-extra-list { margin: 0 0 6px; }
+        .cs-legend li.cs-ramp { display: block; padding: 4px 10px 0; }
+        .cs-ramp-bar {
+            display: block; height: 12px; border-radius: 3px;
+            border: 1px solid rgba(0,0,0,.3);
+        }
+        .cs-ramp-ticks {
+            position: relative; display: block; height: 20px;
+            font-size: 12px; color: #4a554a; font-variant-numeric: tabular-nums;
+        }
+        .cs-ramp-ticks span {
+            position: absolute; top: 3px; transform: translateX(-50%); white-space: nowrap;
+        }
+        .cs-ramp-ticks span:first-child { transform: none; }
+        .cs-ramp-ticks span:last-child { transform: translateX(-100%); }
+        .cs-ramp-ends {
+            display: flex; justify-content: space-between; gap: 8px;
+            font-size: 12px; color: #4a554a;
+        }
+        .cs-extra-cat { image-rendering: pixelated; }
         .cs-wx table { border-collapse: collapse; width: 100%; font-size: 12px; }
         .cs-wx td { padding: 2px 4px; }
         .cs-wx .wx-good  { color: #1e6b3a; font-weight: 600; }
@@ -1407,6 +1838,7 @@ class MorilleVisualizer:
                     <h2 id="cs-legend-title">Probabilité</h2>
                     <p class="cs-hint">Cliquez une classe pour la masquer ou l'afficher.</p>
                     <ul class="cs-legend" id="cs-legend"></ul>
+                    %RANK_HINT%
                     %WEATHER_HINT%
                     <button type="button" class="cs-link" id="cs-legend-reset" hidden>Tout afficher</button>
                     <div class="cs-row">
@@ -1431,6 +1863,7 @@ class MorilleVisualizer:
                     <label class="cs-label" for="cs-basemap">Fond de carte</label>
                     <select id="cs-basemap" class="cs-select">%BASEMAP_OPTIONS%</select>
                     <div id="cs-layers">%LAYER_CHECKS%</div>
+                    %EXTRA_BLOCK%
                     %DIAG_BLOCK%
                 </section>
                 %WEATHER_SECTION%
@@ -1441,6 +1874,7 @@ class MorilleVisualizer:
         <div id="cs-readout" class="cs-readout" aria-live="polite">Chargement de la carte…</div>
         <img id="cartom-terrain-img" src="%TERRAIN_URI%" alt="" hidden>
         %DATA_IMGS%
+        %EXTRA_IMGS%
 
         <script>
         (function () {
@@ -1453,7 +1887,8 @@ class MorilleVisualizer:
                 return;
             }
 
-            var LABELS = CFG.labels, TH = CFG.thresholds, ALPHA = CFG.classAlpha;
+            /* Seuils des classes : propres à l'espèce affichée (par rang, D52) */
+            var LABELS = CFG.labels, TH = CFG.thresholds[CFG.primary], ALPHA = CFG.classAlpha;
             var N = CFG.scoreScale, OUT = CFG.outCode;
             var SW = CFG.palette.swatches, SWTXT = CFG.palette.swatchText;
             var IDLE = 'Survolez ou touchez la carte';
@@ -1514,13 +1949,19 @@ class MorilleVisualizer:
 
             /* ═══════ Couleurs : LUT score → couleur continue + classe ═══════ */
             var lutRgb = new Uint8ClampedArray((N + 1) * 3), lutCls = new Uint8Array(N + 1);
-            (function () {
-                var stops = CFG.palette.stops.map(function (s) { return [s[0], hexToRgb(s[1])]; });
+            /* Arrêts de la palette calés sur les seuils de l'espèce (0, seuils,
+               1) : chaque classe garde sa couleur quels que soient ses seuils. */
+            function buildLut() {
+                var pos = [0].concat(TH, [1]);
+                var stops = CFG.palette.stops.map(function (s, i) {
+                    return [pos[i], hexToRgb(s[1])];
+                });
                 for (var v = 0; v <= N; v++) {
                     var s = v / N, rgb = stops[stops.length - 1][1];
                     for (var i = 1; i < stops.length; i++) {
                         if (s <= stops[i][0]) {
-                            var t = (s - stops[i - 1][0]) / (stops[i][0] - stops[i - 1][0]);
+                            var span = stops[i][0] - stops[i - 1][0];
+                            var t = span > 0 ? (s - stops[i - 1][0]) / span : 1;
                             var a = stops[i - 1][1], b = stops[i][1];
                             rgb = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
                                    a[2] + (b[2] - a[2]) * t];
@@ -1530,7 +1971,8 @@ class MorilleVisualizer:
                     lutRgb[v * 3] = rgb[0]; lutRgb[v * 3 + 1] = rgb[1]; lutRgb[v * 3 + 2] = rgb[2];
                     lutCls[v] = classOf(s);
                 }
-            })();
+            }
+            buildLut();
 
             /* ═══════ Données : score par espèce + terrain (R=pente, G+B=altitude) ═══════ */
             var dataPx = {}, dataW = 0, dataH = 0, terrainPx = null;
@@ -1789,6 +2231,177 @@ class MorilleVisualizer:
                 });
             }
 
+            /* ═══════ Calques supplémentaires (D53) : un seul à la fois ═══════ */
+            /* Un PNG de codes 8 bits par calque (pente : canal R du PNG
+               terrain), décodé au premier affichage et coloré ici ; même
+               grille que le score, masqué hors zone étudiée (D39). */
+            var EXTRA = CFG.extra || [], extraByKey = {}, extraKey = '';
+            var extraPx = {}, extraLuts = {}, extraOverlays = {};
+            var extraHint = document.getElementById('cs-extra-hint');
+            var extraLegend = document.getElementById('cs-extra-legend');
+            var extraOpRow = document.getElementById('cs-extra-oprow');
+            var extraOp = document.getElementById('cs-extra-op');
+            var extraOpOut = document.getElementById('cs-extra-op-val');
+            EXTRA.forEach(function (x) {
+                extraByKey[x.key] = x;
+                if (x.kind === 'cat') {
+                    x.byCode = {};
+                    x.classes.forEach(function (c) { x.byCode[c.code] = c; });
+                }
+            });
+            function extraOpacity() { return extraOp ? parseInt(extraOp.value, 10) / 100 : 0.8; }
+            function rampRgb(stops, v) {
+                if (v <= stops[0][0]) { return hexToRgb(stops[0][1]); }
+                for (var i = 1; i < stops.length; i++) {
+                    if (v <= stops[i][0]) {
+                        var t = (v - stops[i - 1][0]) / (stops[i][0] - stops[i - 1][0]);
+                        var a = hexToRgb(stops[i - 1][1]), b = hexToRgb(stops[i][1]);
+                        return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
+                                a[2] + (b[2] - a[2]) * t];
+                    }
+                }
+                return hexToRgb(stops[stops.length - 1][1]);
+            }
+            /* Code → RGBA (alpha 0 = transparent) */
+            function extraLut(x) {
+                if (extraLuts[x.key]) { return extraLuts[x.key]; }
+                var lut = new Uint8ClampedArray(256 * 4);
+                function put(k, rgb) {
+                    lut[k * 4] = rgb[0]; lut[k * 4 + 1] = rgb[1];
+                    lut[k * 4 + 2] = rgb[2]; lut[k * 4 + 3] = 255;
+                }
+                if (x.kind === 'cat') {
+                    x.classes.forEach(function (c) { put(c.code, hexToRgb(c.color)); });
+                } else {
+                    for (var k = 0; k <= x.maxCode; k++) {
+                        if (k !== x.none) { put(k, rampRgb(x.stops, x.vmin + k * x.step)); }
+                    }
+                }
+                return (extraLuts[x.key] = lut);
+            }
+            function extraPixels(x) {
+                if (x.src === 'terrain') { return terrainPx; }
+                if (extraPx[x.key]) { return extraPx[x.key]; }
+                var img = document.getElementById('cartom-extra-img-' + x.key);
+                if (img && !img.getAttribute('src')) {
+                    img.addEventListener('load', function () {
+                        extraPx[x.key] = pixels(img);
+                        if (extraKey === x.key) { renderExtra(); }
+                        if (pointPopup.isOpen()) { pointPopup.update(); }
+                    }, {once: true});
+                    img.src = img.getAttribute('data-src');
+                }
+                return null;
+            }
+            function renderExtra() {
+                var x = extraByKey[extraKey];
+                Object.keys(extraOverlays).forEach(function (k) {
+                    if (k !== extraKey) { map.removeLayer(extraOverlays[k]); }
+                });
+                if (!x) { return; }
+                if (extraOverlays[x.key]) {
+                    extraOverlays[x.key].setOpacity(extraOpacity()).addTo(map);
+                    return;
+                }
+                var px = extraPixels(x), area = dataPx[current];
+                if (!px || !area || px.length !== area.length) { return; }
+                var lut = extraLut(x), c = document.createElement('canvas');
+                c.width = dataW; c.height = dataH;
+                var ctx = c.getContext('2d'), out = ctx.createImageData(dataW, dataH), dd = out.data;
+                for (var i = 0, n = dataW * dataH; i < n; i++) {
+                    var o = i * 4;
+                    if (area[o] === OUT) { continue; }
+                    var k = px[o] * 4;
+                    if (!lut[k + 3]) { continue; }
+                    dd[o] = lut[k]; dd[o + 1] = lut[k + 1]; dd[o + 2] = lut[k + 2]; dd[o + 3] = 255;
+                }
+                ctx.putImageData(out, 0, 0);
+                var key = x.key;
+                c.toBlob(function (blob) {
+                    if (!blob || extraOverlays[key]) { return; }
+                    extraOverlays[key] = L.imageOverlay(URL.createObjectURL(blob), CFG.bounds, {
+                        opacity: extraOpacity(), interactive: false, zIndex: 2,
+                        className: x.kind === 'cat' ? 'cs-extra-cat' : 'cs-prob'
+                    });
+                    if (extraKey === key) { extraOverlays[key].addTo(map); }
+                }, 'image/png');
+            }
+            function shareText(s) {
+                if (s >= 0.095) { return fmt(s * 100, 0) + ' %'; }
+                if (s >= 0.001) { return fmt(s * 100, 1) + ' %'; }
+                return '< 0,1 %';
+            }
+            function buildExtraLegend() {
+                var x = extraByKey[extraKey];
+                if (!extraLegend) { return; }
+                extraLegend.innerHTML = '';
+                extraHint.hidden = !x; extraOpRow.hidden = !x;
+                if (!x) { return; }
+                extraHint.textContent = x.hint || '';
+                if (x.kind === 'cat') {
+                    x.classes.forEach(function (c) {
+                        var li = document.createElement('li');
+                        li.innerHTML = '<span class="cs-nul"><span class="cs-swatch" style="background:'
+                            + c.color + '" aria-hidden="true"></span><span>' + esc(c.label)
+                            + '</span><span class="cs-range" title="Part de la zone étudiée">'
+                            + shareText(c.share) + '</span></span>';
+                        extraLegend.appendChild(li);
+                    });
+                    return;
+                }
+                var lo = x.stops[0][0], hi = x.stops[x.stops.length - 1][0];
+                function pos(v) { return ((v - lo) / (hi - lo) * 100).toFixed(1) + '%'; }
+                var li = document.createElement('li');
+                li.className = 'cs-ramp';
+                li.innerHTML = '<span class="cs-ramp-bar" aria-hidden="true" '
+                    + 'style="background:linear-gradient(90deg,'
+                    + x.stops.map(function (s) { return s[1] + ' ' + pos(s[0]); }).join(',')
+                    + ')"></span><span class="cs-ramp-ticks">'
+                    + x.ticks.map(function (t) {
+                        return '<span style="left:' + pos(t[0]) + '">' + esc(t[1]) + '</span>';
+                    }).join('') + '</span>'
+                    + (x.ends ? '<span class="cs-ramp-ends"><span>' + esc(x.ends[0])
+                       + '</span><span>' + esc(x.ends[1]) + '</span></span>' : '');
+                extraLegend.appendChild(li);
+            }
+            function bigAreaText(m2) {
+                if (m2 >= 1e6) { return fmt(m2 / 1e6, m2 >= 1e7 ? 0 : 1) + ' km²'; }
+                return areaText(m2 / 1e4);
+            }
+            /* Valeur du calque affiché au pixel o (texte), dans la zone étudiée */
+            function extraValue(o) {
+                var x = extraByKey[extraKey];
+                if (!x || x.unit === 'deg') { return null; }   /* pente : déjà lue */
+                var px = x.src === 'terrain' ? terrainPx : extraPx[x.key];
+                if (!px) { return null; }
+                var k = px[o];
+                if (x.kind === 'cat') {
+                    var c = k === x.none ? null : x.byCode[k];
+                    if (c) { return x.short + ' : ' + c.label; }
+                    return x.noneText ? x.short + ' : ' + x.noneText : null;
+                }
+                if (k === x.none) { return null; }
+                var v = x.vmin + k * x.step;
+                if (x.unit === 'twi') { return 'TWI ' + fmt(v, 1); }
+                if (x.unit === 'log10m2') { return 'aire drainée ' + bigAreaText(Math.pow(10, v)); }
+                return fmt(v, 1);
+            }
+            document.querySelectorAll('input[name="cs-extra"]').forEach(function (r) {
+                r.addEventListener('change', function () {
+                    if (!r.checked) { return; }
+                    extraKey = r.value;
+                    buildExtraLegend(); renderExtra();
+                    if (pointPopup.isOpen()) { pointPopup.update(); }
+                });
+            });
+            if (extraOp) {
+                extraOp.addEventListener('input', function () {
+                    extraOpOut.textContent = extraOp.value + ' %';
+                    var ov = extraOverlays[extraKey];
+                    if (ov) { ov.setOpacity(extraOpacity()); }
+                });
+            }
+
             /* ═══════ Lecture de la cellule (survol, ou toucher sur mobile) ═══════ */
             /* L'image est linéaire en Y Mercator (overlay EPSG:3857, D29) :
                la ligne de pixel se calcule en Mercator, pas en latitude. */
@@ -1819,6 +2432,10 @@ class MorilleVisualizer:
                         cell.slope = (terrainPx[o] - CFG.slopeOffset) / CFG.slopeScale;
                     }
                 }
+                if (v !== OUT) {
+                    var ex = extraValue(o);
+                    if (ex) { cell.extra = ex; }
+                }
                 return cell;
             }
             var OUT_TEXT = 'Hors zone étudiée (Isère) : pas de score';
@@ -1830,6 +2447,7 @@ class MorilleVisualizer:
                 var parts = [cell.state === 'outside' ? OUT_TEXT
                              : CFG.species[current].name + ' : ' + fmt(cell.s, 2) + ' · '
                                + LABELS[classOf(cell.s)]];
+                if (cell.extra) { parts.push(cell.extra); }
                 if (cell.alt !== undefined) { parts.push(cell.alt + ' m'); }
                 if (cell.slope !== undefined) { parts.push(fmt(cell.slope, 0) + '°'); }
                 return parts;
@@ -1850,6 +2468,7 @@ class MorilleVisualizer:
                 var lines = [cell.state === 'outside' ? esc(OUT_TEXT)
                              : esc(CFG.species[current].name) + ' : <b>' + fmt(cell.s, 2)
                                + '</b> · ' + esc(LABELS[classOf(cell.s)])];
+                if (cell.extra) { lines.push(esc(cell.extra)); }
                 if (cell.alt !== undefined) { terrain.push('altitude ' + cell.alt + ' m'); }
                 if (cell.slope !== undefined) { terrain.push('pente ' + fmt(cell.slope, 0) + '°'); }
                 if (terrain.length) { lines.push(terrain.join(' · ')); }
@@ -2037,6 +2656,9 @@ class MorilleVisualizer:
                 current = sp;
                 document.getElementById('cs-legend-title').textContent =
                     'Probabilité — ' + CFG.species[sp].name;
+                /* Seuils par rang de l'espèce : LUT et bornes de la légende */
+                TH = CFG.thresholds[sp];
+                buildLut(); buildLegend();
                 renderProb(); renderHotspots(); syncDiag(); syncLayers();
                 if (dataPx[current]) { readout.textContent = IDLE; }
                 /* Popups ouvertes : score de la nouvelle espèce */
@@ -2061,9 +2683,15 @@ class MorilleVisualizer:
                 dataW = imgs[0].naturalWidth; dataH = imgs[0].naturalHeight;
                 if (ready(terrainImg) && terrainImg.naturalWidth === dataW) {
                     terrainPx = pixels(terrainImg);
+                } else {   /* calque de pente lu dans le PNG terrain : indisponible */
+                    EXTRA.forEach(function (x) {
+                        if (x.src !== 'terrain') { return; }
+                        var r = document.querySelector('input[name="cs-extra"][value="' + x.key + '"]');
+                        if (r) { r.closest('label').hidden = true; }
+                    });
                 }
                 readout.textContent = IDLE;
-                renderProb();
+                renderProb(); renderExtra();
             }
             var waiting = imgs.concat([terrainImg]).filter(function (img) { return img && !ready(img); });
             if (!waiting.length) { start(); }
@@ -2091,6 +2719,9 @@ class MorilleVisualizer:
             "%DIAG_BLOCK%": diag_block,
             "%WEATHER_SECTION%": weather_html,
             "%WEATHER_HINT%": weather_hint,
+            "%RANK_HINT%": rank_hint,
+            "%EXTRA_BLOCK%": extra_block,
+            "%EXTRA_IMGS%": extra_imgs,
             "%TERRAIN_URI%": terrain_uri,
             "%DATA_IMGS%": data_imgs,
             "%AREA_LINE%": _AREA_LINE,
@@ -2412,24 +3043,34 @@ class MorilleVisualizer:
             if self.debug_layers and show_elimination
             else []
         )
+        extra_specs = self._prepare_extra_layers()
         logger.info(
-            "⏱️  Préparation diagnostic (reproj.) : %.2fs — %d couches",
+            "⏱️  Préparation diagnostic et calques (reproj.) : %.2fs — "
+            "%d couches, %d calques",
             time.perf_counter() - t_prep,
-            len(diag_specs),
+            len(diag_specs), len(extra_specs),
         )
 
         # ── Phase 2 : encodage PNG parallèle (score par espèce,
-        #    terrain, diagnostic) ──
+        #    terrain, diagnostic, calques supplémentaires) ──
         t_enc = time.perf_counter()
         n_workers = max(
-            1, min(_PNG_WORKERS, len(diag_specs) + len(self.species_list) + 1),
+            1, min(
+                _PNG_WORKERS,
+                len(diag_specs) + len(extra_specs) + len(self.species_list) + 1,
+            ),
         )
         diag_uris: dict[str, str] = {}
+        extra_uris: dict[str, str] = {}
         with ThreadPoolExecutor(
             max_workers=n_workers,
             thread_name_prefix="png",
         ) as pool:
             diag_futures = {pool.submit(spec.render): spec for spec in diag_specs}
+            extra_futures = {
+                pool.submit(x.render): str(x.cfg["key"])
+                for x in extra_specs if x.render is not None
+            }
             data_futures = {
                 sp: pool.submit(self._build_data_png_bytes, sp)
                 for sp in self.species_list
@@ -2439,6 +3080,8 @@ class MorilleVisualizer:
             for fut in as_completed(diag_futures):
                 spec = diag_futures[fut]
                 diag_uris[spec.key] = self._png_to_data_uri(fut.result())
+            for fut in as_completed(extra_futures):
+                extra_uris[extra_futures[fut]] = self._png_to_data_uri(fut.result())
             data_uris_by_species = {
                 sp: self._png_to_data_uri(fut.result())
                 for sp, fut in data_futures.items()
@@ -2463,7 +3106,7 @@ class MorilleVisualizer:
                 control=False,
                 interactive=False,
                 pixelated=False,
-                zIndex=2 if spec.group == "twi-raw" else 3,
+                zIndex=3,
             )
             overlay.add_to(m)
             diag_layers.append({
@@ -2503,6 +3146,11 @@ class MorilleVisualizer:
             diag_layers=diag_layers,
             hotspots=self._hotspots_payload(),
             weather_html=self._weather_section_html(),
+            extra_layers=[
+                x.cfg for x in extra_specs
+                if x.render is None or str(x.cfg["key"]) in extra_uris
+            ],
+            extra_uris=extra_uris,
         )
 
         m.fit_bounds(self._bounds)

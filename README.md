@@ -64,7 +64,7 @@ python main.py --discover-wfs
 |---|---|---|
 | `--cell-size` | auto (50 m) | Taille de cellule (m) |
 | `--species` | `esculenta elata edulis` | Espèces à modéliser (morille grise, morille noire, cèpe) |
-| `--hotspot-threshold` | `0.60` | Seuil de score des hotspots |
+| `--hotspot-threshold` | seuil Bon de l'espèce | Seuil de score des hotspots ; par défaut, celui de la classe Bon de chaque espèce (ses 10 % de cellules les mieux notées de la zone étudiée) |
 | `--smoothing-sigma` | `0.5` | Sigma du lissage gaussien |
 | `--urban-buffer` | `10` | Buffer (m) autour de l'urbain |
 | `--no-urban` / `--no-landcover` / `--no-weather` | off | Désactiver un masque/modulation |
@@ -75,7 +75,7 @@ python main.py --discover-wfs
 | `--console-hotspots` | `5` | Hotspots listés par espèce dans le résumé console (ancien nom : `--max-hotspots`) ; n'affecte ni la carte ni le CSV |
 | `--map-hotspots` | `20` | Hotspots numérotés affichés à l'ouverture de la carte (réglable ensuite dans le panneau) |
 | `--export-vector` | off | Export GPKG (volumineux) |
-| `--debug-layers` | off | Ajouter à la carte les couches de diagnostic (zones exclues, TWI brut) |
+| `--debug-layers` | off | Ajouter à la carte les couches de diagnostic (zones exclues par masque éliminatoire) |
 | `-v` / `--verbose` | off | Tout le détail (DEBUG) à l'écran |
 | `--force` | off | Ignorer les avertissements (poids, taille grille) |
 
@@ -95,7 +95,7 @@ Le détail (tableau des poids, statistiques par critère, validation point par p
 
 ## Sorties (`output/`)
 
-- `cartomorilles.html` — carte interactive : panneau latéral (espèce, légende-filtre par classe, opacité, hotspots numérotés, fonds et couches, météo), lecture du score au survol ou au toucher, popup du point touché (coordonnées à copier, liens *Itinéraire* et *Google Maps*) et bouton *Me localiser*
+- `cartomorilles.html` — carte interactive : panneau latéral (espèce, légende-filtre par classe, opacité, hotspots numérotés, fonds et couches, météo), lecture du score au survol ou au toucher, popup du point touché (coordonnées à copier, liens *Itinéraire* et *Google Maps*) et bouton *Me localiser*. Le volet *Calques supplémentaires* de la section Couches affiche, un à la fois par-dessus la probabilité, les données du modèle : nature du sol (catégories géologiques BDCharm-50), essences forestières (BD Forêt v2), humidité du sol (TWI), pente et aire drainée (la morphologie qui entre dans le TWI), avec légende, part de la zone étudiée par classe et valeur sous le curseur
 - `{species}_probability.tif` — raster GeoTIFF par espèce (+ alias `morilles_probability.tif`)
 - `{species}_hotspots.csv` — hotspots triés par score, avec lien Google Maps ; les coordonnées (`lat`/`lon`, `x_l93`/`y_l93`) sont la cellule la mieux notée de l'amas (`max_score`), le point à viser, pas son centre
 - `{species}_hotspots.gpx` — les 20 meilleurs hotspots de la zone étudiée, en waypoints GPX pour les applis GPS (« Morille grise n°3 » = hotspot n°3 de la carte et du CSV, même point que la carte et le CSV)
@@ -107,7 +107,7 @@ Le détail (tableau des poids, statistiques par critère, validation point par p
 
 - **Sur le téléphone** : copier `cartomorilles.html` et l'ouvrir dans le navigateur. Toucher un point affiche son score, ses coordonnées (bouton *Copier*) et un lien *Itinéraire* vers Google Maps ; les popups des hotspots ont les mêmes actions. Le bouton de localisation, sous le zoom, centre la carte sur votre position et donne le score à cet endroit ; le point bleu suit ensuite vos déplacements (toucher à nouveau : recentrer, ou arrêter si la position est visible). Le navigateur n'autorise la localisation que sur une page sûre : `https`, `localhost` ou fichier local (`file://`). Servie en `http` sur le réseau local (`http://192.168…`), la page ne peut pas localiser et le bandeau du bas le dit.
 - **Pour un usage sans réseau fiable**, importer `{species}_hotspots.gpx` dans une appli GPS à cartes hors ligne (OsmAnd, Organic Maps, IGNrando', Locus Map, Garmin…).
-- **Ce que la carte HTML contient** : scores, pente et altitude (images intégrées), hotspots, cours d'eau, observations iNaturalist, et les bibliothèques qui la font fonctionner : Leaflet, jQuery, leaflet-measure et les feuilles de base de Bootstrap 5 et 3, copiées dans `vendor/` (+0,36 Mo, 1,9 % d'une carte de 18,9 Mo à 50 m ; même rendu qu'avec les CDN). **Ce qu'elle va chercher sur Internet** : seulement les fonds de carte (IGN Géoplateforme `data.geopf.fr`, OpenStreetMap, Esri, OpenTopoMap). Les liens *Itinéraire* et Google Maps des popups ouvrent des sites en ligne.
+- **Ce que la carte HTML contient** : scores, pente et altitude, calques supplémentaires (images intégrées), hotspots, cours d'eau, observations iNaturalist, et les bibliothèques qui la font fonctionner : Leaflet, jQuery, leaflet-measure et les feuilles de base de Bootstrap 5 et 3, copiées dans `vendor/` (+0,36 Mo, 1,9 % d'une carte de 18,9 Mo à 50 m ; même rendu qu'avec les CDN). **Ce qu'elle va chercher sur Internet** : seulement les fonds de carte (IGN Géoplateforme `data.geopf.fr`, OpenStreetMap, Esri, OpenTopoMap). Les liens *Itinéraire* et Google Maps des popups ouvrent des sites en ligne.
 - **Hors ligne** (vérifié en rendant injoignables tous les hôtes externes cités par la page) :
 
   | Indisponible | Effet |
@@ -158,7 +158,7 @@ Post-traitement :
 2. **Pénalité de monotonie** (terrain uniforme).
 3. **Pénalité calc-dry** (chênaies/buis xérothermophiles, morille grise seulement).
 4. **Lissage gaussien spatial** (sigma configurable, défaut 0,5).
-5. **Classification en 6 classes** : Nul / Très faible / Faible / Moyen / Bon / Excellent (seuils 0,15 · 0,30 · 0,45 · 0,60 · 0,75).
+5. **Classification en 6 classes, par rang** (D52) : Nul = score < 0,15 (cellule éliminée) ; les autres classes partagent les cellules notées de l'espèce dans la zone étudiée : Excellent = les 2 % les mieux notées, Bon = les 8 % suivantes, puis Moyen 20 %, Faible 30 %, Très faible 40 % (`config.CLASS_RANK_QUANTILES`). Les seuils sont donc propres à chaque espèce et à chaque run ; la légende de la carte et le rapport JSON les donnent. La moyenne pondérée de 14 critères tient presque toutes les cellules entre 0,45 et 0,85 : avec des seuils fixes, Bon et Excellent couvraient un tiers à la moitié de l'Isère. Les seuils fixes 0,15 · 0,30 · 0,45 · 0,60 · 0,75 restent l'échelle de la météo, qui note une journée et non une cellule.
 
 La **météo du jour** (Open-Meteo, 7 jours) n'entre pas dans le score : la carte montre le potentiel du terrain, stable d'un jour à l'autre, et la météo s'affiche à part dans le panneau de la carte, le résumé console et `rapport_{species}.json` (`--no-weather` pour ne pas la consulter, hors ligne).
 

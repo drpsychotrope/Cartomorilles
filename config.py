@@ -126,7 +126,7 @@ __all__ = [
     "PHENOLOGY_ENABLED", "PHENOLOGY_GRADIENT",
     "PHENOLOGY_BASE_MONTH", "PHENOLOGY_BASE_ALT",
     # Classification
-    "PROBABILITY_THRESHOLDS", "PROBABILITY_LABELS",
+    "PROBABILITY_THRESHOLDS", "PROBABILITY_LABELS", "CLASS_RANK_QUANTILES",
     # Fonds de carte
     "BASEMAPS", "DEFAULT_BASEMAP",
     # Validation
@@ -907,6 +907,16 @@ PROBABILITY_LABELS: Final[tuple[str, ...]] = (
     "Excellent",
 )
 
+# Classes de la carte par rang (D52). Le score se tasse entre 0,45 et 0,85
+# pour toute forêt non éliminée : des seuils absolus classaient un tiers à
+# la moitié de l'Isère en Bon ou Excellent. Chaque espèce est donc classée
+# sur ses propres cellules notées (score ≥ PROBABILITY_THRESHOLDS[0]) de la
+# zone étudiée : bornes cumulées des quantiles Très faible | Faible | Moyen
+# | Bon | Excellent → 40 % / 30 % / 20 % / 8 % / 2 %. Sous le premier seuil
+# absolu : Nul (cellule éliminée). Les seuils absolus restent l'échelle de
+# la météo (D44) et le repli quand la zone n'a pas de cellule notée.
+CLASS_RANK_QUANTILES: Final[tuple[float, ...]] = (0.40, 0.70, 0.90, 0.98)
+
 # Anciens seuils binaires (n_high / n_medium) : gardés seulement dans le
 # rapport JSON pour comparer avec les calibrations passées (D35). La carte,
 # la console et la météo utilisent les 6 classes ci-dessus.
@@ -1405,6 +1415,17 @@ def validate_config() -> bool:
                 i - 1, PROBABILITY_THRESHOLDS[i - 1],
             )
             ok = False
+
+    # ── Classes par rang (D52) : une borne de moins que les seuils absolus
+    #    (Nul reste absolu), quantiles croissants dans ]0, 1[ ──
+    q = CLASS_RANK_QUANTILES
+    if (
+        len(q) != len(PROBABILITY_THRESHOLDS) - 1
+        or any(not 0.0 < v < 1.0 for v in q)
+        or any(b <= a for a, b in zip(q, q[1:]))
+    ):
+        logger.error("CLASS_RANK_QUANTILES invalide : %s", q)
+        ok = False
 
     # ── Éliminatoires existent dans les scores ──
     for geo in ELIMINATORY_GEOLOGY:
