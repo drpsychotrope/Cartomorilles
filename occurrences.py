@@ -9,8 +9,8 @@ Sources, réunies au même format (une liste par espèce du modèle) :
     occurrence/search dans config.BBOX_WGS84 (pages de 300), dataset/{key}
     → titre du jeu de données, affiché comme source.
 
-Cache GBIF JSON par espèce dans data/cache (TTL 7 jours, comme
-iNaturalist). Hors ligne : le dernier cache est repris même périmé ; sans
+Cache GBIF JSON par taxon dans data/cache (TTL 7 jours, comme
+iNaturalist) ; les deux morilles partagent le genre Morchella (D49). Hors ligne : le dernier cache est repris même périmé ; sans
 cache, la liste est vide et le pipeline continue.
 
 GBIF agrège aussi les observations iNaturalist « research grade » (jeu
@@ -51,8 +51,10 @@ from utils import TO_L93
 logger = logging.getLogger("cartomorilles.occurrences")
 
 __all__ = [
-    "INAT_SPECIES",
+    "INAT_TAXON",
     "PRECISE_MAX_M",
+    "taxon_for",
+    "gbif_cache_path",
     "SOURCES",
     "occurrences_by_species",
     "fetch_gbif_occurrences",
@@ -67,9 +69,9 @@ __all__ = [
 # CONSTANTES
 # ═══════════════════════════════════════════════════════════════════
 
-# Espèce du modèle des observations iNaturalist de species_enricher
-# (requête genre Morchella)
-INAT_SPECIES: Final[str] = "esculenta"
+# Taxon des observations iNaturalist de species_enricher (requête genre
+# Morchella) : attachées à toute espèce modélisée de ce taxon (D49)
+INAT_TAXON: Final[str] = "Morchella"
 # Occurrence « précise » : position connue à ± 250 m au plus, non floutée
 PRECISE_MAX_M: Final[float] = 250.0
 # Sources distinguées par le contrôle du modèle (et leurs libellés)
@@ -84,11 +86,7 @@ _BANDS: Final[tuple[float, ...]] = (0.45, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85)
 
 _API: Final[str] = "https://api.gbif.org/v1"
 _USER_AGENT: Final[str] = "Cartomorilles (favorabilite morille et cepe, Isere)"
-# Taxon GBIF interrogé pour chaque espèce du modèle : (nom, rang)
-_TAXA: Final[dict[str, tuple[str, str]]] = {
-    "esculenta": ("Morchella", "GENUS"),        # toutes les morilles
-    "edulis": ("Boletus edulis", "SPECIES"),
-}
+# Taxon GBIF (nom, rang) de chaque espèce : config.SPECIES_PARAMS[sp]["taxon"]
 _PAGE_SIZE: Final[int] = 300                     # maximum de l'API
 _MAX_RECORDS: Final[int] = 3000                  # plafond par espèce
 _CACHE_TTL_S: Final[int] = 7 * 24 * 3600         # 7 jours
@@ -108,6 +106,30 @@ _DEFAULT_TITLE: Final[str] = "jeu de données GBIF"
 # API PUBLIQUE
 # ═══════════════════════════════════════════════════════════════════
 
+def taxon_for(species: str) -> tuple[str, str]:
+    """Taxon GBIF (nom, rang) des occurrences d'une espèce modélisée, lu
+    dans config.SPECIES_PARAMS (D49)."""
+    name, rank = config.get_species_params(species)["taxon"]
+    return str(name), str(rank)
+
+
+def gbif_cache_path(
+    taxon: tuple[str, str],
+    bbox_wgs84: Mapping[str, float],
+    cache_dir: Path,
+) -> Path:
+    """Fichier de cache GBIF d'un taxon dans une bbox : commun aux espèces
+    de même taxon (les deux morilles)."""
+    name, rank = taxon
+    bbox_key = (
+        f"{bbox_wgs84['west']:.4f}_{bbox_wgs84['south']:.4f}_"
+        f"{bbox_wgs84['east']:.4f}_{bbox_wgs84['north']:.4f}"
+    )
+    digest = hashlib.md5(f"{name}|{rank}|{bbox_key}".encode()).hexdigest()[:8]
+    slug = name.lower().replace(" ", "_")
+    return cache_dir / f"gbif_{slug}_{digest}.json"
+
+
 def occurrences_by_species(
     species_list: Iterable[str],
     inat_observations: Iterable[Mapping[str, Any]] = (),
@@ -115,8 +137,8 @@ def occurrences_by_species(
     bbox_wgs84: Mapping[str, float] = config.BBOX_WGS84,
     cache_dir: Path | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Occurrences par espèce : iNaturalist (pour INAT_SPECIES) puis GBIF,
-    sans les doublons iNaturalist de GBIF."""
+    """Occurrences par espèce : iNaturalist (espèces de taxon INAT_TAXON)
+    puis GBIF, sans les doublons iNaturalist de GBIF."""
     species = list(species_list)
     # La requête iNaturalist « Morchella » ramène aussi Verpa bohemica
     # (synonyme Morchella bohemica) : hors genre, pas une morille.
@@ -125,8 +147,9 @@ def occurrences_by_species(
         if o["taxon"].split()[0] == "Morchella"
     ]
     gbif = fetch_gbif_occurrences(species, bbox_wgs84, cache_dir=cache_dir)
+    morels = set(config.species_with_taxon(INAT_TAXON))
     return {
-        sp: (inat if sp == INAT_SPECIES else [])
+        sp: (inat if sp in morels else [])
         + drop_inaturalist_duplicates(gbif.get(sp, []), inat)
         for sp in species
     }
@@ -142,23 +165,25 @@ def fetch_gbif_occurrences(
 
     Retourne {espèce: [occurrence, …]} (format du module ; les occurrences
     du jeu iNaturalist ont source="inaturalist").
-    Espèce sans taxon GBIF défini, API indisponible sans cache : [].
+    Une requête par taxon distinct (les deux morilles partagent le genre
+    Morchella). API indisponible sans cache : [].
     """
     cache_dir = cache_dir or Path("data/cache")
     out: dict[str, list[dict[str, Any]]] = {}
     titles: dict[str, str] = {}
     online = True
+    groups: dict[tuple[str, str], list[str]] = {}
+    for species in species_list:
+        groups.setdefault(taxon_for(species), []).append(species)
     with requests.Session() as session:
         session.headers["User-Agent"] = _USER_AGENT
-        for species in species_list:
-            taxon = _TAXA.get(species)
-            if taxon is None:
-                out[species] = []
-                continue
-            out[species], online = _fetch_species(
-                session, species, taxon, bbox_wgs84, cache_dir,
+        for taxon, members in groups.items():
+            found, online = _fetch_species(
+                session, members[0], taxon, bbox_wgs84, cache_dir,
                 titles, online=online,
             )
+            for species in members:
+                out[species] = list(found)
     return out
 
 
@@ -461,12 +486,7 @@ def _fetch_species(
     `online=False` (échec réseau sur une espèce précédente) : cache seul.
     """
     name, rank = taxon
-    bbox_key = (
-        f"{bbox['west']:.4f}_{bbox['south']:.4f}_"
-        f"{bbox['east']:.4f}_{bbox['north']:.4f}"
-    )
-    digest = hashlib.md5(f"{name}|{rank}|{bbox_key}".encode()).hexdigest()[:8]
-    cache_file = cache_dir / f"gbif_{species}_{digest}.json"
+    cache_file = gbif_cache_path(taxon, bbox, cache_dir)
 
     cached = _read_cache(cache_file)
     if cached is not None:
