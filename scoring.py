@@ -89,7 +89,7 @@ def rank_class_thresholds(
 
 _ALT_ELIM_MIN: float = getattr(config, "ALT_ELIMINATORY_MIN", 100.0)
 _ALT_ELIM_MAX: float = getattr(config, "ALT_ELIMINATORY_MAX", 1400.0)
-_SOFT_ELIM_BUFFER_M: float = getattr(config, "SOFT_ELIM_BUFFER", 15.0)
+_SOFT_ELIM_BUFFER_M: float = getattr(config, "SOFT_ELIM_BUFFER", 0.0)
 _MIN_CLUSTER_SIZE: int = getattr(config, "MIN_CLUSTER_SIZE", 4)
 _HOTSPOT_CLOSING_RADIUS: int = getattr(config, "HOTSPOT_CLOSING_RADIUS", 1)
 
@@ -126,6 +126,10 @@ class MorilleScoring:
         self.grid: GridBuilder = grid_builder
         # Copie superficielle — ne pas aliaser le dict original
         self.scores: dict[str, np.ndarray] = dict(grid_builder.scores)
+        # Instantané par espèce : la grille est réécrite par l'espèce suivante
+        self.score_confidence: dict[str, Any] = dict(
+            getattr(grid_builder, "score_confidence", {}) or {},
+        )
         self.species: str = species
         # v2.6.0 — paramètres écologiques par espèce (alt_elim, twi_waterlog,
         # slope_max, apply_calcdry, apply_monotony, eliminatory_geology, ...)
@@ -511,8 +515,9 @@ class MorilleScoring:
             pct,
         )
 
-        # Appliquer l'élimination dure
-        self.final_score[combined] = 0.0
+        # Appliquer l'élimination dure ; une cellule NoData reste NaN (classe
+        # -1, nodata du GeoTIFF) au lieu de devenir un 0 compté « Nul » (D60)
+        self.final_score[combined & np.isfinite(self.final_score)] = 0.0
 
         # Transition douce autour des zones éliminées
         self._apply_soft_transition(combined)
@@ -626,25 +631,26 @@ class MorilleScoring:
 
     def _apply_soft_transition(self, hard_mask: np.ndarray) -> None:
         """
-        Applique une transition douce autour des zones éliminées.
+        Transition douce autour des zones éliminées : score × d / tampon,
+        d = distance (m) du centre de la cellule au bord de la zone
+        éliminée. Désactivée par défaut (SOFT_ELIM_BUFFER = 0, D60).
         """
         assert self.final_score is not None, "final_score is None in soft transition"
 
-        if _SOFT_ELIM_BUFFER_M <= 0:
+        if _SOFT_ELIM_BUFFER_M <= 0 or not hard_mask.any():
             return
 
-        cell_size = float(getattr(config, "CELL_SIZE", 5.0))
-        buffer_px = max(1, int(round(_SOFT_ELIM_BUFFER_M / cell_size)))
+        cell_size = float(getattr(self.grid, "cell_size", config.CELL_SIZE))
+        dist_m: np.ndarray = (
+            np.asarray(distance_transform_edt(~hard_mask), dtype=np.float64)
+            - 0.5
+        ) * cell_size
 
-        dist_from_elim: np.ndarray = np.asarray(
-            distance_transform_edt(~hard_mask)
-        ).astype(np.float64)
-
-        in_buffer = (dist_from_elim > 0) & (dist_from_elim <= buffer_px)
+        in_buffer = (~hard_mask) & (dist_m < _SOFT_ELIM_BUFFER_M)
         if not in_buffer.any():
             return
 
-        fade = np.clip(dist_from_elim / buffer_px, 0.0, 1.0)
+        fade = np.clip(dist_m / _SOFT_ELIM_BUFFER_M, 0.0, 1.0)
         self.final_score[in_buffer] *= fade[in_buffer]
 
         logger.debug(
@@ -1050,10 +1056,13 @@ class MorilleScoring:
         hot_mask = safe >= threshold
 
         # ── Connected components GPU/CPU ──
+        # Le closing relie des cellules chaudes proches sans traverser les
+        # cellules éliminées ; seules les cellules chaudes comptent (D60)
         labeled, n_clusters = _accel.connected_components(
             hot_mask,
             structure=_STRUCT_8CONN,
             closing_iterations=_HOTSPOT_CLOSING_RADIUS,
+            barrier=self.elimination_mask,
         )
 
         if n_clusters == 0:
@@ -1104,23 +1113,16 @@ class MorilleScoring:
             confidence = float(np.mean(conf_vals)) if conf_vals else None
         conf_rounded = round(confidence, 2) if confidence is not None else None
 
-        # ── Dominant species/geology par cluster (boucle légère) ──
-        # Réutilise un masque pré-alloué pour éviter 1312× np.zeros
-        reuse_mask = np.empty(stat_labeled.shape, dtype=bool)
+        # ── Essence et géologie dominantes de tous les amas en une passe ──
+        # (une boucle par amas sur toute la grille coûtait ~2 min à 20 m)
+        dom_species = self._dominant_by_cluster(stat_labeled, "tree_species")
+        dom_geology = self._dominant_by_cluster(stat_labeled, "geology")
 
         hotspots: list[dict[str, Any]] = []
         for i in range(n_valid):
             cid = int(valid_ids[i])
-
-            # Masque cluster réutilisé (O(cluster) vs O(N))
-            np.equal(stat_labeled, cid, out=reuse_mask)
-
-            dominant_species = self._get_dominant_value_in_cluster(
-                reuse_mask, "tree_species", "essence_canonical",
-            )
-            dominant_geology = self._get_dominant_value_in_cluster(
-                reuse_mask, "geology", "geology_canonical",
-            )
+            dominant_species = dom_species.get(cid)
+            dominant_geology = dom_geology.get(cid)
 
             h_alt = stats["altitude"]
             h_slp = stats["slope"]
@@ -1180,51 +1182,40 @@ class MorilleScoring:
     # Hotspots — catégorie dominante via bincount sur int raster
     # ------------------------------------------------------------------
 
-    def _get_dominant_value_in_cluster(
-        self,
-        cluster_mask: np.ndarray,
-        field: str,
-        _column_unused: str | None = None,
-    ) -> str | None:
-        """
-        Catégorie dominante dans un cluster via bincount sur int raster (D6).
-
-        Parameters
-        ----------
-        cluster_mask : bool array (ny, nx), True pour les cellules du cluster
-        field : "tree_species" | "geology"
-        _column_unused : ignoré — conservé pour compatibilité call sites
-
-        Returns
-        -------
-        Nom canonique de la catégorie dominante, ou None si pas de données.
-        """
+    def _dominant_by_cluster(
+        self, labeled: np.ndarray, field: str,
+    ) -> dict[int, str]:
+        """Catégorie dominante (code > 0 le plus fréquent) de chaque amas de
+        `labeled`, en un seul bincount sur (amas, code) — D6, D60."""
         grid = self.grid
-
         if field == "tree_species":
             int_raster = getattr(grid, "_tree_species_int_raster", None)
             code_to_name = getattr(grid, "_tree_code_to_name", None)
-        elif field == "geology":
+        else:
             int_raster = getattr(grid, "_geology_int_raster", None)
             code_to_name = getattr(grid, "_geology_code_to_name", None)
-        else:
-            return None
-
-        if int_raster is None or code_to_name is None:
-            return None
-
-        cluster_mask = np.asarray(cluster_mask, dtype=bool)
-        int_raster = np.asarray(int_raster, dtype=np.int16)
-
-        values = int_raster[cluster_mask]
-        values = values[values > 0]  # exclure nodata
-
-        if len(values) == 0:
-            return None
-
-        counts = np.bincount(values)
-        dominant_code = int(counts.argmax())
-        return code_to_name.get(dominant_code)
+        if int_raster is None or not code_to_name:
+            return {}
+        lab = np.asarray(labeled)
+        codes = np.asarray(int_raster)
+        sel = (lab > 0) & (codes > 0)
+        if not sel.any():
+            return {}
+        k = int(codes[sel].max()) + 1
+        keys = lab[sel].astype(np.int64) * k + codes[sel].astype(np.int64)
+        uniq, cnt = np.unique(keys, return_counts=True)
+        cluster = uniq // k
+        code = uniq % k
+        # Pour chaque amas, le code le plus fréquent (ex æquo : le plus petit)
+        order = np.lexsort((code, -cnt, cluster))
+        first = np.ones(order.size, dtype=bool)
+        first[1:] = cluster[order][1:] != cluster[order][:-1]
+        best = order[first]
+        return {
+            int(c): code_to_name.get(int(v))
+            for c, v in zip(cluster[best], code[best])
+            if code_to_name.get(int(v))
+        }
 
     def _reverse_lookup_score(
         self,

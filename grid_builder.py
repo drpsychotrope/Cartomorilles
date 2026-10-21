@@ -52,9 +52,7 @@ from config import (
     DIST_WATER_MAX,
     GEOLOGY_SCORES,
     SLOPE_MAX,
-    SLOPE_MODERATE,
     SLOPE_OPTIMAL,
-    SLOPE_STEEP,
     TREE_SCORES,
     TWI_DRY_FLOOR,
     TWI_DRY_LIMIT,
@@ -90,10 +88,10 @@ FILL_NO_FOREST: float = 0.05
 FILL_NO_GEOLOGY: float = float(GEOLOGY_SCORES.get("unknown", 0.30))
 FILL_DEFAULT_BONUS: float = 1.0
 
-# Rugosité terrain — non présent dans config.py v2.2.0, défini localement
-ROUGHNESS_OPTIMAL: float = 3.0
-ROUGHNESS_MAX: float = 12.0
-ROUGHNESS_WINDOW: int = 5
+# Rugosité terrain : config (une seule source, D60)
+ROUGHNESS_OPTIMAL: float = config.ROUGHNESS_OPTIMAL
+ROUGHNESS_MAX: float = config.ROUGHNESS_MAX
+ROUGHNESS_WINDOW: int = config.ROUGHNESS_WINDOW
 
 # Seuil de pente pour classifier "plat" (aspect)
 FLAT_SLOPE_THRESHOLD: float = 5.0
@@ -567,6 +565,11 @@ class GridBuilder:
         grid : grille à résolution native du DEM.
         nan_mask : masque NaN à la même résolution.
         order : 0=nearest (catégoriel), 1=bilinéaire (continu).
+
+        grid_mode=True : les bords des pixels source et cible coïncident
+        (même emprise). Sans lui, scipy alignait les centres des pixels
+        extrêmes, d'où un décalage jusqu'à ~15–19 m sur les bords à 50 m
+        par rapport aux rasters vecteur et à x_coords/y_coords (D60).
         """
         zy = self.ny / grid.shape[0]
         zx = self.nx / grid.shape[1]
@@ -574,11 +577,13 @@ class GridBuilder:
         if np.any(nan_mask):
             filled = np.where(nan_mask, 0.0, grid)
             zoomed: np.ndarray = np.asarray(
-                zoom(filled, (zy, zx), order=order),
+                zoom(filled, (zy, zx), order=order,
+                     grid_mode=True, mode="nearest"),
             ).astype(np.float32)
             nan_zoomed: np.ndarray = (
                 np.asarray(
-                    zoom(nan_mask.astype(np.float32), (zy, zx), order=0),
+                    zoom(nan_mask.astype(np.float32), (zy, zx), order=0,
+                         grid_mode=True, mode="nearest"),
                 )
                 > 0.5
             )
@@ -586,7 +591,8 @@ class GridBuilder:
             return zoomed
 
         return np.asarray(
-            zoom(grid, (zy, zx), order=order),
+            zoom(grid, (zy, zx), order=order,
+                 grid_mode=True, mode="nearest"),
         ).astype(np.float32)
 
     def _max_before_zoom(self, grid: np.ndarray) -> np.ndarray:
@@ -782,14 +788,38 @@ class GridBuilder:
         return self
 
 
+    def recompute_habitat_scores(self) -> GridBuilder:
+        """Recalcule canopy_openness et ground_cover pour l'espèce en cours.
+
+        Leurs bonus « essence favorable » (tree_species > 0.40 / 0.60) et
+        « calcaire » (geology > 0.70) lisent les critères propres à
+        l'espèce : calculés une fois à l'étape 2, ils gardaient la table de
+        la 1re espèce pour les suivantes (D60). À appeler après
+        l'enrichissement IFN de l'espèce (D47). Le masque des plans d'eau
+        et la modulation landcover sont réappliqués aux deux critères.
+        """
+        self.score_canopy_openness()
+        self.score_ground_cover()
+        names = [n for n in ("canopy_openness", "ground_cover") if n in self.scores]
+        if self.water_mask is not None and self.water_mask.any():
+            for name in names:
+                self.scores[name][self.water_mask] = 0.0
+        green = getattr(self, "_landcover_green_score", None)
+        if isinstance(green, np.ndarray) and green.shape == (self.ny, self.nx):
+            for name in names:
+                self.scores[name] = (self.scores[name] * green).astype(np.float32)
+        return self
+
     # ═══════════════════════════════════════════════════════
     #  SCORES TERRAIN
     # ═══════════════════════════════════════════════════════
 
     def score_altitude(self, species: str = "esculenta") -> GridBuilder:
         """
-        Score d'altitude — v2.2.0 : optimal 200-600m, bonus à 350m.
+        Score d'altitude — v2.2.0 : optimal 200-600m.
         v2.6.0 : ranges species-aware via config.SPECIES_PARAMS[species].
+        Le « bonus 350 m » (+0,05 sur des cellules déjà à 1,0, plafonné à
+        1,0) n'avait aucun effet : retiré (D60).
         """
         if self._skip_zero_weight("altitude"):
             return self
@@ -808,16 +838,6 @@ class GridBuilder:
         # Zone optimale → 1.0
         mask_opt = (_alt >= alt_min) & (_alt <= alt_max)
         score[mask_opt] = 1.0
-
-        # Bonus micro-humidité centré sur 350m (Vouillants)
-        if mask_opt.any():
-            center = config.ALTITUDE_ALLUVIAL_CENTER
-            alluvial_bonus = np.exp(
-                -((_alt - center) ** 2) / (2 * 100.0**2)
-            ) * 0.05
-            score[mask_opt] = np.minimum(
-                score[mask_opt] + alluvial_bonus[mask_opt], 1.0
-            )
 
         # Sous l'optimum
         mask_low = (_alt >= range_min) & (_alt < alt_min)
@@ -852,6 +872,9 @@ class GridBuilder:
            >slope_max   éliminatoire → 0.0
 
         v2.6.0 : opt_max et slope_max species-aware (cèpe : 25°/45°).
+        Bornes de `config.slope_breaks` : « modéré » garde au moins 5°
+        (morille noire, optimum jusqu'à 30° : 30–35° modéré, 35–40°
+        raide) — sans quoi le score sautait de 1.0 à 0.55 à 30° (D60).
         """
         if self._skip_zero_weight("slope"):
             return self
@@ -862,10 +885,7 @@ class GridBuilder:
         params = config.SPECIES_PARAMS.get(
             species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
         )
-        opt_max  = params["slope_optimal"][1]   # 15° morille / 25° cèpe
-        moderate = SLOPE_MODERATE                # 30°
-        steep    = SLOPE_STEEP                   # 40°
-        maximum  = params["slope_max"]           # 45°
+        opt_max, moderate, steep, maximum = config.slope_breaks(params)
 
         score = np.ones_like(_slope, dtype=np.float32)
 
@@ -1260,7 +1280,13 @@ class GridBuilder:
     def _apply_water_type_bonus(
         self, score: np.ndarray, hydro_gdf: gpd.GeoDataFrame
     ) -> np.ndarray:
-        """Applique le bonus par type de cours d'eau."""
+        """Applique le bonus par type de cours d'eau (×max des bonus > 1
+        dans un rayon de 100 m).
+
+        Les facteurs ≤ 1 (ruisseau 0,9, torrent 0,7, inconnu 0,9) n'ont
+        jamais pu s'appliquer : le raster part de 1 et garde le maximum. Ils
+        ne sont plus rasterisés (les 3 884 lignes IGN, toutes « inconnu »,
+        l'étaient pour rien — D60)."""
         if "water_bonus" not in hydro_gdf.columns:
             return score
 
@@ -1268,7 +1294,7 @@ class GridBuilder:
 
         for bonus_val, group in hydro_gdf.groupby("water_bonus"):
             bonus_f = float(bonus_val)  # type: ignore[arg-type]
-            if abs(bonus_f - 1.0) < 0.01:
+            if bonus_f <= 1.0 + 1e-6:
                 continue
 
             shapes: list[tuple[Any, int]] = []
@@ -2304,6 +2330,15 @@ class GridBuilder:
         ("cemetery", 5),
     )
 
+    def _buffer_cells(self, buffer_m: float) -> int:
+        """Dilatation, en mailles, d'un tampon de `buffer_m` autour d'une
+        géométrie rasterisée en all_touched : la maille touchée déborde déjà
+        jusqu'à une maille au-delà du bord, seules les mailles entières du
+        tampon s'y ajoutent. floor, et non round (arrondi bancaire :
+        round(10/20) = 0 mais round(30/20) = 2) — mêmes valeurs qu'avant à
+        10, 20 et 50 m pour le tampon de 10 m des bâtiments (D60)."""
+        return max(0, int(np.floor(float(buffer_m) / self.cell_size + 1e-9)))
+
     def _close_urban_gaps(self, mask: np.ndarray) -> np.ndarray:
         """Comble les vides de moins de 2 × URBAN_GAP_CLOSE_M entre
         bâtiments (rues, places, cours) : fermeture morphologique par un
@@ -2348,6 +2383,12 @@ class GridBuilder:
 
         urban_gdf = self._ensure_l93(urban_gdf)
 
+        # Tampon par type : constante + surcharge buffer_m (bâtiments)
+        buffer_map: dict[str, int] = {
+            k: (v if k not in ("batiment", "building") else buffer_m)
+            for k, v in self._URBAN_BUFFER_DEFAULTS
+        }
+
         # ── Cache disque ──
         _src_col = urban_gdf.get("source")
         _src_name = (
@@ -2356,10 +2397,18 @@ class GridBuilder:
             else "unknown"
         )
         # v2 : bandes de rasterisation corrigées et vides comblés (D56) ;
-        # le rayon de fermeture fait partie de la clé
+        # v3 : tampons, filtre de densité et fermeture dans la clé —
+        # `--urban-buffer` resservait le masque du tampon précédent (D60)
+        _params = hashlib.md5(
+            repr((
+                sorted(buffer_map.items()), int(buffer_m),
+                int(min_urban_density), int(density_radius),
+                float(config.URBAN_GAP_CLOSE_M),
+            )).encode(),
+        ).hexdigest()[:8]
         cache_path = _accel.raster_cache_path(
             "urban_mask",
-            f"{_src_name}_v2_ferm{config.URBAN_GAP_CLOSE_M:g}",
+            f"{_src_name}_v3_{_params}",
             len(urban_gdf),
             self.cell_size,
             (self.ny, self.nx),
@@ -2382,12 +2431,6 @@ class GridBuilder:
                 urban_ha,
             )
             return self
-
-        # Construire buffer_map depuis constante + surcharge buffer_m
-        buffer_map: dict[str, int] = {
-            k: (v if k not in ("batiment", "building") else buffer_m)
-            for k, v in self._URBAN_BUFFER_DEFAULTS
-        }
 
         # ── Rasterisation parallèle (base) ──
         all_geoms: list[Any] = [
@@ -2466,7 +2509,7 @@ class GridBuilder:
                     type_raster = type_raster & base_raster
 
                 if buf > 0:
-                    iterations = max(0, round(buf / self.cell_size))
+                    iterations = self._buffer_cells(buf)
                     if iterations > 0:
                         type_raster = np.asarray(
                             binary_dilation(type_raster, iterations=iterations),
@@ -2477,7 +2520,7 @@ class GridBuilder:
             self.urban_mask = combined_mask
         else:
             if buffer_m > 0:
-                iterations = max(0, round(buffer_m / self.cell_size))
+                iterations = self._buffer_cells(buffer_m)
                 if iterations > 0:
                     base_raster = np.asarray(
                         binary_dilation(base_raster, iterations=iterations),

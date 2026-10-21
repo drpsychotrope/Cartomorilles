@@ -825,9 +825,11 @@ class DataLoader:
             self.bbox["xmax"] - CELL_SIZE / 2,
             nx,
         )
+        # Ligne 0 = nord, comme le transform from_bounds ci-dessous (la
+        # grille croissante en y retournait le relief nord-sud — D60)
         y_g = np.linspace(
-            self.bbox["ymin"] + CELL_SIZE / 2,
             self.bbox["ymax"] - CELL_SIZE / 2,
+            self.bbox["ymin"] + CELL_SIZE / 2,
             ny,
         )
         xx, yy = np.meshgrid(x_g, y_g)
@@ -2341,41 +2343,17 @@ class DataLoader:
             logger.warning("⚠️ Fichier introuvable: %s", filepath)
             return None
 
-        try:
-            # Lire d'abord le CRS sans charger toutes les données
-            import fiona
-
-            with fiona.open(path) as src:
-                file_crs = src.crs_wkt if src.crs_wkt else None
-                file_epsg = src.crs.get("init", "") if src.crs else ""
-
-            # Déterminer le BBOX de filtre dans le bon CRS
-            if file_crs and "2154" in str(file_crs) + str(file_epsg):
-                filter_bbox = (
-                    self.bbox_buffered["xmin"],
-                    self.bbox_buffered["ymin"],
-                    self.bbox_buffered["xmax"],
-                    self.bbox_buffered["ymax"],
-                )
-            else:
-                # Fichier probablement en WGS84 → filtre en WGS84
-                filter_bbox = (
-                    self.bbox_wgs84_buffered["west"],
-                    self.bbox_wgs84_buffered["south"],
-                    self.bbox_wgs84_buffered["east"],
-                    self.bbox_wgs84_buffered["north"],
-                )
-                logger.debug(
-                    "   Fichier non-L93 (%s) → filtre WGS84", file_epsg
-                )
-        except Exception:
-            # Pas de fiona ou erreur → tenter sans filtre CRS
-            filter_bbox = (
-                self.bbox_buffered["xmin"],
-                self.bbox_buffered["ymin"],
-                self.bbox_buffered["xmax"],
-                self.bbox_buffered["ymax"],
-            )
+        # Emprise L93 en GeoSeries : geopandas la reprojette dans le CRS du
+        # fichier. L'ancien test sur src.crs.get("init") levait une
+        # TypeError sous Fiona ≥ 1.9 : tout fichier en WGS84 était filtré
+        # avec l'emprise L93 et revenait vide (D60)
+        filter_bbox = gpd.GeoSeries(
+            [box(
+                self.bbox_buffered["xmin"], self.bbox_buffered["ymin"],
+                self.bbox_buffered["xmax"], self.bbox_buffered["ymax"],
+            )],
+            crs=TARGET_CRS,
+        )
 
         try:
             gdf = gpd.read_file(path, bbox=filter_bbox)

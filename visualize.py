@@ -664,7 +664,12 @@ class MorilleVisualizer:
         self._hydro_gdf = hydro_gdf
         self._urban_gdf = urban_gdf
         self._forest_gdf = forest_gdf
-        self._inat_observations: list[dict[str, Any]] = inat_observations or []
+        # Genre Morchella seulement : la requête « Morchella » ramène aussi
+        # Verpa bohemica (synonyme Morchella bohemica), pas une morille (D60)
+        self._inat_observations: list[dict[str, Any]] = [
+            o for o in (inat_observations or [])
+            if str(o.get("taxon_name") or "Morchella").split()[0] == "Morchella"
+        ]
         self._weather_days: list[Any] = weather_days or []
         self.debug_layers = debug_layers
         self.default_hotspots_shown = max(1, int(default_hotspots_shown))
@@ -873,6 +878,11 @@ class MorilleVisualizer:
             dst_transform=self._dst_transform,
             dst_crs=self._dst_crs,
             resampling=Resampling.nearest if nearest else Resampling.bilinear,
+            # Sans nodata, GDAL écrit 0 hors de l'emprise L93 tournée :
+            # « 0 m, 0° » et score Nul y étaient lus au lieu de « pas de
+            # données » (D60)
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
         )
         if is_mask:
             return np.asarray(np.nan_to_num(dst, nan=0.0) > 0.5)
@@ -1344,11 +1354,14 @@ class MorilleVisualizer:
             return buf.getvalue()
 
     def _build_data_png_bytes(self, species: str | None = None) -> bytes:
-        """PNG niveaux de gris du score d'une espèce, lu par le JS (rendu
-        de la couche de probabilité + lecture de cellule).
+        """PNG RGB du score d'une espèce, lu par le JS (rendu de la couche
+        de probabilité + lecture de cellule).
 
-        Valeur = score × 200 (0–200 → 0.00–1.00), 254 = hors emprise
-        d'étude (D39), 255 = NaN.
+        R = score × 200 (0–200 → 0.00–1.00), 254 = hors emprise d'étude
+        (D39), 255 = NaN ; G = classe (indice dans PROBABILITY_LABELS) du
+        score non quantifié sur les seuils de l'espèce (D52). Le R tronqué
+        au 1/200 faisait tomber d'une classe 9 à 25 % des cellules Bon et
+        Excellent dont le score est juste au-dessus d'un seuil (D60).
         Altitude et pente, communes aux espèces, sont dans le PNG terrain.
 
         v2.6.0 : species kwarg sélectionne le raster source. Si None → primary.
@@ -1357,6 +1370,7 @@ class MorilleVisualizer:
         score_src = self._final_score_by_species.get(sp, self._final_score)
         score_wgs = self._reproject_to_wgs84(score_src)
         valid_s = np.asarray(np.isfinite(score_wgs))
+        rgb = np.zeros((*score_wgs.shape, 3), dtype=np.uint8)
         gray = np.full(score_wgs.shape, _SCORE_NAN, dtype=np.uint8)
         gray[valid_s] = np.clip(
             (score_wgs[valid_s] * _SCORE_SCALE).astype(np.int32),
@@ -1364,8 +1378,21 @@ class MorilleVisualizer:
         ).astype(np.uint8)
         if self._study_mask is not None:
             gray[~self._study_mask] = _SCORE_OUT
+        thresholds = np.asarray(
+            [float(t) for t in getattr(
+                self.models.get(sp), "class_thresholds",
+                config.PROBABILITY_THRESHOLDS,
+            )],
+            dtype=np.float64,
+        )
+        cls = np.zeros(score_wgs.shape, dtype=np.uint8)
+        cls[valid_s] = np.digitize(score_wgs[valid_s], thresholds).astype(
+            np.uint8,
+        )
+        rgb[:, :, 0] = gray
+        rgb[:, :, 1] = cls
 
-        png_bytes = self._encode_opaque_png(gray)
+        png_bytes = self._encode_opaque_png(rgb)
         h, w = gray.shape
         logger.info(
             "✅ Data PNG [%s] : %dx%d px (%.0f KB) — score",
@@ -1948,8 +1975,8 @@ class MorilleVisualizer:
             }
             L.control.scale({position: 'bottomright', imperial: false, maxWidth: 140}).addTo(map);
 
-            /* ═══════ Couleurs : LUT score → couleur continue + classe ═══════ */
-            var lutRgb = new Uint8ClampedArray((N + 1) * 3), lutCls = new Uint8Array(N + 1);
+            /* ═══════ Couleurs : LUT score → couleur continue (classe : canal G) ═══════ */
+            var lutRgb = new Uint8ClampedArray((N + 1) * 3);
             /* Arrêts de la palette calés sur les seuils de l'espèce (0, seuils,
                1) : chaque classe garde sa couleur quels que soient ses seuils. */
             function buildLut() {
@@ -1970,7 +1997,6 @@ class MorilleVisualizer:
                         }
                     }
                     lutRgb[v * 3] = rgb[0]; lutRgb[v * 3 + 1] = rgb[1]; lutRgb[v * 3 + 2] = rgb[2];
-                    lutCls[v] = classOf(s);
                 }
             }
             buildLut();
@@ -2004,7 +2030,7 @@ class MorilleVisualizer:
                 for (var i = 0, n = dataW * dataH; i < n; i++) {
                     var o = i * 4, v = src[o];
                     if (v > N) { continue; }
-                    var a = alphaByCls[lutCls[v]];
+                    var a = alphaByCls[src[o + 1]];   /* G = classe exacte (D60) */
                     if (!a) { continue; }
                     dd[o] = lutRgb[v * 3]; dd[o + 1] = lutRgb[v * 3 + 1];
                     dd[o + 2] = lutRgb[v * 3 + 2]; dd[o + 3] = a;
@@ -2425,7 +2451,8 @@ class MorilleVisualizer:
                 var o = (py * dataW + px) * 4, v = d[o];
                 if (v > N && v !== OUT) { return {state: 'nodata'}; }
                 /* Hors zone étudiée (D39) : pas de score, mais le terrain */
-                var cell = v === OUT ? {state: 'outside'} : {state: 'ok', s: v / N};
+                var cell = v === OUT ? {state: 'outside'}
+                    : {state: 'ok', s: v / N, cls: d[o + 1]};
                 if (terrainPx) {
                     var alt = terrainPx[o + 1] + (terrainPx[o + 2] << 8);
                     if (alt > 0) { cell.alt = Math.round(alt - CFG.altOffset); }
@@ -2447,7 +2474,7 @@ class MorilleVisualizer:
                 if (!hasTerrain(cell)) { return ['Chargement de la carte…']; }
                 var parts = [cell.state === 'outside' ? OUT_TEXT
                              : CFG.species[current].name + ' : ' + fmt(cell.s, 2) + ' · '
-                               + LABELS[classOf(cell.s)]];
+                               + LABELS[cell.cls]];
                 if (cell.extra) { parts.push(cell.extra); }
                 if (cell.alt !== undefined) { parts.push(cell.alt + ' m'); }
                 if (cell.slope !== undefined) { parts.push(fmt(cell.slope, 0) + '°'); }
@@ -2468,7 +2495,7 @@ class MorilleVisualizer:
                 if (!hasTerrain(cell)) { return esc(cellParts(cell)[0]); }
                 var lines = [cell.state === 'outside' ? esc(OUT_TEXT)
                              : esc(CFG.species[current].name) + ' : <b>' + fmt(cell.s, 2)
-                               + '</b> · ' + esc(LABELS[classOf(cell.s)])];
+                               + '</b> · ' + esc(LABELS[cell.cls])];
                 if (cell.extra) { lines.push(esc(cell.extra)); }
                 if (cell.alt !== undefined) { terrain.push('altitude ' + cell.alt + ' m'); }
                 if (cell.slope !== undefined) { terrain.push('pente ' + fmt(cell.slope, 0) + '°'); }
@@ -2829,6 +2856,8 @@ class MorilleVisualizer:
             date_str = str(obs.get("observed_on", "?"))
             taxon = str(obs.get("taxon_name", "Morchella"))
             obs_id = obs.get("id", "?")
+            obscured = bool(obs.get("obscured"))
+            accuracy = obs.get("accuracy_m")
 
             popup_html = (
                 f"<b>iNaturalist #{html.escape(str(obs_id))}</b><br>"
@@ -2836,13 +2865,24 @@ class MorilleVisualizer:
                 f"Date : {html.escape(date_str)}<br>"
                 f"Qualité : {html.escape(quality)}"
             )
+            # Position floutée par iNaturalist (espèce ou lieu protégés) :
+            # le point n'est qu'un centre de zone, à ~20 km près (D60)
+            if obscured:
+                popup_html += "<br><i>Position floutée par iNaturalist</i>"
+            elif accuracy is not None:
+                try:
+                    popup_html += f"<br>Précision : ± {float(accuracy):.0f} m"
+                except (TypeError, ValueError):
+                    pass
+            fill = _INAT_COLOR if quality == "research" else "#9e7cc1"
             folium.CircleMarker(
                 location=[float(lat), float(lng)],
                 radius=6,
-                color="#ffffff",
-                weight=1.5,
-                fill=True,
-                fill_color=_INAT_COLOR if quality == "research" else "#9e7cc1",
+                color=fill if obscured else "#ffffff",
+                weight=2 if obscured else 1.5,
+                dash_array="3 3" if obscured else None,
+                fill=not obscured,
+                fill_color=fill,
                 fill_opacity=0.9,
                 # le clic ouvre cette popup, pas celle du point de la carte
                 bubbling_mouse_events=False,
@@ -3259,8 +3299,11 @@ class MorilleVisualizer:
         score: np.ndarray = self._final_score_by_species.get(sp, self._final_score)
         prob_classes: np.ndarray = self._prob_classes_by_species.get(sp, self._prob_classes)
         elim_mask: np.ndarray = self._elim_mask_by_species.get(sp, self._elim_mask)
-        half = config.CELL_SIZE / 2.0
+        half = float(getattr(self.grid, "cell_size", config.CELL_SIZE)) / 2.0
         labels = list(config.PROBABILITY_LABELS)
+        # Critères et confiances de l'espèce (instantané du modèle) : la
+        # grille ne garde que ceux de la dernière espèce calculée (D60)
+        model = self.models.get(sp)
 
         above = np.isfinite(score) & (score >= threshold)
         iy_arr, ix_arr = np.where(above)
@@ -3306,14 +3349,16 @@ class MorilleVisualizer:
             data["slope"] = np.round(sv, 2)
 
         conf_dict: dict[str, Any] = getattr(
-            self.grid, "score_confidence", {},
-        )
+            model, "score_confidence", None,
+        ) or getattr(self.grid, "score_confidence", {})
         if isinstance(conf_dict, dict):
             for crit, conf_val in conf_dict.items():
                 if isinstance(conf_val, (int, float)):
                     data[f"conf_{crit}"] = round(float(conf_val), 2)
 
-        scores_dict: dict[str, Any] = getattr(self.grid, "scores", {})
+        scores_dict: dict[str, Any] = getattr(
+            model, "scores", None,
+        ) or getattr(self.grid, "scores", {})
         if isinstance(scores_dict, dict):
             for crit_name, crit_arr in scores_dict.items():
                 if (

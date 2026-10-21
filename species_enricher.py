@@ -56,11 +56,6 @@ _INAT_TAXON: Final[str] = "Morchella"      # niveau C' : espèces de ce taxon (D
 _INAT_PER_PAGE: Final[int] = 200
 _INAT_CACHE_TTL_S: Final[int] = 7 * 24 * 3600          # 7 jours
 _INAT_CACHE_SCHEMA: Final[int] = 2                      # 2 : + taxon, précision
-_INAT_QUALITY_SCORES: Final[dict[str, float]] = {
-    "research": 0.90,
-    "needs_id": 0.75,
-}
-_INAT_BUFFER_M: Final[float] = 200.0                    # rayon boost (mètres L93)
 
 # ═══════════════════════════════════════════════════════════════════
 # CONSTANTES — MAPPING BD FORÊT v2 (calibré sur données réelles)
@@ -792,21 +787,20 @@ class SpeciesEnricher:
         if n_obs > 0:
             logger.info("  Niveau C : %d cellules", n_obs)
 
-        # ── Niveau C' : iNaturalist (Morchella) — espèces de ce taxon (D49) ──
-        if config.get_species_params(species)["taxon"][0] == _INAT_TAXON:
-            if not self._inat_fetched:
-                self.inat_observations = self._fetch_inaturalist(
-                    config.BBOX_WGS84,
-                )
-                self._inat_fetched = True
-            n_inat = self._apply_inaturalist_boost(
-                tree_scores, enrichable, x_coords, y_coords,
-                self.inat_observations,
+        # ── Niveau C' : iNaturalist (Morchella), récupéré pour la carte ──
+        # Plus injecté dans le critère essence (D60) : ces observations
+        # servent à évaluer le modèle (AUC, Boyce), les y injecter rendait
+        # l'évaluation circulaire. Le boost ne touchait d'ailleurs plus
+        # aucune cellule depuis D46 (NaN < 0,90 est faux), et 42 des 73
+        # observations ont une précision au-delà de 200 m.
+        if (
+            config.get_species_params(species)["taxon"][0] == _INAT_TAXON
+            and not self._inat_fetched
+        ):
+            self.inat_observations = self._fetch_inaturalist(
+                config.BBOX_WGS84,
             )
-            if n_inat > 0:
-                logger.info(
-                    "  Niveau C' : %d cellules (iNaturalist)", n_inat,
-                )
+            self._inat_fetched = True
 
         # ── Niveaux B+D — vectorisé par combo keys ────────────────
         enriched, strength = self._compute_regional_scores(
@@ -1039,7 +1033,12 @@ class SpeciesEnricher:
         proportions: dict[str, float],
         forest_type: int,
     ) -> dict[str, float]:
-        """Filtre par type (1=feuillus, 2=conifères, 3/0=tout)."""
+        """Filtre par type (1=feuillus, 2=conifères, 3/0=tout).
+
+        Type absent de la région (conifères du Bas-Dauphiné) : {} — le
+        mélange n'a pas de score et l'appelant retombe sur le mélange
+        `_default` du même type, au lieu de noter une pessière comme la
+        chênaie régionale (D60)."""
         if forest_type in (_FT_UNKNOWN, _FT_MIXTE):
             return proportions
 
@@ -1053,7 +1052,7 @@ class SpeciesEnricher:
                 total += p
 
         if total < 1e-10:
-            return proportions
+            return {}
 
         return {sp: p / total for sp, p in filtered.items()}
 
@@ -1275,12 +1274,18 @@ class SpeciesEnricher:
             codes_hash = hashlib.md5(
                 codes.tobytes(), usedforsecurity=False,
             ).hexdigest()[:8]
+            _bb = getattr(grid, "bbox", None)
             cache_path = _accel.raster_cache_path(
                 "forest_type",
                 f"ft_{codes_hash}",
                 len(geometries),
                 grid.cell_size,
                 out_shape,
+                # Emprise dans la clé (D27) : même forme, autre emprise
+                bbox=(
+                    (_bb["xmin"], _bb["ymin"], _bb["xmax"], _bb["ymax"])
+                    if isinstance(_bb, dict) else None
+                ),
             )
             cached = _accel.raster_cache_load(cache_path)
 
@@ -1687,55 +1692,6 @@ class SpeciesEnricher:
             "✅ iNaturalist : %d observations Morchella récupérées", len(results),
         )
         return results
-
-    def _apply_inaturalist_boost(
-        self,
-        tree_scores: np.ndarray,
-        enrichable: np.ndarray,
-        x_coords: Any,
-        y_coords: Any,
-        observations: list[dict[str, object]],
-    ) -> int:
-        """Booste tree_species pour cellules dans un rayon de 100m d'une obs. Morchella.
-
-        Seules les cellules `enrichable` (unknown) sont ciblées.
-        Score : 0.90 (research) ou 0.75 (needs_id).
-        Retourne le nombre de cellules boostées.
-        """
-        if not observations or x_coords is None or y_coords is None:
-            return 0
-
-        if isinstance(x_coords, np.ndarray) and x_coords.ndim == 1:
-            xx, yy = np.meshgrid(x_coords, y_coords)
-        else:
-            xx, yy = np.asarray(x_coords), np.asarray(y_coords)
-
-        boosted = 0
-        for obs in observations:
-            lng = float(str(obs["lng"]))
-            lat = float(str(obs["lat"]))
-            x_l93, y_l93 = _TO_L93.transform(lng, lat)
-            score_val = float(
-                _INAT_QUALITY_SCORES.get(str(obs.get("quality_grade", "needs_id")), 0.75)
-            )
-            dist2: np.ndarray = (xx - x_l93) ** 2 + (yy - y_l93) ** 2
-            target = (
-                enrichable
-                & (dist2 <= _INAT_BUFFER_M ** 2)
-                & (tree_scores < score_val)
-            )
-            if np.any(target):
-                tree_scores[target] = np.float32(score_val)
-                enrichable[target] = False
-                boosted += int(np.count_nonzero(target))
-
-        if boosted:
-            logger.info(
-                "✅ iNaturalist boost : %d cellules (Morchella, r=%.0fm)",
-                boosted,
-                _INAT_BUFFER_M,
-            )
-        return boosted
 
     # ═══════════════════════════════════════════════════════════════
     # PARSEUR TFV — code structuré + texte libre

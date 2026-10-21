@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -102,7 +103,7 @@ __all__ = [
     # Altitude
     "ALTITUDE_OPTIMAL", "ALTITUDE_RANGE", "ALTITUDE_ALLUVIAL_CENTER",
     # Pente
-    "SLOPE_OPTIMAL", "SLOPE_MODERATE", "SLOPE_STEEP", "SLOPE_MAX",
+    "SLOPE_OPTIMAL", "SLOPE_MODERATE", "SLOPE_STEEP", "SLOPE_MAX", "slope_breaks",
     # Rugosité
     "ROUGHNESS_WINDOW", "ROUGHNESS_OPTIMAL", "ROUGHNESS_MAX",
     # Hydrographie
@@ -748,7 +749,9 @@ def geology_label(key: object) -> str | None:
 ALTITUDE_OPTIMAL: Final[tuple[float, float]] = (200.0, 600.0)   # v2.5.4 (200,700) testé puis reverté
 ALTITUDE_RANGE: Final[tuple[float, float]] = (150.0, 900.0)
 
-# Centre du bonus micro-nappe / humidité résiduelle
+# Centre du bonus micro-nappe / humidité résiduelle — sans effet : le bonus
+# s'ajoutait à des cellules déjà à 1,0 puis était plafonné à 1,0 (retiré du
+# score d'altitude, D60 ; constante gardée pour compatibilité)
 ALTITUDE_ALLUVIAL_CENTER: Final[float] = 350.0
 
 
@@ -772,14 +775,21 @@ SLOPE_MAX: Final[float] = 45.0
 
 # v2.5.4 : SOFT_ELIM_BUFFER explicité dans config (auparavant fallback 15.0
 # dans scoring.py via getattr). Tests 5m régressaient le max — 15m conservé.
-SOFT_ELIM_BUFFER: Final[float] = 15.0
+# D60 : 0 = pas de transition. À 15 m, l'arrondi au pixel la rendait inactive
+# dès 11 m de maille (20 et 50 m : toutes les mesures D45–D59) et divisait
+# par deux, à 10 m seulement, la cellule voisine de toute zone éliminée —
+# dont la berge des cours d'eau, habitat favorable. Mesurée en mètres
+# depuis le bord de la zone éliminée si on la réactive.
+SOFT_ELIM_BUFFER: Final[float] = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════
 #  RUGOSITÉ TERRAIN
 # ═══════════════════════════════════════════════════════════════
 
-ROUGHNESS_WINDOW: Final[int] = 7
+# Fenêtre (pixels du MNT natif, 20 m : 100 m) de l'écart-type local de la
+# pente. 7 n'était pas lu : grid_builder avait sa propre copie à 5 (D60)
+ROUGHNESS_WINDOW: Final[int] = 5
 ROUGHNESS_OPTIMAL: Final[float] = 3.0
 ROUGHNESS_MAX: Final[float] = 12.0
 
@@ -1329,6 +1339,17 @@ def species_with_taxon(taxon_name: str) -> tuple[str, ...]:
 #  VALIDATION GLOBALE
 # ═══════════════════════════════════════════════════════════════
 
+def slope_breaks(params: Mapping[str, Any]) -> tuple[float, float, float, float]:
+    """Bornes du score de pente d'une espèce : (fin de l'optimum, fin du
+    modéré, fin du raide, éliminatoire). Chaque segment garde au moins 5°
+    pour que le score reste continu quand l'optimum de l'espèce atteint
+    SLOPE_MODERATE (morille noire : optimum jusqu'à 30°) — D60."""
+    opt_max = float(params["slope_optimal"][1])
+    moderate = max(SLOPE_MODERATE, opt_max + 5.0)
+    steep = max(SLOPE_STEEP, moderate + 5.0)
+    return opt_max, moderate, steep, float(params["slope_max"])
+
+
 def validate_config() -> bool:
     """Vérifie la cohérence interne de la configuration."""
     ok = True
@@ -1540,6 +1561,13 @@ def validate_config() -> bool:
                 "altitude_optimal", sp_name,
             )
         slo_opt = params["slope_optimal"]
+        _o, _m, steep_end, slope_max = slope_breaks(params)
+        if steep_end >= slope_max:
+            logger.error(
+                "SPECIES_PARAMS['%s'] : pente raide jusqu'à %.0f° ≥ "
+                "slope_max=%.0f°", sp_name, steep_end, slope_max,
+            )
+            ok = False
         if slo_opt[0] >= slo_opt[1] or slo_opt[1] > params["slope_max"]:
             logger.error(
                 "SPECIES_PARAMS['%s'].slope_optimal/slope_max incohérent: "

@@ -44,6 +44,7 @@ from typing import Any, Final
 import numpy as np
 import requests
 from affine import Affine
+from scipy.stats import rankdata
 
 import config
 from utils import TO_L93
@@ -308,7 +309,9 @@ def occurrence_check(
         n_used = n_good = 0
         if precise:
             rows, cols = _occurrence_cells(precise, transform, score.shape)
-            n_used = int(np.count_nonzero(valid[rows, cols]))
+            inside = valid[rows, cols]
+            rows, cols = _unique_cells(rows[inside], cols[inside], score.shape)
+            n_used = int(rows.size)
             n_good = int(np.count_nonzero(good[rows, cols]))
         share = n_good / n_used if n_used else None
         sources[source] = {
@@ -337,15 +340,28 @@ def _round(value: float | None, digits: int = 4) -> float | None:
 
 
 def _spearman(x: list[float], y: list[float]) -> float | None:
-    """Corrélation de Spearman (rangs sans ex æquo attendus) ; None si
-    moins de trois points ou variance nulle."""
+    """Corrélation de Spearman, ex æquo au rang moyen (des classes sans
+    occurrence ont le même P/E = 0 : argsort les départageait par ordre de
+    classe — D60) ; None si moins de trois points ou variance nulle."""
     if len(x) < 3 or len(x) != len(y):
         return None
-    rx = np.argsort(np.argsort(np.asarray(x, dtype=float))).astype(float)
-    ry = np.argsort(np.argsort(np.asarray(y, dtype=float))).astype(float)
+    rx = rankdata(np.asarray(x, dtype=float))
+    ry = rankdata(np.asarray(y, dtype=float))
     if rx.std() == 0 or ry.std() == 0:
         return None
     return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def _unique_cells(
+    rows: np.ndarray, cols: np.ndarray, shape: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Une présence par cellule : relevés répétés d'un même site (deux
+    années d'inventaire aux mêmes coordonnées) ou observations voisines
+    comptaient plusieurs fois dans l'AUC et les P/E (D60)."""
+    if rows.size == 0:
+        return rows, cols
+    flat = np.unique(rows.astype(np.int64) * int(shape[1]) + cols)
+    return flat // int(shape[1]), flat % int(shape[1])
 
 
 def occurrence_metrics(
@@ -390,7 +406,9 @@ def occurrence_metrics(
     precise = [o for o in occs if is_precise(o)]
     rows, cols = _occurrence_cells(precise, transform, score.shape)
     kept = valid[rows, cols]
-    s_occ = np.asarray(score[rows[kept], cols[kept]], dtype=np.float32)
+    n_in = int(np.count_nonzero(kept))
+    rows, cols = _unique_cells(rows[kept], cols[kept], score.shape)
+    s_occ = np.asarray(score[rows, cols], dtype=np.float32)
     n_used = int(s_occ.size)
 
     cuts = np.asarray(
@@ -461,6 +479,7 @@ def occurrence_metrics(
         "n_total": len(occs),
         "n_precise": len(precise),
         "n_used": n_used,
+        "n_same_cell": n_in - n_used,
         "n_area": n_area,
         "precise_max_m": PRECISE_MAX_M,
         "class_thresholds": [round(float(t), 4) for t in cuts],

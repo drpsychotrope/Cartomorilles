@@ -60,22 +60,16 @@ import requests
 
 import config
 from config import (
-    ALTITUDE_OPTIMAL,
-    ALTITUDE_RANGE,
     BBOX,
     BBOX_WGS84,
     CELL_SIZE,
     CONFIG_VERSION,
-    GEOLOGY_SCORES,
     N_SCORING_GRIDS,
     PROBABILITY_LABELS,
     PROBABILITY_THRESHOLDS,
     SCORE_THRESHOLD_HIGH,
     SCORE_THRESHOLD_MEDIUM,
-    SLOPE_MAX,
-    SLOPE_OPTIMAL,
     SUPPORTED_SPECIES,
-    TREE_SCORES,
     WEIGHTS,
     LANDCOVER_AUTO_MAX_KM2,
     CELL_SIZE_AUTO_THRESHOLDS,
@@ -789,17 +783,27 @@ def validate_against_terrain(
         logger.debug("")
         logger.debug("📍 Validation croisée terrain [%s] :", model.species)
 
+        if not hasattr(grid, "x_coords") or not hasattr(grid, "y_coords"):
+            logger.debug("   Grille sans coordonnées, validation impossible.")
+            return None
+        xs = np.asarray(grid.x_coords, dtype=np.float64)
+        ys = np.asarray(grid.y_coords, dtype=np.float64)
+        half = float(getattr(grid, "cell_size", abs(xs[1] - xs[0]))) / 2.0
+        x_lo, x_hi = min(xs[0], xs[-1]) - half, max(xs[0], xs[-1]) + half
+        y_lo, y_hi = min(ys[0], ys[-1]) - half, max(ys[0], ys[-1]) + half
+
         for pt in checkpoints:
             x, y = TO_L93.transform(pt["lon"], pt["lat"])
-
-            if not hasattr(grid, "x_coords") or not hasattr(grid, "y_coords"):
-                logger.debug(
-                    "   Grille sans coordonnées, validation impossible.",
-                )
-                return None
-
-            ix = int(np.argmin(np.abs(grid.x_coords - x)))
-            iy = int(np.argmin(np.abs(grid.y_coords - y)))
+            # argmin rend toujours un indice : un point hors de la grille
+            # était noté sur la cellule du bord la plus proche (D60)
+            if not (x_lo <= x <= x_hi and y_lo <= y <= y_hi):
+                logger.debug("   ⚠️  %s hors grille — ignoré", pt["name"])
+                continue
+            ix = int(np.argmin(np.abs(xs - x)))
+            iy = int(np.argmin(np.abs(ys - y)))
+            if not np.isfinite(scores[iy, ix]):
+                logger.debug("   ⚠️  %s sans score (NoData) — ignoré", pt["name"])
+                continue
 
             if 0 <= iy < scores.shape[0] and 0 <= ix < scores.shape[1]:
                 predicted = float(scores[iy, ix])
@@ -1108,6 +1112,22 @@ def save_hotspots_gpx(
 # ═══════════════════════════════════════════════════════════════
 
 
+def _json_safe(obj: Any) -> Any:
+    """Copie de `obj` où NaN et ±inf deviennent None (null en JSON), ainsi
+    que les flottants numpy ; tuples et ensembles deviennent des listes."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (set, frozenset)):
+        return sorted(_json_safe(v) for v in obj)
+    if isinstance(obj, (float, np.floating)):
+        return float(obj) if np.isfinite(obj) else None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    return obj
+
+
 def save_report(
     output_dir: Path,
     stats: dict[str, Any],
@@ -1117,10 +1137,12 @@ def save_report(
     concordance: float | None,
     enrichment_stats: dict[str, Any] | None = None,
     species: str = "esculenta",
+    n_evaluated: int | None = None,
 ) -> Path:
     """Sauvegarde un rapport JSON complet et reproductible.
 
     v2.6.0 : nom rapport templaté par espèce — `rapport_{species}.json`.
+    `n_evaluated` : points de contrôle notés (dans la grille, avec score).
     """
     hotspots_export: list[dict[str, Any]] = [
         hotspot_to_export_dict(h) for h in hotspots[:30]
@@ -1146,6 +1168,7 @@ def save_report(
         "terrain_validation": {
             "concordance_rate": concordance,
             "n_checkpoints": len(sp_checkpoints),
+            "n_evaluated": n_evaluated,
         },
         "enrichment": enrichment_stats,
         "hotspots": hotspots_export,
@@ -1153,7 +1176,11 @@ def save_report(
 
     report_path = output_dir / f"rapport_{species}.json"
     with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+        # NaN (essence inconnue, D46) → null : JSON strict lisible partout
+        json.dump(
+            _json_safe(report), f, indent=2, ensure_ascii=False,
+            default=str, allow_nan=False,
+        )
 
     logger.debug("📝 Rapport sauvegardé [%s] : %s", species, report_path)
     return report_path
@@ -1623,25 +1650,28 @@ def main(args: argparse.Namespace) -> int:
     grid.compute_terrain(dem_data)
 
     # ── 2b. Scores terrain ────────────────────────────────────
+    # Tables de la 1re espèce modélisée, comme l'enrichissement (2c') :
+    # les critères dépendant de l'espèce sont recalculés à l'étape 3 (D60)
+    first_species = species_list[0]
     logger.debug("   ▸ Altitude, pente, rugosité, exposition...")
-    grid.score_altitude()
-    grid.score_slope()
+    grid.score_altitude(species=first_species)
+    grid.score_slope(species=first_species)
     grid.score_terrain_roughness()
-    grid.score_aspect()
+    grid.score_aspect(species=first_species)
     # ── TWI (fix #46 v2.3.5) ──
-    grid.score_twi()
+    grid.score_twi(species=first_species)
 
     # ── 2c. Scores écologiques (données vectorielles) ─────────
     logger.debug("   ▸ Distance eau...")
     grid.score_distance_water(hydro_gdf, water_surfaces_gdf)
 
     logger.debug("   ▸ Essences forestières...")
-    grid.score_tree_species(forest_gdf)
+    grid.score_tree_species(forest_gdf, species=first_species)
     # Peuplements d'arbres hôtes : élimination « sans arbre hôte » (D57)
     grid.compute_host_forest(forest_gdf)
 
     logger.debug("   ▸ Géologie (%s)...", geology_source)
-    grid.score_geology(geology_gdf)
+    grid.score_geology(geology_gdf, species=first_species)
 
     # ── 2c'. Enrichissement essences (niveaux B+C+D) ─────────
     # Table de la 1re espèce modélisée ; rejoué par espèce à l'étape 3 (D47).
@@ -1650,7 +1680,7 @@ def main(args: argparse.Namespace) -> int:
     logger.debug("   ▸ Enrichissement essences (IFN 1997 × altitude)...")
     enricher.enrich_grid_scores(
         grid, forest_gdf=forest_gdf, geology_gdf=geology_gdf,
-        species=species_list[0],
+        species=first_species,
     )
     enrich_stats = enricher.get_stats(grid)
     logger.debug(
@@ -1772,6 +1802,10 @@ def main(args: argparse.Namespace) -> int:
             grid, forest_gdf=forest_gdf, geology_gdf=geology_gdf,
             species=species,
         )
+        # Ouverture de canopée et couvert du sol lisent l'essence et la
+        # géologie de l'espèce (bonus « essence favorable », « calcaire ») :
+        # recalculés après l'enrichissement de l'espèce (D60)
+        grid.recompute_habitat_scores()
 
         sp_model = MorilleScoring(grid, species=species)
         sp_model.compute_weighted_score()
@@ -1908,12 +1942,9 @@ def main(args: argparse.Namespace) -> int:
         "weather": weather_status,
         "weather_today": weather_today,
         "weights": dict(WEIGHTS),
-        "tree_scores": dict(TREE_SCORES),
-        "geology_scores": dict(GEOLOGY_SCORES),
-        "altitude_optimal": list(ALTITUDE_OPTIMAL),
-        "altitude_range": list(ALTITUDE_RANGE),
-        "slope_optimal": list(SLOPE_OPTIMAL),
-        "slope_max": SLOPE_MAX,
+        # Tables d'essences et de géologie, optimums d'altitude et de pente :
+        # ceux de l'espèce, sous species_params (ici ils étaient ceux de la
+        # morille grise dans les trois rapports — D60)
         "geology_source": geology_source,
         "bd_foret_path": bd_foret_path,
         "geology_path": geology_path,
@@ -1950,6 +1981,7 @@ def main(args: argparse.Namespace) -> int:
             sp_snapshot, duration, sp_conc.rate if sp_conc else None,
             enrichment_stats=full_enrich_stats,
             species=sp,
+            n_evaluated=sp_conc.n_points if sp_conc else None,
         ))
         produced.append(
             save_hotspots_csv(output_dir, hotspots_by_species[sp], species=sp),

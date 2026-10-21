@@ -51,14 +51,16 @@ try:
     import cupyx.scipy.ndimage as _cpx_ndi_import
 
     _cp_import.cuda.Device(0).compute_capability
+    _dev = _cp_import.cuda.Device(0)
+    try:
+        _name = _cp_import.cuda.runtime.getDeviceProperties(0)["name"]
+        _GPU_NAME = _name.decode() if isinstance(_name, bytes) else str(_name)
+    except Exception:  # noqa: BLE001 — nom indisponible, GPU utilisable
+        _GPU_NAME = str(_dev)
+    _GPU_MEM_GB = _dev.mem_info[1] / (1024**3)
     _cp = _cp_import
     _cpx_ndi = _cpx_ndi_import
-    _dev = _cp.cuda.Device(0)
     _GPU_AVAILABLE = True
-    _GPU_NAME = _dev.attributes["DeviceName"] if hasattr(
-        _dev, "attributes",
-    ) else str(_dev)
-    _GPU_MEM_GB = _dev.mem_info[1] / (1024**3)
     logger.info(
         "🟢 GPU détecté : %s (%.1f GB VRAM)", _GPU_NAME, _GPU_MEM_GB,
     )
@@ -151,7 +153,10 @@ def _nb_slope_aspect(
             if mag < 1e-8:
                 aspect[i, j] = -1.0
             else:
-                a = np.degrees(np.arctan2(-dz_dy, dz_dx))
+                # dz_dx = ∂z/∂est, dz_dy = ∂z/∂sud (ligne 0 = nord) : la
+                # descente pointe vers (−∂z/∂est, −∂z/∂nord) = (−dz_dx, dz_dy),
+                # comme le chemin GPU (convolve retourne ses noyaux) — D60
+                a = np.degrees(np.arctan2(dz_dy, -dz_dx))
                 if a < 0.0:
                     a += 360.0
                 a = 90.0 - a
@@ -214,36 +219,26 @@ def _nb_gaussian_filter_nearest(
 
 
 @njit(parallel=True, cache=True)
-def _nb_uniform_filter(data: np.ndarray, size: int) -> np.ndarray:
-    """Filtre uniforme via image intégrale — Numba parallèle."""
-    ny, nx = data.shape
-    half = size // 2
-
-    integ = np.empty((ny + 1, nx + 1), dtype=np.float64)
-    for i in range(ny + 1):
-        integ[i, 0] = 0.0
-    for j in range(nx + 1):
-        integ[0, j] = 0.0
-
-    for i in range(ny):
+def _nb_box_mean(padded: np.ndarray, size: int, ny: int, nx: int) -> np.ndarray:
+    """Moyenne sur fenêtre size×size d'un tableau déjà bordé de size//2
+    (image intégrale) — Numba parallèle."""
+    py, px = padded.shape
+    integ = np.zeros((py + 1, px + 1), dtype=np.float64)
+    for i in range(py):
         row_sum = 0.0
-        for j in range(nx):
-            row_sum += data[i, j]
+        for j in range(px):
+            row_sum += padded[i, j]
             integ[i + 1, j + 1] = integ[i, j + 1] + row_sum
 
     out = np.empty((ny, nx), dtype=np.float32)
+    area = float(size * size)
     for i in prange(ny):
         for j in range(nx):
-            r0 = max(i - half, 0)
-            r1 = min(i + half + 1, ny)
-            c0 = max(j - half, 0)
-            c1 = min(j + half + 1, nx)
-            area = (r1 - r0) * (c1 - c0)
             s = (
-                integ[r1, c1]
-                - integ[r0, c1]
-                - integ[r1, c0]
-                + integ[r0, c0]
+                integ[i + size, j + size]
+                - integ[i, j + size]
+                - integ[i + size, j]
+                + integ[i, j]
             )
             out[i, j] = np.float32(s / area)
 
@@ -278,10 +273,11 @@ def _nb_gaussian_filter(
             acc = 0.0
             for k in range(ksize):
                 jj = j + k - radius
+                # « reflect » de scipy/cupyx : d c b a | a b c d | d c b a
                 if jj < 0:
-                    jj = -jj
+                    jj = -jj - 1
                 if jj >= nx:
-                    jj = 2 * nx - 2 - jj
+                    jj = 2 * nx - 1 - jj
                 acc += data[i, jj] * kernel[k]
             tmp[i, j] = acc
 
@@ -292,9 +288,9 @@ def _nb_gaussian_filter(
             for k in range(ksize):
                 ii = i + k - radius
                 if ii < 0:
-                    ii = -ii
+                    ii = -ii - 1
                 if ii >= ny:
-                    ii = 2 * ny - 2 - ii
+                    ii = 2 * ny - 1 - ii
                 acc += tmp[ii, j] * kernel[k]
             out[i, j] = np.float32(acc)
 
@@ -587,11 +583,29 @@ def compute_roughness(
 
 
 def uniform_filter(data: np.ndarray, size: int) -> np.ndarray:
-    """Filtre uniforme (box filter) accéléré."""
+    """Filtre uniforme (box filter) accéléré.
+
+    CPU comme GPU (cupyx/scipy, mode « reflect ») : fenêtre pleine au bord
+    (la version Numba la rétrécissait, d'où un filtre de densité urbaine
+    différent sur le bord de la grille), et un NaN ne gâte que les fenêtres
+    qui le contiennent (l'image intégrale le propageait à toute la suite de
+    la grille) — D60.
+    """
     data = np.asarray(data, dtype=np.float32)
     if _GPU_AVAILABLE:
         return _gpu_uniform_filter(data, size)
-    return _nb_uniform_filter(data, size)
+    ny, nx = data.shape
+    half = size // 2
+    nan = np.isnan(data)
+    has_nan = bool(nan.any())
+    src = np.where(nan, np.float32(0.0), data) if has_nan else data
+    out = _nb_box_mean(np.pad(src, half, mode="symmetric"), size, ny, nx)
+    if has_nan:
+        n_nan = _nb_box_mean(
+            np.pad(nan.astype(np.float32), half, mode="symmetric"), size, ny, nx,
+        )
+        out[n_nan > 0] = np.nan
+    return out
 
 
 def gaussian_filter(
@@ -615,8 +629,14 @@ def gaussian_filter(
     else:
         if mode == "nearest":
             result = _nb_gaussian_filter_nearest(data, sigma, truncate=truncate)
-        else:
+        elif mode == "reflect" and int(truncate * sigma + 0.5) < min(data.shape):
             result = _nb_gaussian_filter(data, sigma, truncate=truncate)
+        else:  # autre mode, ou noyau plus large que la grille : scipy
+            from scipy.ndimage import gaussian_filter as _scipy_gaussian
+            result = np.asarray(
+                _scipy_gaussian(data, sigma=sigma, mode=mode, truncate=truncate),
+                dtype=np.float32,
+            )
         backend = "CPU"
 
     dt = time.perf_counter() - t0
@@ -783,7 +803,7 @@ def _rasterize_band_worker(
             transform=t,
             fill=0,
             dtype=np.uint8,
-            all_touched=True,
+            all_touched=all_touched,
         ),
         dtype=np.uint8,
     )
@@ -1147,23 +1167,35 @@ def connected_components(
     mask: np.ndarray,
     structure: np.ndarray | None = None,
     closing_iterations: int = 0,
+    barrier: np.ndarray | None = None,
 ) -> tuple[np.ndarray, int]:
-    """Labeling 8-connexité avec closing optionnel — GPU si dispo."""
+    """Labeling 8-connexité avec closing optionnel — GPU si dispo.
+
+    Le closing ne sert qu'à relier des cellules de `mask` proches : il ne
+    retire aucune cellule (le bord de la grille érodait), ne traverse pas
+    `barrier` (cellules éliminées), et les étiquettes rendues ne portent que
+    sur les cellules de `mask` — les cellules qu'il ajoute ne comptent dans
+    aucune statistique d'amas (D60).
+    """
     t0 = time.perf_counter()
 
     if structure is None:
         structure = np.ones((3, 3), dtype=np.int32)
 
+    base = np.asarray(mask, dtype=bool)
     if _GPU_AVAILABLE:
         assert _cp is not None and _cpx_ndi is not None
 
-        g_mask = _cp.asarray(mask)
+        g_mask = _cp.asarray(base)
         g_struct = _cp.asarray(structure)
 
         if closing_iterations >= 1:
-            g_mask = _cpx_ndi.binary_closing(
+            closed = _cpx_ndi.binary_closing(
                 g_mask, structure=g_struct, iterations=closing_iterations,
             )
+            g_mask = closed | g_mask
+            if barrier is not None:
+                g_mask &= ~_cp.asarray(barrier, dtype=bool)
 
         _lab_result = _cpx_ndi.label(g_mask, structure=g_struct)
         labeled = _cp.asnumpy(_lab_result[0]).astype(np.int32)  # type: ignore[index]
@@ -1173,18 +1205,23 @@ def connected_components(
         from scipy.ndimage import binary_closing as _binary_closing
         from scipy.ndimage import label as _label
 
-        m = np.asarray(mask)
+        m = base
         if closing_iterations >= 1:
             m = np.asarray(
                 _binary_closing(
                     m, structure=structure, iterations=closing_iterations,
                 ),
-            )
+            ) | base
+            if barrier is not None:
+                m &= ~np.asarray(barrier, dtype=bool)
 
         _lab_result = _label(m, structure=structure)
         labeled = np.asarray(_lab_result[0], dtype=np.int32)  # type: ignore[index]
         n_clusters = int(_lab_result[1])  # type: ignore[index]
         backend = "CPU"
+
+    # Statistiques sur les seules cellules de `mask`
+    labeled[~base] = 0
 
     dt = time.perf_counter() - t0
     logger.info(
