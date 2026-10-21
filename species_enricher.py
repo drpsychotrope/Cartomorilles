@@ -51,8 +51,7 @@ __all__ = ["SpeciesEnricher"]
 # ═══════════════════════════════════════════════════════════════════
 
 _INAT_BASE_URL: Final[str] = "https://api.inaturalist.org/v1/observations"
-_INAT_TAXON: Final[str] = "Morchella"
-_INAT_SPECIES: Final[str] = "esculenta"    # seule espèce modélisée de ce taxon
+_INAT_TAXON: Final[str] = "Morchella"      # niveau C' : espèces de ce taxon (D49)
 _INAT_PER_PAGE: Final[int] = 200
 _INAT_CACHE_TTL_S: Final[int] = 7 * 24 * 3600          # 7 jours
 _INAT_CACHE_SCHEMA: Final[int] = 2                      # 2 : + taxon, précision
@@ -774,8 +773,8 @@ class SpeciesEnricher:
         if n_obs > 0:
             logger.info("  Niveau C : %d cellules", n_obs)
 
-        # ── Niveau C' : iNaturalist (Morchella) — morille seulement ──
-        if species == _INAT_SPECIES:
+        # ── Niveau C' : iNaturalist (Morchella) — espèces de ce taxon (D49) ──
+        if config.get_species_params(species)["taxon"][0] == _INAT_TAXON:
             if not self._inat_fetched:
                 self.inat_observations = self._fetch_inaturalist(
                     config.BBOX_WGS84,

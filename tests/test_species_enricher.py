@@ -104,6 +104,17 @@ class EnrichGridScoresBySpecies(unittest.TestCase):
         # Niveau C' (observations Morchella) : morille seulement
         self.assertEqual(enricher.inat_calls, 0)
 
+    def test_morille_noire_gets_inat_level(self) -> None:
+        # Niveau C' : toute espèce de taxon Morchella, pas seulement la grise
+        enricher, grid = self._enrich("elata")
+        ts = grid.scores["tree_species"]
+        unknown = grid._tree_species_int_raster == _CODE_UNKNOWN
+        self.assertTrue(np.all(np.isfinite(ts[unknown])))
+        np.testing.assert_allclose(
+            ts[unknown], _expected_mix_score("gresivaudan", "elata"), atol=1e-5,
+        )
+        self.assertEqual(enricher.inat_calls, 1)
+
     def test_known_and_no_forest_cells_untouched(self) -> None:
         for species in ("esculenta", "edulis"):
             _, grid = self._enrich(species)
