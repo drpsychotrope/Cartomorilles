@@ -60,6 +60,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import matplotlib
@@ -160,8 +161,8 @@ _TWI_SWATCH: str = "#4575b4"
 # Couleur des observations iNaturalist (hors de la palette des scores)
 _INAT_COLOR: str = "#6a3d9a"
 # Les observations iNaturalist sont des Morchella (species_enricher) :
-# couche affichée seulement quand cette espèce est active.
-_INAT_SPECIES: str = "esculenta"
+# couche affichée quand une espèce de ce taxon est active (grise ou noire, D49)
+_INAT_TAXON: str = "Morchella"
 # Repères : gris neutre, forme losange (≠ hotspots ronds numérotés)
 _LANDMARK_COLOR: str = "#5f6368"
 # Emprise d'étude : contour sombre sur halo blanc, extérieur voilé de blanc
@@ -820,6 +821,14 @@ class MorilleVisualizer:
             },
         }
 
+    @staticmethod
+    def observation_species(species_list: Sequence[str]) -> list[str]:
+        """Espèces de la carte dont le taxon naturaliste est Morchella : la
+        couche d'observations iNaturalist est affichée quand l'une d'elles
+        est active (D49)."""
+        morels = set(config.species_with_taxon(_INAT_TAXON))
+        return [sp for sp in species_list if sp in morels]
+
     def inside_study_area(self, hotspots: list[dict[str, Any]]) -> np.ndarray:
         """Hotspots (centroïdes L93) situés dans l'emprise d'étude — même
         filtre pour la carte et l'export GPX de main.py."""
@@ -1192,7 +1201,7 @@ class MorilleVisualizer:
             "hotspotsDefault": self.default_hotspots_shown,
             "basemaps": basemaps,
             "layers": layer_vars,
-            "layerSpecies": {"inat": _INAT_SPECIES},
+            "layerSpecies": {"inat": self.observation_species(self.species_list)},
             "area": self._study_area_geojson(),
             "areaStyle": {
                 "line": _AREA_LINE,
@@ -1738,13 +1747,14 @@ class MorilleVisualizer:
                 var key = input.dataset.layer, layer = window[CFG.layers[key]];
                 var row = input.closest('label');
                 if (!layer) { row.hidden = true; return; }
+                var linked = CFG.layerSpecies[key];
                 layerRows.push({input: input, layer: layer, row: row,
-                                species: CFG.layerSpecies[key] || null});
+                                species: linked ? [].concat(linked) : null});
                 input.addEventListener('change', syncLayers);
             });
             function syncLayers() {
                 layerRows.forEach(function (l) {
-                    var off = l.species !== null && l.species !== current;
+                    var off = l.species !== null && l.species.indexOf(current) === -1;
                     l.row.hidden = off;
                     if (l.input.checked && !off) { map.addLayer(l.layer); }
                     else { map.removeLayer(l.layer); }
@@ -2168,9 +2178,11 @@ class MorilleVisualizer:
     # Couche iNaturalist Morchella
     # ──────────────────────────────────────────────────────
     def _add_inaturalist_layer(self, folium_map: folium.Map) -> str | None:
-        """Observations Morchella : affichées seulement quand la morille
-        est l'espèce active (le JS masque la couche pour les autres)."""
-        if not self._inat_observations or _INAT_SPECIES not in self.species_list:
+        """Observations Morchella : affichées quand une morille (grise ou
+        noire) est l'espèce active (le JS masque la couche pour les autres)."""
+        if not self._inat_observations or not self.observation_species(
+            self.species_list,
+        ):
             return None
 
         fg = folium.FeatureGroup(
