@@ -24,6 +24,7 @@ v2.3.0 — Fixes #12-17, #24-25
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
@@ -118,6 +119,23 @@ _CANOPY_BASE_INTERIOR: float = 0.55       # v2.5.3 : 0.45 → 0.55 — relève p
 _CANOPY_SLOPE_BONUS: float = 0.10         # trouées naturelles 10-30°
 _CANOPY_ALT_BONUS: float = 0.05           # structure montagnarde 300-800m
 _CANOPY_SPECIES_BONUS: float = 0.05       # essences favorables (score > 0.40)
+
+
+def _categorical_cache_key(lookup: np.ndarray, codes: np.ndarray) -> str:
+    """Empreinte MD5 (8 hex) d'un raster catégoriel : lookup code → score
+    (D23) et séquence des codes dans l'ordre de rasterisation (D48).
+
+    Le raster int16 ne dépend que des géométries, des codes brûlés et de
+    leur ordre (last wins, D22) : deux rasterisations ne partagent un cache
+    que si les mêmes codes sont brûlés dans le même ordre. Un changement du
+    tri des polygones (``na_position="first"``, D46) change donc la clé,
+    même à lookup identique.
+    """
+    digest = hashlib.md5(usedforsecurity=False)
+    digest.update(np.ascontiguousarray(lookup, dtype=np.float32).tobytes())
+    digest.update(np.ascontiguousarray(codes, dtype=np.int16).tobytes())
+    return digest.hexdigest()[:8]
+
 
 __all__ = ("GridBuilder",)
 
@@ -1191,7 +1209,8 @@ class GridBuilder:
         prévaut en cas de chevauchement de polygones (last wins).
 
         v2.6.0 : table de scores species-aware via config.SPECIES_PARAMS.
-        Le hash MD5 du lookup (D23) garantit caches disque distincts par espèce.
+        Clé de cache = lookup (D23) + ordre de rasterisation (D48) + emprise
+        (D27) : caches distincts par espèce et par ordre de brûlage.
         """
         name = "tree_species"
         if self._skip_zero_weight(name):
@@ -1296,18 +1315,17 @@ class GridBuilder:
         geometries: list[Any] = gdf.geometry.tolist()
         codes = np.asarray(gdf["_burn_code"].values, dtype=np.int16)
 
-        # ── Cache (hash du mapping score → invalidation auto) ─────
-        import hashlib
-
-        lookup_hash = hashlib.md5(
-            lookup.tobytes(), usedforsecurity=False,
-        ).hexdigest()[:8]
+        # ── Cache : lookup (D23) + ordre de brûlage (D48) + emprise (D27) ──
         cache_path = _accel.raster_cache_path(
             "tree_species",
-            f"{col}_{lookup_hash}",
+            f"{col}_{_categorical_cache_key(lookup, codes)}",
             len(geometries),
             self.cell_size,
             (self.ny, self.nx),
+            bbox=(
+                self.bbox["xmin"], self.bbox["ymin"],
+                self.bbox["xmax"], self.bbox["ymax"],
+            ),
         )
         cached = _accel.raster_cache_load(cache_path)
 
@@ -1411,7 +1429,8 @@ class GridBuilder:
         prévaut en cas de chevauchement (last wins).
 
         v2.6.0 : table de scores + ELIMINATORY_GEOLOGY species-aware.
-        Cèpe : eliminatory_geology = ∅ (ubiquiste). Cache D23 isolé par hash.
+        Cèpe : eliminatory_geology = ∅ (ubiquiste). Clé de cache = lookup
+        (D23) + ordre de rasterisation (D48) + emprise (D27).
         """
         name = "geology"
         if self._skip_zero_weight(name):
@@ -1526,18 +1545,17 @@ class GridBuilder:
         geometries: list[Any] = gdf.geometry.tolist()
         codes = np.asarray(gdf["_burn_code"].values, dtype=np.int16)
 
-        # ── Cache (hash du mapping score → invalidation auto) ─────
-        import hashlib
-
-        lookup_hash = hashlib.md5(
-            lookup.tobytes(), usedforsecurity=False,
-        ).hexdigest()[:8]
+        # ── Cache : lookup (D23) + ordre de brûlage (D48) + emprise (D27) ──
         cache_path = _accel.raster_cache_path(
             "geology_cat",
-            f"{col}_{lookup_hash}",
+            f"{col}_{_categorical_cache_key(lookup, codes)}",
             len(geometries),
             self.cell_size,
             (self.ny, self.nx),
+            bbox=(
+                self.bbox["xmin"], self.bbox["ymin"],
+                self.bbox["xmax"], self.bbox["ymax"],
+            ),
         )
         cached = _accel.raster_cache_load(cache_path)
 
