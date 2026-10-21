@@ -16,6 +16,7 @@ Les colonnes de sortie sont normalisées pour grid_builder.py.
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import time
@@ -43,6 +44,10 @@ from config import (
     BBOX_WGS84,
     CELL_SIZE,
     DATA_BUFFER,
+    DEM_RESOLUTION_M,
+    DEM_SOURCE,
+    RGEALTI_LAYER,
+    RGEALTI_WMS_URL,
     WATER_TYPE_BONUS,
     resolve_geology,
     resolve_tree_name,
@@ -148,9 +153,10 @@ def _bbox_hash(bbox_wgs84: Mapping[str, float]) -> str:
 
 # overpass-api.de répond 406 à une requête sans User-Agent identifiable
 # (celui de requests par défaut) : toutes ses réponses étaient perdues (D61)
+_USER_AGENT: str = "Cartomorilles (carte de prospection mycologique, usage personnel)"
 _OVERPASS_HEADERS: dict[str, str] = {
     "Accept": "application/json",
-    "User-Agent": "Cartomorilles (carte de prospection mycologique, usage personnel)",
+    "User-Agent": _USER_AGENT,
 }
 
 
@@ -500,29 +506,50 @@ class DataLoader:
 
     def load_dem(self, filepath: str | None = None) -> dict[str, Any]:
         """
-        Charge le MNT. Priorité: fichier local → cache → Copernicus → synthétique.
+        Charge le MNT. Priorité : fichier local → RGE ALTI (cache, puis WMS
+        de la Géoplateforme, D63) → Copernicus (cache, puis téléchargement)
+        → synthétique.
 
         Returns:
             {"data": np.ndarray (float32, NaN pour nodata),
              "transform": rasterio.Affine,
-             "crs": str}
+             "crs": str, "source": str}
         """
         # 1. Fichier local
         if filepath and Path(filepath).exists():
             result = self._read_dem_file(filepath)
             if result is not None:
+                result["source"] = "fichier"
                 return result
 
-        # 2. Cache
+        # 2. RGE ALTI de l'IGN : le sol, sous les arbres et les bâtiments
+        if DEM_SOURCE == "rgealti":
+            res_tag = f"{DEM_RESOLUTION_M:g}".replace(".", "p")
+            rge_cache = self._cache_path(f"dem_rgealti{res_tag}m", "tif")
+            result = self._read_dem_file(str(rge_cache), label="cache RGE ALTI")
+            if result is not None:
+                result["source"] = "RGE ALTI"
+                return result
+            try:
+                result = self._download_rgealti_dem(DEM_RESOLUTION_M)
+                self._save_dem_cache(result, rge_cache)
+                return result
+            except Exception as e:  # noqa: BLE001 — repli Copernicus
+                logger.warning(
+                    "⚠️ RGE ALTI indisponible (%s) — repli sur le MNS "
+                    "Copernicus (cime des arbres, toits)", e,
+                )
+
+        # 3. Copernicus : cache, puis téléchargement
         cache_path = self._cache_path("dem", "tif")
         result = self._read_dem_file(str(cache_path), label="cache")
         if result is not None:
+            result["source"] = "Copernicus"
             return result
-
-        # 3. Copernicus DEM
         try:
             result = self._download_copernicus_dem()
             self._save_dem_cache(result, cache_path)
+            result["source"] = "Copernicus"
             return result
         except Exception as e:
             logger.warning("⚠️ Copernicus DEM échoué: %s", e)
@@ -664,6 +691,115 @@ class DataLoader:
         )
         return {"data": dem_l93, "transform": dst_transform, "crs": TARGET_CRS}
 
+    # Tuile du MNT RGE ALTI : 2 500 pixels du MNT de côté (25 km à 10 m),
+    # demandée au WMS à 5 m (5 000 px, sous son plafond de 5 010)
+    _RGEALTI_TILE_PX: int = 2500
+    _RGEALTI_SUBSAMPLE: int = 2
+
+    def _wms_elevation(
+        self, x0: float, y0: float, x1: float, y1: float,
+        width: int, height: int,
+    ) -> np.ndarray:
+        """Altitudes (m, float32, NaN hors couverture) du RGE ALTI sur une
+        emprise L93, image de width × height pixels (WMS GetMap, BIL 32
+        bits) ; trois essais."""
+        params = {
+            "SERVICE": "WMS", "VERSION": "1.3.0", "REQUEST": "GetMap",
+            "LAYERS": RGEALTI_LAYER, "STYLES": "", "CRS": "EPSG:2154",
+            "BBOX": f"{x0:.3f},{y0:.3f},{x1:.3f},{y1:.3f}",
+            "WIDTH": str(width), "HEIGHT": str(height),
+            "FORMAT": "image/x-bil;bits=32",
+        }
+        last = ""
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    RGEALTI_WMS_URL, params=params, timeout=600,
+                    headers={"User-Agent": _USER_AGENT},
+                )
+                ctype = resp.headers.get("Content-Type", "")
+                if resp.status_code == 200 and ctype.startswith("image/x-bil"):
+                    arr = np.frombuffer(resp.content, dtype="<f4")
+                    if arr.size == width * height:
+                        out = arr.reshape(height, width).copy()
+                        out[out <= -1000.0] = np.nan      # nodata −99999
+                        return out
+                    last = f"{arr.size} valeurs pour {width}×{height}"
+                else:
+                    last = f"HTTP {resp.status_code} {ctype}"
+            except requests.RequestException as e:
+                last = str(e)
+            time.sleep(10 * (attempt + 1))
+        raise RuntimeError(f"WMS RGE ALTI : {last}")
+
+    def _download_rgealti_dem(self, res: float) -> dict[str, Any]:
+        """MNT RGE ALTI calé sur l'emprise au pas `res` : tuiles WMS lues à
+        res / 2 (≈ 5 m, la résolution du RGE ALTI) et moyennées 2 × 2, trois
+        requêtes à la fois. Chaque tuile reçue est gardée dans
+        data/cache/rgealti pour reprendre un téléchargement interrompu, puis
+        supprimée quand le MNT complet est en cache (D63)."""
+        b = self.bbox
+        nx = max(1, int(round((b["xmax"] - b["xmin"]) / res)))
+        ny = max(1, int(round((b["ymax"] - b["ymin"]) / res)))
+        transform = from_bounds(b["xmin"], b["ymin"], b["xmax"], b["ymax"], nx, ny)
+        size, sub = self._RGEALTI_TILE_PX, self._RGEALTI_SUBSAMPLE
+        tiles = [
+            (r0, c0, min(size, ny - r0), min(size, nx - c0))
+            for r0 in range(0, ny, size) for c0 in range(0, nx, size)
+        ]
+        cache_dir = DATA_DIR / "cache" / "rgealti"
+        logger.info(
+            "🏔️ MNT RGE ALTI (IGN, Géoplateforme) : %d tuiles lues à %.0f m, "
+            "moyennées à %.0f m (%d × %d)", len(tiles), res / sub, res, nx, ny,
+        )
+
+        def fetch(tile: tuple[int, int, int, int]) -> np.ndarray:
+            r0, c0, h, w = tile
+            x0, y1 = transform * (c0, r0)
+            x1, y0 = transform * (c0 + w, r0 + h)
+            key = hashlib.md5(
+                f"{RGEALTI_LAYER}|{x0:.3f},{y0:.3f},{x1:.3f},{y1:.3f}|{w}x{h}x{sub}".encode(),
+            ).hexdigest()[:12]
+            path = cache_dir / f"{key}.npy"
+            if path.exists():
+                try:
+                    return np.load(path)
+                except (OSError, ValueError):
+                    path.unlink(missing_ok=True)
+            fine = self._wms_elevation(x0, y0, x1, y1, w * sub, h * sub)
+            # Moyenne des pixels valides de chaque bloc sub × sub (NaN si
+            # aucun) ; pas de nanmean, qui avertit depuis les threads
+            cells = fine.reshape(h, sub, w, sub)
+            valid = np.isfinite(cells)
+            count = valid.sum(axis=(1, 3))
+            total = np.where(valid, cells, 0.0).sum(axis=(1, 3), dtype=np.float64)
+            block = np.full((h, w), np.nan, dtype=np.float32)
+            np.divide(total, count, out=block, where=count > 0, casting="unsafe")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            np.save(path, block)
+            return block
+
+        dem = np.full((ny, nx), np.nan, dtype=np.float32)
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for i, ((r0, c0, h, w), block) in enumerate(
+                zip(tiles, pool.map(fetch, tiles)), start=1,
+            ):
+                dem[r0:r0 + h, c0:c0 + w] = block
+                logger.debug("   RGE ALTI tuile %d/%d", i, len(tiles))
+        missing = float(np.isnan(dem).mean())
+        if missing > 0.01:
+            raise ValueError(f"{missing:.1%} de l'emprise sans altitude")
+        for f in cache_dir.glob("*.npy"):
+            f.unlink(missing_ok=True)
+        logger.info(
+            "✅ MNT RGE ALTI : %d × %d à %.0f m, alt %.0f–%.0f m (%.0f s)",
+            nx, ny, res, float(np.nanmin(dem)), float(np.nanmax(dem)),
+            time.time() - t0,
+        )
+        return {"data": dem, "transform": transform, "crs": TARGET_CRS,
+                "source": "RGE ALTI"}
+
     def _save_dem_cache(self, dem_data: dict[str, Any], cache_path: Path) -> None:
         """Sauvegarde le DEM en cache GeoTIFF."""
         try:
@@ -678,7 +814,11 @@ class DataLoader:
                 dtype=np.float32,
                 crs=TARGET_CRS,
                 transform=dem_data["transform"],
-                compress="lzw",
+                compress="deflate",
+                predictor=3,
+                tiled=True,
+                blockxsize=512,
+                blockysize=512,
                 nodata=np.nan,
             ) as dst:
                 dst.write(dem, 1)

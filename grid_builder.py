@@ -428,6 +428,8 @@ class GridBuilder:
 
         dem_raw = np.asarray(dem_data["data"]).astype(np.float32)
         dem_ny, dem_nx = dem_raw.shape
+        # Source du MNT (RGE ALTI, Copernicus, fichier), citée par la carte
+        self.dem_source: str = str(dem_data.get("source") or "MNT")
 
         # ── Résolution native du DEM ──
         dem_res_x: float | None = dem_data.get("res_x")

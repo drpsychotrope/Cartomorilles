@@ -604,6 +604,15 @@ class _ExtraSpec(NamedTuple):
     render: Callable[[], bytes] | None
 
 
+def _dem_label(source: str) -> str:
+    """Nom du MNT pour la carte (D63)."""
+    return {
+        "RGE ALTI": "MNT RGE ALTI de l'IGN",
+        "Copernicus": "MNS Copernicus",
+        "fichier": "MNT fourni",
+    }.get(source, "MNT")
+
+
 def render_size(
     nx: int, ny: int,
     bounds_l93: tuple[float, float, float, float],
@@ -1337,8 +1346,8 @@ class MorilleVisualizer:
                 "src": "terrain", "none": 0,
                 "vmin": -_SLOPE_OFFSET / _SLOPE_SCALE, "step": 1 / _SLOPE_SCALE,
                 "maxCode": 181,
-                "hint": "Pente du MNT Copernicus (méthode de Horn), en degrés. "
-                        f"{opt_text}.",
+                "hint": f"Pente du {_dem_label(getattr(self.grid, 'dem_source', ''))} "
+                        f"(méthode de Horn), en degrés. {opt_text}.",
                 "stops": [list(s) for s in _SLOPE_STOPS],
                 "ticks": [list(t) for t in _SLOPE_TICKS],
                 "ends": ["plat", "falaise"],

@@ -24,7 +24,7 @@ Dépendances principales : `numpy`, `scipy`, `geopandas`, `shapely`, `rasterio`,
 
 | Couche | Fichier attendu | Source |
 |---|---|---|
-| MNT | `Copernicus_DSM_COG_10_N{44,45}_00_E{004,005,006}_00_DEM.tif` (6 tuiles, merge auto) | Copernicus DSM 30 m |
+| MNT | téléchargé au premier run (WMS de la Géoplateforme, ~4 min), puis `dem_rgealti10m_*.tif` en cache | IGN RGE ALTI® (modèle de terrain, le sol sous les arbres ; 5 m moyenné à 10 m ; Licence Ouverte Etalab 2.0). Repli : MNS Copernicus 30 m (`Copernicus_DSM_COG_10_N{44,45}_00_E{004,005,006}_00_DEM.tif`, cime des arbres) |
 | Essences | `FORMATION_VEGETALE.shp` | IGN BD Forêt v2 |
 | Géologie | `geologie_38/GEO050K_HARM_038_S_FGEOL_2154.shp` | BRGM BDCharm-50 |
 | Régions IFN | `rfifn250_l93.shp` | IFN |

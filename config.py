@@ -84,6 +84,7 @@ __all__ = [
     "CONFIG_VERSION",
     # Emprise
     "BBOX_WGS84", "BBOX", "CELL_SIZE", "MAP_CENTER", "DATA_BUFFER",
+    "DEM_SOURCE", "DEM_RESOLUTION_M", "RGEALTI_WMS_URL", "RGEALTI_LAYER",
     # Chemins données
     "DEM_FILE", "FOREST_SHAPEFILE",
     "DATA_SUBDIR_GEOLOGY", "GEOLOGY_SHAPEFILE",
@@ -188,6 +189,18 @@ GEOLOGY_SHAPEFILE: Final[str] = "GEO050K_HARM_038_S_FGEOL_2154.shp"
 
 CELL_SIZE: float = 20.0
 DATA_BUFFER: Final[float] = 500.0
+
+# ── MNT (D63) ────────────────────────────────────────────────────
+# RGE ALTI® de l'IGN : modèle de terrain (le sol, sous les arbres et les
+# bâtiments), pas de 1 à 5 m, Licence Ouverte Etalab 2.0, lu sur le WMS
+# raster de la Géoplateforme à 5 m et moyenné à DEM_RESOLUTION_M. Repli :
+# Copernicus GLO-30, modèle de surface (cime des arbres, toits). Pente,
+# exposition, rugosité et TWI sont calculés à DEM_RESOLUTION_M quelle que
+# soit la maille de la grille.
+DEM_SOURCE: Final[str] = "rgealti"            # "rgealti" | "copernicus"
+DEM_RESOLUTION_M: Final[float] = 10.0
+RGEALTI_WMS_URL: Final[str] = "https://data.geopf.fr/wms-r/wms"
+RGEALTI_LAYER: Final[str] = "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES"
 
 # ── Auto-scaling résolution ──────────────────────────────────────
 # (seuil_km², cell_m) — premier seuil ≥ emprise gagne.
