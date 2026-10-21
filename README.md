@@ -154,7 +154,7 @@ Modules d'appui : `weather.py` (modulation météo J+0), `landcover_detector.py`
 Là où la BD Forêt ne donne pas l'essence, `tree_species` est noté par le mélange régional IFN (région × type de forêt × étage × substrat) et son poids devient, cellule par cellule, la **fiabilité de ce mélange** (D51) : ×1 quand une essence domine ou que les essences du mélange ont le même score, ×0 quand le mélange est aussi dispersé que l'échelle des essences de l'espèce (frênaie ou robineraie, on ne sait) — la cellule est alors notée sur ses 13 autres critères.
 
 Post-traitement :
-1. **Masques éliminatoires** (score → 0), par espèce : urbain et proximité urbaine (< 15 m), plans d'eau, NoData du MNT, géologie éliminatoire (morille grise : granite, gneiss, siliceux ; morille noire et cèpe : aucune), pente > 45°, altitude hors plage (morille grise 100–1 400 m, morille noire 300–2 200 m, cèpe 200–2 200 m), engorgement (TWI).
+1. **Masques éliminatoires** (score → 0), par espèce : urbain et proximité urbaine (< 15 m), plans d'eau (cours d'eau de la couche hydro IGN, lacs et retenues de la géologie BDCharm-50 — D54), NoData du MNT, géologie éliminatoire (morille grise : granite, gneiss, siliceux ; morille noire et cèpe : aucune), pente > 45°, altitude hors plage (morille grise 100–1 400 m, morille noire 300–2 200 m, cèpe 200–2 200 m), engorgement (TWI).
 2. **Pénalité de monotonie** (terrain uniforme).
 3. **Pénalité calc-dry** (chênaies/buis xérothermophiles, morille grise seulement).
 4. **Lissage gaussien spatial** (sigma configurable, défaut 0,5).

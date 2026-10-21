@@ -74,7 +74,7 @@ All thresholds, scoring weights, tree species scores, geology scores, and spatia
 ## Scoring Model
 
 `scoring.py` aggregates 14 criteria via weighted sum, per species, then applies:
-1. **Eliminatory masks** (8 boolean) → score = 0: urban, water bodies, DEM NoData, eliminatory geology (esculenta: granite, gneiss, siliceous; elata and edulis: none), slope > 45°, altitude outside the species range (esculenta 100–1400 m, elata 300–2200 m, edulis 200–2200 m), waterlogged (TWI > species threshold), urban proximity (< 15 m)
+1. **Eliminatory masks** (8 boolean) → score = 0: urban, water (IGN hydro streams, rasterized with a 2 m buffer, all_touched; BDCharm-50 `hydrographie` lakes — D54), DEM NoData, eliminatory geology (esculenta: granite, gneiss, siliceous; elata and edulis: none), slope > 45°, altitude outside the species range (esculenta 100–1400 m, elata 300–2200 m, edulis 200–2200 m), waterlogged (TWI > species threshold), urban proximity (< 15 m)
 2. **Monotony penalty** — uniform terrain discount
 3. **Calc-dry penalty** (esculenta only)
 4. **Gaussian spatial smoothing** (sigma configurable, default 0.5)
@@ -119,6 +119,7 @@ These decisions are documented in `decisions.md` — do not reverse them without
 | **D50** | A hotspot's x_l93/y_l93 (so lat/lon, Google Maps link, GPX waypoint and map marker) is the centre of its max-score cell (`_accel.vectorized_cluster_stats`; tie → closest to the centroid), never the centroid, which falls outside an elongated or L-shaped cluster, often on an eliminated cell; the centroid stays in the stats dict only |
 | **D52** | Map classes by rank, per species: Nul = score < 0.15, then quantiles 0.40 / 0.70 / 0.90 / 0.98 of the species' scored cells inside the study area (`scoring.rank_class_thresholds`, `set_rank_thresholds` before `classify_probability`). The same thresholds drive the map legend and LUT (palette stops placed on them, each class keeps its colour), popups, CSV/GPX/console, the JSON report (`class_thresholds`, `classes_study_area`) and `tools/evaluate_occurrences.py`; default hotspot threshold = the species' Bon threshold. `PROBABILITY_THRESHOLDS` stays the weather scale (D44) — amends D38 |
 | **D53** | "Calques supplémentaires": collapsible block of the sidebar's Couches section, one layer at a time above the probability (own opacity, legend with study-area share or graduated ramp, value under the cursor and in the point popup): geology categories, BD Forêt v2 `ESSENCE` as published (rasterized in visualize.py like the model, generic classes burned first), TWI, slope (terrain PNG red channel) and D8 drained area (`grid.drained_area_log10`, max-pooled before nearest downsampling). One 8-bit code PNG per layer (255 = none or outside the study area), decoded on first display (`data-src`) and coloured in JS; raw TWI left the `--debug-layers` overlays — amends D37 |
+| **D54** | The IGN hydro layer has lines only, so lakes were scored as land (Paladru 0.52–0.56): `apply_water_mask` adds the BDCharm-50 `hydrographie` cells (lakes, reservoirs; `_geology_water_cells`) to `grid.water_mask`. Streams keep their 2 m buffer, all_touched rasterization — at 50 m that excludes a 50–100 m band along every stream, which the field checkpoints "Berge Vence" and "Isère lit majeur" rely on |
 
 ## Session / Branch Workflow
 

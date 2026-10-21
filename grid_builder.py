@@ -2480,12 +2480,38 @@ class GridBuilder:
         self._log_score_stats("urban_proximity", score)
         return self
 
+    def _geology_water_cells(self) -> np.ndarray | None:
+        """Cellules de la catégorie géologique « hydrographie » : lacs et
+        retenues cartographiés par la BDCharm-50 (None sans géologie)."""
+        raster = getattr(self, "_geology_int_raster", None)
+        names = getattr(self, "_geology_code_to_name", None) or {}
+        codes = [int(c) for c, n in names.items() if n == "hydrographie"]
+        if not isinstance(raster, np.ndarray) or not codes:
+            return None
+        return np.asarray(np.isin(raster, codes))
+
     def apply_water_mask(self) -> GridBuilder:
         """
         Applique le masque des plans d'eau — Fix #24.
 
-        Met les scores à 0 pour les cellules en eau.
+        Met les scores à 0 pour les cellules en eau : entités de la couche
+        hydro (score_distance_water), et lacs ou retenues de la géologie
+        BDCharm-50 (D54) — la couche hydro IGN n'a que des lignes, un lac y
+        était noté comme une terre.
         """
+        lakes = self._geology_water_cells()
+        if lakes is not None and lakes.any():
+            base = (
+                self.water_mask if self.water_mask is not None
+                else np.zeros((self.ny, self.nx), dtype=bool)
+            )
+            n_before = int(base.sum())
+            self.water_mask = base | lakes
+            logger.info(
+                "   Plans d'eau de la géologie (BDCharm « hydrographie ») : "
+                "+%d cellules",
+                int(self.water_mask.sum()) - n_before,
+            )
         if self.water_mask is not None and self.water_mask.any():
             n = int(self.water_mask.sum())
             for name in self.scores:
