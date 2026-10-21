@@ -80,7 +80,7 @@ python main.py --discover-wfs
 | `-v` / `--verbose` | off | Tout le détail (DEBUG) à l'écran |
 | `--force` | off | Ignorer les avertissements (poids, taille grille) |
 
-Garde-fous : avertissement à 50 M cellules avec la mémoire de pointe estimée (~5 Go + 0,22 Go par million de cellules, mesuré avec les trois espèces et `--hd-map` : 13 Go et 4 min 30 à 20 m, 36 Go et 10 min 30 à 10 m), limite dure à 200 M sans `--force`.
+Garde-fous : avertissement à 50 M cellules avec la mémoire de pointe estimée (~7 Go + 0,22 Go par million de cellules, mesuré avec les trois espèces et `--hd-map` : 38 Go et 9 min 30 à 10 m), limite dure à 200 M sans `--force`.
 
 ### Sortie console
 

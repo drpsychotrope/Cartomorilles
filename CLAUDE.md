@@ -141,7 +141,7 @@ Active development uses a multi-session system tracked in `.sessions/`:
 ## Performance Notes
 
 - **TWI** is computed on the native DEM (the 20 m cache, whatever `--cell-size`): pit filling ~7 s + D8 ~5-8 s on 35M pixels; topologically ordered — cannot be trivially parallelized (D20)
-- Grid size: warn at 50M cells with the peak-memory estimate (~5.3 GB + 220 bytes per cell, measured with three species and `--hd-map`: 13.0 GB / 4.5 min at 20 m, 36.1 GB / 10.5 min at 10 m), hard limit at 200M unless `--force`
+- Grid size: warn at 50M cells with the peak-memory estimate (~7.3 GB + 220 bytes per cell, measured with three species and `--hd-map`: 38.2 GB / 9.5 min at 10 m with the RGE ALTI terrain), hard limit at 200M unless `--force`
 - Avoid adding string matching inside scoring loops — use int-coded raster lookups (D6, D25)
 - PNG overlays use `compress_level=1` (parallel speed); data GeoTIFFs use level 6 (D17)
 - Cache files live in `data/cache/` — categorical rasters keyed by MD5 of the lookup array and of the burn order, so config and sort-order changes auto-invalidate (D23, D48)

@@ -110,9 +110,10 @@ _ZONE_LABEL = f"Isère 38 — {_ZONE_DX_KM:.0f}×{_ZONE_DY_KM:.0f} km"
 _MAX_CELLS = 200_000_000  # 200M — protège contre cell_size=5m accidentel
 _WARN_CELLS = 50_000_000  # 50M — avertit sur la mémoire et la durée
 # Mémoire de pointe mesurée (trois espèces, carte HD) : 13,0 Go pour 35,2 M
-# cellules (20 m), 36,1 Go pour 140,9 M (10 m) ≈ 5,3 Go fixes (données
-# vectorielles, MNT natif, GPU) + 220 octets par cellule (D62)
-_PEAK_FIXED_BYTES = 5.3e9
+# cellules (20 m), 36,1 Go pour 140,9 M (10 m) ≈ 5,3 Go fixes + 220 octets
+# par cellule (D62) ; terrain calculé sur le RGE ALTI à 10 m : 38,2 Go à
+# 10 m (D63), d'où ~2 Go fixes de plus
+_PEAK_FIXED_BYTES = 7.3e9
 _PEAK_BYTES_PER_CELL = 220
 
 # ── Résumé console / carte ────────────────────────────────────
