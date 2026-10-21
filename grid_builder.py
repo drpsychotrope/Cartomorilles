@@ -126,6 +126,10 @@ _CANOPY_SPECIES_BONUS: float = 0.05       # essences favorables (score > 0.40)
 # couverte par l'eau et sa berge (D55)
 _COVER_SUBCELL_M: float = 10.0
 
+# BD Forêt v2 : formations sans arbre hôte (landes et pelouses « NC »,
+# forêts sans couvert arboré « NR ») — D57
+_NON_HOST_ESSENCES: frozenset[str] = frozenset({"NC", "NR"})
+
 
 def _categorical_cache_key(lookup: np.ndarray, codes: np.ndarray) -> str:
     """Empreinte MD5 (8 hex) d'un raster catégoriel : lookup code → score
@@ -239,6 +243,9 @@ class GridBuilder:
         # Aire drainée D8 (log10 m²) du calcul du TWI, pour la carte (D53)
         self.drained_area_log10: np.ndarray | None = None
         self.dist_water_grid: np.ndarray | None = None
+        # Peuplements d'arbres hôtes et distance à eux (D57)
+        self.host_forest_mask: np.ndarray | None = None
+        self.dist_host_forest: np.ndarray | None = None
 
         # Rasters intermédiaires (pour diagnostics)
         self.tree_raster: np.ndarray | None = None
@@ -2567,6 +2574,41 @@ class GridBuilder:
             int(_um.sum()),
         )
         self._log_score_stats("urban_proximity", score)
+        return self
+
+    def compute_host_forest(
+        self, forest_gdf: gpd.GeoDataFrame | None,
+    ) -> GridBuilder:
+        """Peuplements d'arbres hôtes (D57) : polygones BD Forêt hors landes,
+        pelouses et forêts sans couvert, rasterisés comme la forêt du modèle
+        (all_touched), et distance de chaque cellule au plus proche (m),
+        pour les espèces mycorhiziennes strictes (`host_tree_max_dist_m`)."""
+        self.host_forest_mask = None
+        self.dist_host_forest = None
+        if forest_gdf is None or forest_gdf.empty:
+            logger.info("⏭️  Arbres hôtes : pas de données forêt")
+            return self
+        gdf = self._ensure_l93(forest_gdf)
+        geom = gdf.geometry
+        keep = geom.notna() & ~geom.is_empty
+        if "ESSENCE" in gdf.columns:
+            raw = gdf["ESSENCE"].fillna("NR").astype(str).str.strip()
+            keep &= ~raw.isin(_NON_HOST_ESSENCES)
+        geoms = list(gdf.geometry[keep])
+        if not geoms:
+            logger.info("⏭️  Arbres hôtes : aucun peuplement")
+            return self
+        host = _accel.parallel_rasterize_mask(
+            geoms, out_shape=(self.ny, self.nx), transform=self.transform,
+        )
+        self.host_forest_mask = host
+        self.dist_host_forest = (
+            np.asarray(_accel.distance_transform_edt(~host)) * self.cell_size
+        ).astype(np.float32)
+        logger.info(
+            "✅ Arbres hôtes : %d peuplements, %.1f %% de la grille",
+            len(geoms), float(host.mean()) * 100,
+        )
         return self
 
     def _geology_water_cells(self) -> np.ndarray | None:

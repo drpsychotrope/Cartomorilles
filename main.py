@@ -195,40 +195,53 @@ TERRAIN_CHECKPOINTS = TERRAIN_CHECKPOINTS_ESCULENTA
 # Points de contrôle terrain — CÈPE (Boletus edulis, biblio)
 # v2.6.0 : sites typés cèpe — montagnard, mycorhize Pinaceae/Fagaceae,
 # pas d'élimination granite (cèpe ubiquiste).
+# D58 : les coordonnées rondes d'origine ne tombaient pas sur l'habitat
+# décrit (crête à 2 504 m pour « Belledonne 1500m », châtaigneraie à 586 m
+# pour « Plaine Bièvre », hors Isère pour « Lautaret » et « Vercors »…) ;
+# chaque point est déplacé sur la cellule la plus proche qui correspond à
+# sa description (essence BD Forêt publiée, étage, géologie, pente ≤ 30°,
+# au cœur du peuplement, dans la zone étudiée), choisie sans regarder le
+# score du modèle. Anciennes coordonnées en commentaire.
 TERRAIN_CHECKPOINTS_EDULIS: tuple[dict[str, Any], ...] = (
     # ── Contrôles positifs (cèpes attendus) ──────────────────────
     {
+        # avant : 45.0660, 5.4630 (hors Isère, aucune forêt à 600 m)
         "name": "Vercors hêtraie-sapinière 1100m",
-        "lat": 45.0660, "lon": 5.4630, "expected": 0.70,
-        "obs": "hêtre + sapin altitude optimale, sol calcaire",
+        "lat": 45.08589, "lon": 5.44140, "expected": 0.70,
+        "obs": "mélange hêtre-sapin (BD Forêt « Mixte »), calcaire, 1 134 m",
     },
     {
+        # avant : 45.3500, 5.8000 (pente de 52°, éliminée)
         "name": "Chartreuse sapinière 1100m",
-        "lat": 45.3500, "lon": 5.8000, "expected": 0.65,
-        "obs": "sapinière calcaire montagne moyenne",
+        "lat": 45.34998, "lon": 5.80190, "expected": 0.65,
+        "obs": "sapinière-pessière sur éboulis calcaire, 1 032 m",
     },
     {
-        "name": "Belledonne épicéa-pin granite 1500m",
-        "lat": 45.1700, "lon": 5.9500, "expected": 0.65,
-        "obs": "pessière granite — INVERSE morille (granite OK cèpe)",
+        # avant : 45.1700, 5.9500 (crête à 2 504 m, hors forêt)
+        "name": "Belledonne pessière siliceuse 1500m",
+        "lat": 45.17943, "lon": 5.91695, "expected": 0.65,
+        "obs": "pessière sur schiste (sol acide), 1 547 m — INVERSE morille",
     },
     {
-        "name": "Trièves chênaie-hêtraie 800m",
-        "lat": 44.8500, "lon": 5.6500, "expected": 0.55,
-        "obs": "chêne + hêtre versant montagne basse",
+        # avant : 44.8500, 5.6500 (pinède à 574 m)
+        "name": "Trièves hêtraie 750m",
+        "lat": 44.84409, "lon": 5.67280, "expected": 0.55,
+        "obs": "hêtraie sur calcaire, versant de montagne basse",
         "tolerance": 0.50,
     },
     {
-        "name": "Châtaigneraie Bas-Dauphiné 500m",
-        "lat": 45.4500, "lon": 5.4000, "expected": 0.60,
-        "obs": "châtaignier acide — bon habitat cèpe",
+        # avant : 45.4500, 5.4000 (hors forêt, 66 m d'un peuplement)
+        "name": "Châtaigneraie Bas-Dauphiné 570m",
+        "lat": 45.44982, "lon": 5.40170, "expected": 0.60,
+        "obs": "châtaigneraie, sol acide — bon habitat cèpe",
         "tolerance": 0.50,
     },
     # ── Contrôles négatifs (cèpes peu probables) ────────────────
     {
-        "name": "Plaine Bièvre peuplier 250m",
-        "lat": 45.4500, "lon": 5.2500, "expected": 0.15,
-        "obs": "peuplier saturé, alt trop basse",
+        # avant : 45.4500, 5.2500 (châtaigneraie à 586 m)
+        "name": "Plaine Bièvre peupleraie 340m",
+        "lat": 45.38068, "lon": 5.12254, "expected": 0.15,
+        "obs": "peupleraie de plaine alluviale, trop basse",
         "tolerance": 0.50,
     },
     {
@@ -237,9 +250,10 @@ TERRAIN_CHECKPOINTS_EDULIS: tuple[dict[str, Any], ...] = (
         "obs": "urbain dense — éliminé",
     },
     {
-        "name": "Lautaret alpin 2050m",
-        "lat": 45.0350, "lon": 6.4050, "expected": 0.00,
-        "obs": "altitude > 2200m éliminatoire (limite supérieure)",
+        # remplace « Lautaret alpin 2050m » (45.0350, 6.4050, hors Isère)
+        "name": "Alpage sans arbre 2100m (Écrins)",
+        "lat": 44.89517, "lon": 6.30222, "expected": 0.00,
+        "obs": "pelouse alpine, aucun arbre hôte à 300 m — éliminé (D57)",
     },
     {
         "name": "Isère lit majeur",
@@ -470,13 +484,19 @@ def _resolve_data_path(
     else:
         dp = None
 
-    # 3. Glob récursif dans data/ (couvre sous-dossiers type geologie_38/)
+    # 3. Glob récursif dans data/ (couvre sous-dossiers type geologie_38/),
+    #    à côté de main.py puis dans le dossier courant : data_loader lit
+    #    data/ dans le dossier courant (MNT, caches), un main.py lancé
+    #    depuis une autre copie du dépôt doit trouver les mêmes fichiers
     if glob_pattern is not None:
-        candidates = sorted(_DATA_DIR.rglob(glob_pattern))
-        if candidates:
-            chosen = candidates[0]
-            logger.log(level, "   ✅ %s (glob) : %s", label, chosen.name)
-            return str(chosen)
+        for data_dir in dict.fromkeys(
+            (_DATA_DIR, (Path.cwd() / "data").resolve()),
+        ):
+            candidates = sorted(data_dir.rglob(glob_pattern)) if data_dir.is_dir() else []
+            if candidates:
+                chosen = candidates[0]
+                logger.log(level, "   ✅ %s (glob) : %s", label, chosen)
+                return str(chosen)
 
     if default is None and glob_pattern is None:
         logger.log(
@@ -1617,6 +1637,8 @@ def main(args: argparse.Namespace) -> int:
 
     logger.debug("   ▸ Essences forestières...")
     grid.score_tree_species(forest_gdf)
+    # Peuplements d'arbres hôtes : élimination « sans arbre hôte » (D57)
+    grid.compute_host_forest(forest_gdf)
 
     logger.debug("   ▸ Géologie (%s)...", geology_source)
     grid.score_geology(geology_gdf)

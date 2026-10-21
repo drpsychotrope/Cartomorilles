@@ -155,6 +155,7 @@ _ELIM_LABEL_MAP: dict[str, tuple[str, str]] = {
     "slope": ("Exclu : pente trop forte", "#ff8c00"),
     "altitude": ("Exclu : altitude", "#8b4513"),
     "twi": ("Exclu : sol engorgé (TWI)", "#1f4e9c"),
+    "host": ("Exclu : sans arbre hôte", "#6d4c41"),
 }
 
 # ── Calques supplémentaires (D53) : PNG de codes 8 bits, colorés en JS ──

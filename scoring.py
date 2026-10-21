@@ -483,6 +483,23 @@ class MorilleScoring:
                 int(urban_prox_elim.sum()),
             )
 
+        # ── Sans arbre hôte (D57) : espèce mycorhizienne stricte ──
+        host_max = self.params.get("host_tree_max_dist_m")
+        dist_host = getattr(self.grid, "dist_host_forest", None)
+        if (
+            host_max is not None
+            and isinstance(dist_host, np.ndarray)
+            and dist_host.shape == (ny, nx)
+        ):
+            host_elim = np.isfinite(dist_host) & (dist_host > float(host_max))
+            detail["host"] = host_elim
+            combined |= host_elim
+            logger.info(
+                "  Sans arbre hôte (>%.0fm) : %8d cellules",
+                float(host_max),
+                int(host_elim.sum()),
+            )
+
         # ── Résumé ──
         total_elim = int(combined.sum())
         total_cells = self.final_score.size

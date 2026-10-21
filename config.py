@@ -1295,6 +1295,11 @@ _SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
         "twi_dry_limit":         3.0,
         "twi_wet_limit":         12.0,
         "twi_waterlog":          16.0,
+        # Mycorhizien strict : pas de cèpe sans arbre hôte — cellule à plus
+        # de 30 m d'un peuplement BD Forêt (landes, pelouses et forêts sans
+        # couvert exclues) éliminée (D57). Absent = pas de règle (morilles,
+        # qui sortent aussi des jardins, vergers et lisières).
+        "host_tree_max_dist_m":  30.0,
         "apply_calcdry":         False,                   # OFF — cèpe pas anti-xérique
         "apply_monotony":        True,
         "taxon":                 ("Boletus edulis", "SPECIES"),
@@ -1545,6 +1550,13 @@ def validate_config() -> bool:
         if twi_opt[0] >= twi_opt[1]:
             logger.error("SPECIES_PARAMS['%s'].twi_optimal dégénéré: %s",
                          sp_name, twi_opt)
+            ok = False
+        host_max = params.get("host_tree_max_dist_m")
+        if host_max is not None and float(host_max) < 0:
+            logger.error(
+                "SPECIES_PARAMS['%s'].host_tree_max_dist_m négatif : %s",
+                sp_name, host_max,
+            )
             ok = False
         # Éliminatoires existent dans geology_scores
         for geo in params["eliminatory_geology"]:

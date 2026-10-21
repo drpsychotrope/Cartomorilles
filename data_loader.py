@@ -928,29 +928,15 @@ class DataLoader:
 
     def _download_forest_wfs(self) -> gpd.GeoDataFrame | None:
         """Tente de charger la BD Forêt V2 via WFS Géoplateforme."""
-        bbox_str = (
-            f"{self.bbox_buffered['xmin']},{self.bbox_buffered['ymin']},"
-            f"{self.bbox_buffered['xmax']},{self.bbox_buffered['ymax']}"
-        )
         url = "https://data.geopf.fr/wfs/ows"
 
         for layer in IGN_FORET_LAYERS:
             try:
                 logger.info("🌲 WFS IGN BD Forêt: %s...", layer)
-                params: dict[str, Any] = {
-                    "service": "WFS",
-                    "version": "2.0.0",
-                    "request": "GetFeature",
-                    "typeName": layer,
-                    "outputFormat": "application/json",
-                    "srsName": TARGET_CRS,
-                    "bbox": bbox_str + f",{TARGET_CRS}",
-                    "count": "10000",
-                }
-                data = _wfs_request(url, params, timeout=60)
-                gdf = gpd.GeoDataFrame.from_features(
-                    data["features"], crs=TARGET_CRS
-                )
+                # Paginé : le service plafonne une réponse à 5 000 entités
+                gdf = self._download_wfs_paged(layer, url=url)
+                if gdf is None or gdf.empty:
+                    continue
                 logger.info("✅ BD Forêt WFS: %d polygones", len(gdf))
                 return gdf
             except Exception as e:
@@ -1422,6 +1408,12 @@ class DataLoader:
                         logger.info(
                             "✅ Géologie BRGM WFS: %d polygones", len(gdf)
                         )
+                        if len(gdf) >= int(params["count"]):
+                            logger.warning(
+                                "⚠️ Géologie WFS tronquée au plafond de %s "
+                                "entités : utiliser le shapefile BDCharm-50 "
+                                "(--geology)", params["count"],
+                            )
                         return gdf
                 except Exception as e:
                     logger.debug("   Layer %s: %s", layer, e)
@@ -1726,30 +1718,14 @@ class DataLoader:
 
     def _download_hydro_wfs(self) -> gpd.GeoDataFrame | None:
         """Tente de charger l'hydrographie via WFS IGN BD Topo."""
-        bbox_str = (
-            f"{self.bbox_buffered['xmin']},{self.bbox_buffered['ymin']},"
-            f"{self.bbox_buffered['xmax']},{self.bbox_buffered['ymax']}"
-        )
         url = "https://data.geopf.fr/wfs/ows"
 
         for layer in IGN_HYDRO_LAYERS:
             try:
                 logger.info("💧 WFS IGN Hydro: %s...", layer)
-                params: dict[str, Any] = {
-                    "service": "WFS",
-                    "version": "2.0.0",
-                    "request": "GetFeature",
-                    "typeName": layer,
-                    "outputFormat": "application/json",
-                    "srsName": TARGET_CRS,
-                    "bbox": bbox_str + f",{TARGET_CRS}",
-                    "count": "5000",
-                }
-                data = _wfs_request(url, params, timeout=60)
-                gdf = gpd.GeoDataFrame.from_features(
-                    data["features"], crs=TARGET_CRS
-                )
-                if len(gdf) > 0:
+                # Paginé : le service plafonne une réponse à 5 000 entités
+                gdf = self._download_wfs_paged(layer, url=url)
+                if gdf is not None and len(gdf) > 0:
                     logger.info("✅ Hydro WFS: %d entités", len(gdf))
                     return gdf
             except Exception as e:
@@ -1788,6 +1764,7 @@ class DataLoader:
 
     def _download_wfs_paged(
         self, layer: str, page: int = 5000,
+        url: str = "https://data.geopf.fr/wfs/ows",
     ) -> gpd.GeoDataFrame | None:
         """Toutes les entités d'une couche WFS IGN dans l'emprise tamponnée,
         par pages de `page` (le service plafonne une réponse à 5 000)."""
@@ -1810,7 +1787,7 @@ class DataLoader:
                 "startIndex": str(start),
             }
             data = _wfs_request(
-                "https://data.geopf.fr/wfs/ows", params, timeout=180,
+                url, params, timeout=180,
             )
             features = data["features"]
             if features:
