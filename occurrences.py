@@ -60,6 +60,7 @@ __all__ = [
     "drop_inaturalist_duplicates",
     "is_precise",
     "occurrence_check",
+    "occurrence_metrics",
 ]
 
 # ═══════════════════════════════════════════════════════════════════
@@ -78,6 +79,8 @@ SOURCES: Final[dict[str, str]] = {
 }
 # Première classe comptée comme favorable dans le contrôle du modèle
 _GOOD_LABEL: Final[str] = "Bon"
+# Seuils fins de occurrence_metrics (part de surface et d'occurrences ≥ seuil)
+_BANDS: Final[tuple[float, ...]] = (0.45, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85)
 
 _API: Final[str] = "https://api.gbif.org/v1"
 _USER_AGENT: Final[str] = "Cartomorilles (favorabilite morille et cepe, Isere)"
@@ -218,6 +221,30 @@ def is_precise(occurrence: Mapping[str, Any]) -> bool:
     )
 
 
+def _occurrence_cells(
+    occurrences: list[Mapping[str, Any]],
+    transform: Affine,
+    shape: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Lignes et colonnes de grille des occurrences qui tombent dans la
+    grille (transform : affine Lambert-93 de la grille)."""
+    if not occurrences:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty
+    xs, ys = TO_L93.transform(
+        np.array([float(o["lng"]) for o in occurrences]),
+        np.array([float(o["lat"]) for o in occurrences]),
+    )
+    cols, rows = ~transform * (np.asarray(xs), np.asarray(ys))
+    cols = np.floor(np.asarray(cols)).astype(np.int64)
+    rows = np.floor(np.asarray(rows)).astype(np.int64)
+    inside = (
+        (rows >= 0) & (rows < shape[0])
+        & (cols >= 0) & (cols < shape[1])
+    )
+    return rows[inside], cols[inside]
+
+
 def occurrence_check(
     score: np.ndarray,
     transform: Affine,
@@ -255,18 +282,7 @@ def occurrence_check(
         precise = [o for o in group if is_precise(o)]
         n_used = n_good = 0
         if precise:
-            xs, ys = TO_L93.transform(
-                np.array([float(o["lng"]) for o in precise]),
-                np.array([float(o["lat"]) for o in precise]),
-            )
-            cols, rows = ~transform * (np.asarray(xs), np.asarray(ys))
-            cols = np.floor(np.asarray(cols)).astype(np.int64)
-            rows = np.floor(np.asarray(rows)).astype(np.int64)
-            inside = (
-                (rows >= 0) & (rows < score.shape[0])
-                & (cols >= 0) & (cols < score.shape[1])
-            )
-            rows, cols = rows[inside], cols[inside]
+            rows, cols = _occurrence_cells(precise, transform, score.shape)
             n_used = int(np.count_nonzero(valid[rows, cols]))
             n_good = int(np.count_nonzero(good[rows, cols]))
         share = n_good / n_used if n_used else None
@@ -287,6 +303,141 @@ def occurrence_check(
         "threshold": threshold,
         "precise_max_m": PRECISE_MAX_M,
         "area_share": round(area_share, 4) if area_share is not None else None,
+        "sources": sources,
+    }
+
+
+def _round(value: float | None, digits: int = 4) -> float | None:
+    return None if value is None else round(float(value), digits)
+
+
+def _spearman(x: list[float], y: list[float]) -> float | None:
+    """Corrélation de Spearman (rangs sans ex æquo attendus) ; None si
+    moins de trois points ou variance nulle."""
+    if len(x) < 3 or len(x) != len(y):
+        return None
+    rx = np.argsort(np.argsort(np.asarray(x, dtype=float))).astype(float)
+    ry = np.argsort(np.argsort(np.asarray(y, dtype=float))).astype(float)
+    if rx.std() == 0 or ry.std() == 0:
+        return None
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def occurrence_metrics(
+    score: np.ndarray,
+    transform: Affine,
+    occurrences: Iterable[Mapping[str, Any]],
+    *,
+    study_mask: np.ndarray | None = None,
+    bands: tuple[float, ...] = _BANDS,
+) -> dict[str, Any]:
+    """Qualité du score mesurée sur les occurrences précises (présence
+    seule), complément de occurrence_check :
+
+    - classes : par classe de config.PROBABILITY_LABELS, part de la surface
+      étudiée (area_share), nombre et part des occurrences (n_occ,
+      occ_share), P/E = occ_share / area_share (1 = pas mieux que le
+      hasard) ;
+    - boyce : corrélation de Spearman entre le rang des classes et leur
+      P/E (Hirzel et al. 2006 : 1 = densité d'occurrences croissante de
+      classe en classe), sur les classes de surface non nulle ;
+    - auc : probabilité qu'une occurrence tirée au hasard soit mieux notée
+      qu'une cellule de l'emprise tirée au hasard (0,5 = hasard) ;
+    - share_nul : part des occurrences dans la classe Nul, donc éliminées
+      à tort ;
+    - median_score : score médian aux occurrences ;
+    - bands : pour chaque seuil, part de la surface et des occurrences à ce
+      score ou plus, et leur rapport (lift).
+
+    Biais connus : échantillonnage naturaliste près des routes et des
+    villes ; position connue à ± PRECISE_MAX_M pour une maille de 50 m.
+    """
+    valid = np.isfinite(score)
+    if study_mask is not None:
+        valid &= study_mask
+    background = np.sort(np.asarray(score[valid], dtype=np.float32))
+    n_area = int(background.size)
+
+    occs = list(occurrences)
+    precise = [o for o in occs if is_precise(o)]
+    rows, cols = _occurrence_cells(precise, transform, score.shape)
+    kept = valid[rows, cols]
+    s_occ = np.asarray(score[rows[kept], cols[kept]], dtype=np.float32)
+    n_used = int(s_occ.size)
+
+    thresholds = np.asarray(config.PROBABILITY_THRESHOLDS, dtype=np.float32)
+    labels = list(config.PROBABILITY_LABELS)
+    area_counts = np.bincount(
+        np.digitize(background, thresholds), minlength=len(labels),
+    )
+    occ_counts = np.bincount(
+        np.digitize(s_occ, thresholds), minlength=len(labels),
+    )
+
+    classes: list[dict[str, Any]] = []
+    ranks: list[float] = []
+    ratios: list[float] = []
+    for i, label in enumerate(labels):
+        area_share = area_counts[i] / n_area if n_area else None
+        occ_share = occ_counts[i] / n_used if n_used else None
+        pe = (
+            occ_share / area_share
+            if area_share and occ_share is not None else None
+        )
+        classes.append({
+            "label": label,
+            "area_share": _round(area_share),
+            "n_occ": int(occ_counts[i]),
+            "occ_share": _round(occ_share),
+            "pe": _round(pe, 2),
+        })
+        if pe is not None:
+            ranks.append(float(i))
+            ratios.append(pe)
+
+    auc = None
+    if n_used and n_area:
+        lo = np.searchsorted(background, s_occ, side="left")
+        hi = np.searchsorted(background, s_occ, side="right")
+        auc = float(np.mean((lo + hi) / 2.0) / n_area)
+
+    bands_out: list[dict[str, Any]] = []
+    for t in bands:
+        area = (
+            float(np.count_nonzero(background >= t)) / n_area
+            if n_area else None
+        )
+        occ = (
+            float(np.count_nonzero(s_occ >= t)) / n_used if n_used else None
+        )
+        bands_out.append({
+            "threshold": float(t),
+            "area_share": _round(area),
+            "occ_share": _round(occ),
+            "lift": _round(occ / area, 2) if area and occ is not None else None,
+        })
+
+    sources: dict[str, dict[str, Any]] = {}
+    for source, label in SOURCES.items():
+        group = [o for o in occs if o.get("source") == source]
+        sources[source] = {
+            "label": label,
+            "n_total": len(group),
+            "n_precise": sum(1 for o in group if is_precise(o)),
+        }
+
+    return {
+        "n_total": len(occs),
+        "n_precise": len(precise),
+        "n_used": n_used,
+        "n_area": n_area,
+        "precise_max_m": PRECISE_MAX_M,
+        "classes": classes,
+        "boyce": _round(_spearman(ranks, ratios), 3),
+        "auc": _round(auc, 3),
+        "share_nul": _round(occ_counts[0] / n_used) if n_used else None,
+        "median_score": _round(float(np.median(s_occ)), 3) if n_used else None,
+        "bands": bands_out,
         "sources": sources,
     }
 
