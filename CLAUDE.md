@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**CARTOMORILLES** is a probabilistic spatial multicriteria model for mapping favorable zones for mushroom foraging in Isère (France) — two species, modelled in one run: morel (*Morchella esculenta*, `esculenta`) and porcini (*Boletus edulis*, `edulis`), with per-species parameters in `config.SPECIES_PARAMS`. It combines DEM terrain analysis, forest species data (BD Forêt v2), geology (BDCharm-50), hydrology, OSM-derived landcover and the day's weather (Open-Meteo) into a weighted score grid.
+**CARTOMORILLES** is a probabilistic spatial multicriteria model for mapping favorable zones for mushroom foraging in Isère (France) — three species, modelled in one run: grey morel (*Morchella esculenta*, `esculenta`), black morel (*Morchella elata* group, `elata`) and porcini (*Boletus edulis*, `edulis`), with per-species parameters in `config.SPECIES_PARAMS`. It combines DEM terrain analysis, forest species data (BD Forêt v2), geology (BDCharm-50), hydrology, OSM-derived landcover and the day's weather (Open-Meteo) into a weighted score grid.
 
 - **CRS**: EPSG:2154 (Lambert-93), covering Isère department bbox (~14 091 km², 107.4×131.2 km)
 - **Grid**: cell size chosen automatically from the bbox area (`config.CELL_SIZE_AUTO_THRESHOLDS`) → **50 m** for the department (~5.6M cells); `--cell-size` overrides it (`config.CELL_SIZE` = 20 m is only the config default, replaced at runtime)
@@ -41,7 +41,7 @@ python main.py --cell-size 10 --hotspot-threshold 0.65 --output-dir ./results --
 python main.py --discover-wfs
 ```
 
-Key flags: `--cell-size` (default auto → 50 m), `--species` (default `esculenta edulis`), `--hotspot-threshold` (default 0.60), `--smoothing-sigma` (default 0.5), `--urban-buffer`, `--no-urban`, `--no-landcover`, `--landcover`, `--no-weather`, `--seed` (default 42), `--force` (bypass grid size/weight warnings), `--open` (open the map at the end), `--console-hotspots` (hotspots listed per species in the end-of-run summary, default 5; console only — `--max-hotspots` is its old name), `--map-hotspots` (numbered hotspots shown when the map opens, default 20), `--debug-layers` (diagnostic overlays in the HTML map), `-v/--verbose` (full DEBUG output on screen).
+Key flags: `--cell-size` (default auto → 50 m), `--species` (default `esculenta elata edulis`), `--hotspot-threshold` (default 0.60), `--smoothing-sigma` (default 0.5), `--urban-buffer`, `--no-urban`, `--no-landcover`, `--landcover`, `--no-weather`, `--seed` (default 42), `--force` (bypass grid size/weight warnings), `--open` (open the map at the end), `--console-hotspots` (hotspots listed per species in the end-of-run summary, default 5; console only — `--max-hotspots` is its old name), `--map-hotspots` (numbered hotspots shown when the map opens, default 20), `--debug-layers` (diagnostic overlays in the HTML map), `-v/--verbose` (full DEBUG output on screen).
 
 Outputs go to `output/` (`--output-dir`): `cartomorilles.html` (one map, species toggle), `{species}_probability.tif` (+ `morilles_probability.tif`, a copy of the esculenta one), `{species}_hotspots.csv`, `rapport_{species}.json`, `cartomorilles.log`, and optionally `{species}_grid.gpkg` (`--export-vector`). The end-of-run summary lists only the files written by that run.
 
@@ -74,7 +74,7 @@ All thresholds, scoring weights, tree species scores, geology scores, and spatia
 ## Scoring Model
 
 `scoring.py` aggregates 14 criteria via weighted sum, per species, then applies:
-1. **Eliminatory masks** (8 boolean) → score = 0: urban, water bodies, DEM NoData, eliminatory geology (esculenta: granite, gneiss, siliceous; edulis: none), slope > 45°, altitude outside the species range (esculenta 100–1400 m, edulis 200–2200 m), waterlogged (TWI > species threshold), urban proximity (< 15 m)
+1. **Eliminatory masks** (8 boolean) → score = 0: urban, water bodies, DEM NoData, eliminatory geology (esculenta: granite, gneiss, siliceous; elata and edulis: none), slope > 45°, altitude outside the species range (esculenta 100–1400 m, elata 300–2200 m, edulis 200–2200 m), waterlogged (TWI > species threshold), urban proximity (< 15 m)
 2. **Monotony penalty** — uniform terrain discount
 3. **Calc-dry penalty** (esculenta only)
 4. **Gaussian spatial smoothing** (sigma configurable, default 0.5)
@@ -115,6 +115,7 @@ These decisions are documented in `decisions.md` — do not reverse them without
 | **D45** | Map classes are computed on the raw terrain score: today's weather is shown in the sidebar, console and JSON report but never multiplied into `final_score` (the ×0.4–1.0 factor of D42 is gone; in October it hid every Bon/Excellent cell). Probability palette = red→yellow→green (ColorBrewer RdYlGn, `_CMAP_STOPS` in `visualize.py`), one palette for all basemaps |
 | **D44** | Weather days use the map's 6 classes: `ProspectingDay.level` = index in `config.PROBABILITY_LABELS` (rounded score digitized on `PROBABILITY_THRESHOLDS`), `.label` = that label, no emoji; favourable day = Bon or Excellent. The map panel and the console summary read `level` / `label` as they are — no other weather scale |
 | **D48** | Categorical raster cache key (`tree_species`, `geology_cat`) = MD5 of the lookup (D23) **and** of the code sequence in burn order (`_categorical_cache_key`), plus the bbox (D27): a change of polygon sort order (e.g. `na_position="first"`, D46) invalidates the cache by itself — never salt the key by hand. `tests/test_grid_builder_cache.py` |
+| **D49** | Third modelled species `elata` (black morel, *Morchella elata* group): own tree and geology tables (fir/spruce 0.95, larch 0.85, acid rocks 0.25 and not eliminatory), altitude optimum 800–1500 m (range 500–1900, eliminatory 300 / 2200), no calc-dry penalty; `esculenta` is labelled "Morille grise"; larch (`meleze`) is scored in all three tables; each species carries its naturalist `taxon` (both morels share *Morchella*: GBIF cache, iNaturalist level C' and the map's observation layer); a species without terrain checkpoints skips the validation instead of borrowing another species' points |
 
 ## Session / Branch Workflow
 

@@ -1,6 +1,6 @@
 # 🍄 CARTOMORILLES
 
-Modèle probabiliste spatial multicritère cartographiant les zones favorables à la cueillette des **morilles** (*Morchella esculenta*) et des **cèpes** (*Boletus edulis*) en **Isère** (38).
+Modèle probabiliste spatial multicritère cartographiant les zones favorables à la cueillette des **morilles grises** (*Morchella esculenta*), des **morilles noires** (groupe *Morchella elata*) et des **cèpes** (*Boletus edulis*) en **Isère** (38).
 
 Il combine analyse de terrain (MNT), essences forestières (BD Forêt v2), géologie (BDCharm-50), hydrographie, occupation du sol (OSM) et météo dans une grille de score pondéré, puis détecte les *hotspots* exportés avec coordonnées GPS.
 
@@ -8,7 +8,7 @@ Il combine analyse de terrain (MNT), essences forestières (BD Forêt v2), géol
 - **Emprise** : Isère département élargi — 107,4 × 131,2 km (~14 091 km²)
 - **Maille** : automatique selon l'emprise — 50 m pour le département (~5,6 M cellules) ; `--cell-size` pour la forcer
 - **Python** : 3.12+
-- **Version** : 2.5.4 (multi-espèces esculenta + edulis)
+- **Version** : 2.5.4 (multi-espèces esculenta + elata + edulis)
 
 ---
 
@@ -63,7 +63,7 @@ python main.py --discover-wfs
 | Flag | Défaut | Rôle |
 |---|---|---|
 | `--cell-size` | auto (50 m) | Taille de cellule (m) |
-| `--species` | `esculenta edulis` | Espèces à modéliser |
+| `--species` | `esculenta elata edulis` | Espèces à modéliser (morille grise, morille noire, cèpe) |
 | `--hotspot-threshold` | `0.60` | Seuil de score des hotspots |
 | `--smoothing-sigma` | `0.5` | Sigma du lissage gaussien |
 | `--urban-buffer` | `10` | Buffer (m) autour de l'urbain |
@@ -152,9 +152,9 @@ Modules d'appui : `weather.py` (modulation météo J+0), `landcover_detector.py`
 | slope | 0.05 | | geology_contact | 0.01 |
 
 Post-traitement :
-1. **Masques éliminatoires** (score → 0), par espèce : urbain et proximité urbaine (< 15 m), plans d'eau, NoData du MNT, géologie éliminatoire (morille : granite, gneiss, siliceux ; cèpe : aucune), pente > 45°, altitude hors plage (morille 100–1 400 m, cèpe 200–2 200 m), engorgement (TWI).
+1. **Masques éliminatoires** (score → 0), par espèce : urbain et proximité urbaine (< 15 m), plans d'eau, NoData du MNT, géologie éliminatoire (morille grise : granite, gneiss, siliceux ; morille noire et cèpe : aucune), pente > 45°, altitude hors plage (morille grise 100–1 400 m, morille noire 300–2 200 m, cèpe 200–2 200 m), engorgement (TWI).
 2. **Pénalité de monotonie** (terrain uniforme).
-3. **Pénalité calc-dry** (chênaies/buis xérothermophiles, morille seulement).
+3. **Pénalité calc-dry** (chênaies/buis xérothermophiles, morille grise seulement).
 4. **Lissage gaussien spatial** (sigma configurable, défaut 0,5).
 5. **Classification en 6 classes** : Nul / Très faible / Faible / Moyen / Bon / Excellent (seuils 0,15 · 0,30 · 0,45 · 0,60 · 0,75).
 
