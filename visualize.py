@@ -1130,10 +1130,13 @@ class MorilleVisualizer:
         cfg: dict[str, Any],
         raster: np.ndarray,
         classes: dict[int, tuple[str, str]],
+        *,
+        by_share: bool = True,
     ) -> _ExtraSpec | None:
         """Calque catégoriel : `raster` = codes > 0 sur la grille (0 = rien),
         `classes` = code → (libellé, couleur). Légende triée par part de
-        la zone étudiée, classes absentes de la zone omises."""
+        la zone étudiée (dans l'ordre de `classes` si `by_share` est faux),
+        classes absentes de la zone omises."""
         src = np.asarray(raster)
         if src.shape != self._final_score.shape or not classes:
             return None
@@ -1152,7 +1155,8 @@ class MorilleVisualizer:
         ]
         if not legend:
             return None
-        legend.sort(key=lambda c: -float(c["share"]))
+        if by_share:
+            legend.sort(key=lambda c: -float(c["share"]))
         cfg = {**cfg, "kind": "cat", "none": _EXTRA_NONE, "classes": legend}
         logger.info(
             "✅ Calque %s : %d classes, %.0f %% de la zone étudiée",
@@ -1234,6 +1238,68 @@ class MorilleVisualizer:
             for code, name in names_by_code.items()
         }
 
+    def _forest_loss_extra_classes(
+        self,
+    ) -> tuple[dict[str, Any], np.ndarray, dict[int, tuple[str, str]]] | None:
+        """Pertes de couvert par âge, dans les tranches du modèle (D64) :
+        effet plein, puis décroissant, puis plus ancienne (aucun effet)."""
+        age_fn = getattr(self.grid, "forest_loss_age", None)
+        age = age_fn() if callable(age_fn) else None
+        if not isinstance(age, np.ndarray):
+            return None
+        ref = config.forest_loss_reference_year()
+        lo, hi = config.FOREST_LOSS_FRESH_AGES
+        fade = config.FOREST_LOSS_FADE_AGE
+        bands = [  # (âge min, âge max, couleur), du plus récent au plus ancien
+            (lo, hi, "#7a0177"),
+            (hi + 1, fade, "#dd3497"),
+            (fade + 1, ref - 2001, "#e5c6dc"),
+        ]
+        raster = np.zeros(age.shape, dtype=np.uint8)
+        classes: dict[int, tuple[str, str]] = {}
+        for code, (a0, a1, color) in enumerate(bands, start=1):
+            if a1 < a0:
+                continue
+            raster[(age >= a0) & (age <= a1)] = code
+            y0, y1 = ref - a1, ref - a0
+            years = f"{y0}–{y1}" if y1 > y0 else str(y0)
+            span = f"{a0} à {a1} ans" if a1 > a0 else f"{a0} ans"
+            classes[code] = (
+                f"{years} ({span})" if code < len(bands)
+                else f"{years} (plus de {fade} ans)",
+                color,
+            )
+        morels = [
+            self._species_info(sp)["name"] for sp in self.species_list
+            if config.get_species_params(sp).get("recent_loss") == "boost"
+        ]
+        penalized = [
+            self._species_info(sp)["name"] for sp in self.species_list
+            if config.get_species_params(sp).get("recent_loss") == "penalty"
+        ]
+        effects = []
+        if morels:
+            effects.append(
+                f"{' et '.join(morels)} : perturbation pleine de {lo} à {hi} "
+                f"ans après la perte, puis décroissante jusqu'à {fade} ans"
+            )
+        if penalized:
+            effects.append(
+                f"{' et '.join(penalized)} : perturbation nulle de {lo} à {hi} "
+                f"ans (arbres hôtes coupés), puis remontant jusqu'à {fade} ans"
+            )
+        cfg = {
+            "key": "loss", "label": "Coupes et chablis récents",
+            "short": "Perte de couvert", "noneText": "aucune depuis 2001",
+            "hint": "Pertes de couvert arboré détectées par satellite "
+                    "(coupes rases, chablis, dépérissements, incendies), "
+                    "année de la perte : Hansen Global Forest Change "
+                    f"v{config.HANSEN_GFC_VERSION.split('-v')[-1]} "
+                    "(Univ. of Maryland, Google, USGS, NASA ; CC BY 4.0)."
+                    + (" " + " ; ".join(effects) + "." if effects else ""),
+        }
+        return cfg, raster, classes
+
     def _species_groups(self, key: Callable[[dict[str, Any]], Any]) -> list[tuple[Any, str]]:
         """Espèces de la carte regroupées par valeur de paramètre :
         [(valeur, « Morille grise et Morille noire »), …]."""
@@ -1306,6 +1372,12 @@ class MorilleVisualizer:
                 },
                 trees[0], trees[1],
             ))
+
+        # ── Coupes, chablis, dépérissements récents (Hansen GFC, D64) ──
+        loss = self._forest_loss_extra_classes()
+        if loss is not None:
+            specs.append(self._categorical_extra(loss[0], loss[1], loss[2],
+                                                 by_share=False))
 
         # ── Humidité du sol : TWI ──
         twi_text = " ; ".join(

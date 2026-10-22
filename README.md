@@ -28,6 +28,7 @@ Dépendances principales : `numpy`, `scipy`, `geopandas`, `shapely`, `rasterio`,
 | Essences | `FORMATION_VEGETALE.shp` | IGN BD Forêt v2 |
 | Géologie | `geologie_38/GEO050K_HARM_038_S_FGEOL_2154.shp` | BRGM BDCharm-50 |
 | Régions IFN | `rfifn250_l93.shp` | IFN |
+| Coupes et chablis | téléchargé au premier run (tuile Hansen `50N_000E`, 38 Mo), puis `forest_loss_GFC-2025-v1.13_*.tif` en cache | Hansen Global Forest Change v1.13 (Univ. of Maryland, Google, USGS, NASA ; CC BY 4.0) : année de perte du couvert arboré, 2001–2025, pixel ~25 × 30 m |
 
 Hydrographie (cours d'eau, et surfaces en eau BD TOPO pour les rives) et zones urbaines sont récupérées via WFS IGN à défaut de fichier local, puis gardées en cache dans `data/`. L'occupation du sol est dérivée par analyse couleur des tuiles OSM.
 
@@ -154,6 +155,8 @@ Modules d'appui : `weather.py` (modulation météo J+0), `landcover_detector.py`
 | slope | 0.05 | | geology_contact | 0.01 |
 
 Là où la BD Forêt ne donne pas l'essence, `tree_species` est noté par le mélange régional IFN (région × type de forêt × étage × substrat) et son poids devient, cellule par cellule, la **fiabilité de ce mélange** (D51) : ×1 quand une essence domine ou que les essences du mélange ont le même score, ×0 quand le mélange est aussi dispersé que l'échelle des essences de l'espèce (frênaie ou robineraie, on ne sait) — la cellule est alors notée sur ses 13 autres critères.
+
+`disturbance` (perturbation du sol) note les lisières, les pentes à chablis, les abords urbains et les **pertes de couvert récentes** (D64) : coupes rases, chablis, dépérissements et incendies détectés par satellite (Hansen Global Forest Change) valent 1,0 de 1 à 4 ans après la perte puis décroissent jusqu'à 8 ans pour les morilles ; pour le cèpe, dont les arbres hôtes ont été coupés, la perturbation y tombe à 0 et remonte de même (un malus, pas une élimination : le satellite compte aussi des coupes partielles). Calque « Coupes et chablis récents » sur la carte.
 
 Post-traitement :
 1. **Masques éliminatoires** (score → 0), par espèce : urbain (bâtiments, zones bâties, parkings, terrains de sport, routes principales et voies ferrées d'OpenStreetMap ; en maille fine, rues, places et cours de moins de 80 m entre bâtiments comblées — D56, D61), eau et berges (une cellule est éliminée quand l'eau et 5 m de berge en couvrent la moitié : lacs, retenues et lits des rivières larges des surfaces en eau BD TOPO, ruisseaux de la couche hydro IGN supposés larges de 4 m, lacs de la géologie BDCharm-50 ; à 50 m, la cellule traversée par un ruisseau reste notée — D54, D55), NoData du MNT, géologie éliminatoire (morille grise : granite, gneiss, siliceux ; morille noire et cèpe : aucune), absence d'arbre hôte à moins de 30 m (cèpe seulement, mycorhizien strict — D57), pente > 45°, altitude hors plage (morille grise 100–1 400 m, morille noire 300–2 200 m, cèpe 200–2 200 m), engorgement (TWI dont l'écoulement suit le réseau hydrographique gravé dans le MNT, cuvettes comblées — D61). La proximité urbaine n'est plus éliminatoire : c'est un critère (D61).

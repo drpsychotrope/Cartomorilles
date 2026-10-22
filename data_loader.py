@@ -46,6 +46,8 @@ from config import (
     DATA_BUFFER,
     DEM_RESOLUTION_M,
     DEM_SOURCE,
+    HANSEN_GFC_URL,
+    HANSEN_GFC_VERSION,
     RGEALTI_LAYER,
     RGEALTI_WMS_URL,
     WATER_TYPE_BONUS,
@@ -799,6 +801,101 @@ class DataLoader:
         )
         return {"data": dem, "transform": transform, "crs": TARGET_CRS,
                 "source": "RGE ALTI"}
+
+    # ═══════════════════════════════════════════════════════
+    # PERTES DE COUVERT FORESTIER (Hansen GFC, D64)
+    # ═══════════════════════════════════════════════════════
+
+    @staticmethod
+    def _hansen_tiles(b: Mapping[str, float]) -> list[str]:
+        """Tuiles Hansen (10° × 10°, nommées par leur coin nord-ouest, ex.
+        « 50N_000E ») qui couvrent l'emprise WGS84 `b`."""
+        tops = range(
+            int(np.floor(b["south"] / 10.0)) * 10 + 10,
+            int(np.ceil(b["north"] / 10.0)) * 10 + 1, 10,
+        )
+        lefts = range(
+            int(np.floor(b["west"] / 10.0)) * 10,
+            int(np.ceil(b["east"] / 10.0)) * 10, 10,
+        )
+        return [
+            f"{abs(t):02d}{'N' if t >= 0 else 'S'}_{abs(lf):03d}{'E' if lf >= 0 else 'W'}"
+            for t in tops for lf in lefts
+        ]
+
+    @staticmethod
+    def _snap_to_pixels(
+        b: Mapping[str, float], tr: rasterio.Affine,
+    ) -> tuple[float, float, float, float]:
+        """Emprise `b` élargie aux bords des pixels de la grille `tr` : la
+        découpe recopie les pixels de la tuile, sans rééchantillonnage."""
+        rx, ry = tr.a, -tr.e
+        west = tr.c + np.floor((b["west"] - tr.c) / rx) * rx
+        east = tr.c + np.ceil((b["east"] - tr.c) / rx) * rx
+        north = tr.f - np.floor((tr.f - b["north"]) / ry) * ry
+        south = tr.f - np.ceil((tr.f - b["south"]) / ry) * ry
+        return float(west), float(south), float(east), float(north)
+
+    def load_forest_loss(self) -> dict[str, Any] | None:
+        """Année de perte du couvert forestier (Hansen Global Forest Change,
+        D64) sur l'emprise WGS84 des requêtes : uint8, 0 = aucune perte,
+        n = perte en 2000 + n. Tuiles téléchargées une fois (~38 Mo), puis
+        découpe en cache `data/forest_loss_<version>_*.tif`. None si
+        indisponible : le critère perturbation garde ses seuls indices."""
+        from rasterio.merge import merge
+
+        cache = self._cache_path(f"forest_loss_{HANSEN_GFC_VERSION}", "tif")
+        if cache.exists():
+            try:
+                with rasterio.open(cache) as src:
+                    data = src.read(1)
+                    transform = src.transform
+                logger.info("✅ Pertes de couvert (cache) : %s", cache.name)
+                return {"data": data, "transform": transform,
+                        "crs": "EPSG:4326", "version": HANSEN_GFC_VERSION}
+            except RasterioIOError:
+                cache.unlink(missing_ok=True)
+
+        b = self.bbox_wgs84_buffered
+        tile_dir = DATA_DIR / "cache" / "hansen"
+        try:
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            paths: list[Path] = []
+            for tile in self._hansen_tiles(b):
+                path = tile_dir / f"{HANSEN_GFC_VERSION}_lossyear_{tile}.tif"
+                if not path.exists():
+                    url = HANSEN_GFC_URL.format(version=HANSEN_GFC_VERSION, tile=tile)
+                    logger.info("🌲 Pertes de couvert Hansen : tuile %s…", tile)
+                    # .part : une tuile interrompue n'est jamais relue
+                    part = path.with_suffix(".part")
+                    self._download_file(url, part)
+                    part.replace(path)
+                paths.append(path)
+            with ExitStack() as stack:
+                sources = [stack.enter_context(rasterio.open(p)) for p in paths]
+                mosaic, transform = merge(
+                    sources, bounds=self._snap_to_pixels(b, sources[0].transform),
+                    nodata=0,
+                )
+            data = np.asarray(mosaic[0], dtype=np.uint8)
+            with rasterio.open(
+                cache, "w", driver="GTiff", height=data.shape[0],
+                width=data.shape[1], count=1, dtype="uint8", crs="EPSG:4326",
+                transform=transform, compress="deflate",
+            ) as dst:
+                dst.write(data, 1)
+            for p in paths:
+                p.unlink(missing_ok=True)
+            logger.info(
+                "✅ Pertes de couvert Hansen %s : %d × %d pixels, %d en perte",
+                HANSEN_GFC_VERSION, data.shape[1], data.shape[0],
+                int(np.count_nonzero(data)),
+            )
+            return {"data": data, "transform": transform, "crs": "EPSG:4326",
+                    "version": HANSEN_GFC_VERSION}
+        except Exception as e:  # noqa: BLE001 — couche facultative
+            logger.warning("⚠️ Pertes de couvert Hansen indisponibles : %s", e)
+            return None
 
     def _save_dem_cache(self, dem_data: dict[str, Any], cache_path: Path) -> None:
         """Sauvegarde le DEM en cache GeoTIFF."""

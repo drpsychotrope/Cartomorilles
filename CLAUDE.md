@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**CARTOMORILLES** is a probabilistic spatial multicriteria model for mapping favorable zones for mushroom foraging in Isère (France) — three species, modelled in one run: grey morel (*Morchella esculenta*, `esculenta`), black morel (*Morchella elata* group, `elata`) and porcini (*Boletus edulis*, `edulis`), with per-species parameters in `config.SPECIES_PARAMS`. It combines DEM terrain analysis, forest species data (BD Forêt v2), geology (BDCharm-50), hydrology, OSM-derived landcover and the day's weather (Open-Meteo) into a weighted score grid.
+**CARTOMORILLES** is a probabilistic spatial multicriteria model for mapping favorable zones for mushroom foraging in Isère (France) — three species, modelled in one run: grey morel (*Morchella esculenta*, `esculenta`), black morel (*Morchella elata* group, `elata`) and porcini (*Boletus edulis*, `edulis`), with per-species parameters in `config.SPECIES_PARAMS`. It combines DEM terrain analysis, forest species data (BD Forêt v2), geology (BDCharm-50), hydrology, recent forest-cover loss (Hansen Global Forest Change — D64), OSM-derived landcover and the day's weather (Open-Meteo) into a weighted score grid.
 
 - **CRS**: EPSG:2154 (Lambert-93), covering Isère department bbox (~14 091 km², 107.4×131.2 km)
 - **Grid**: cell size chosen automatically from the bbox area (`config.CELL_SIZE_AUTO_THRESHOLDS`) → **50 m** for the department (~5.6M cells); `--cell-size` overrides it (`config.CELL_SIZE` = 20 m is only the config default, replaced at runtime)
@@ -50,7 +50,7 @@ Console (D41): by default only the `[1/4]…[4/4]` step lines, warnings and the 
 ## Pipeline Architecture
 
 ```
-data_loader.py          → ingest DEM, shapefiles, WFS/OSM data
+data_loader.py          → ingest DEM, shapefiles, WFS/OSM data, Hansen forest loss
     ↓
 grid_builder.py         → build spatial grid, compute 14 criteria scores
     ↓
@@ -129,6 +129,7 @@ These decisions are documented in `decisions.md` — do not reverse them without
 | **D61** | Coherence audit, batch 2 (measured): `forest_mask` excludes BD Forêt landes and grassland (ESSENCE `NC`; `NR` clear-cuts stay forest); the D9 dist_water floor applies on every grid (`apply_forest_water_floor`) and D8 reads `forest_mask`; TWI routes D8 flow on a pit-filled DEM (Priority-Flood + ε, `_twi_numba._priority_flood`; slope from the raw DEM); urban proximity is no longer eliminatory; landcover urban mask merged right after `apply_urban_mask`; complete OSM urban layer (buildings, built-up landuse, parkings, sport, main roads, railways) downloaded by tiles with per-tile cache and a User-Agent, never cached when incomplete (`urban_v2_*`), roads added after the D56 gap closing; `--dem` L93 files warped onto the bbox; IGN streams and BD TOPO water surfaces burned 20 m into the TWI routing DEM (`compute_terrain(streams=…)`). `tests/test_forest_mask_d61.py` |
 | **D62** | Map pixel budget: `visualize.render_size` keeps the grid resolution down to `MOBILE_MAX_PIXELS` = 4096² per image (iOS Safari canvas limit); `--hd-map` also writes `cartomorilles_hd.html` up to `HD_MAX_PIXELS` = 64 Mpx (~15 m, desktop). Map layers are canvases shown by Leaflet (`CanvasOverlay`, putImageData — no PNG re-encoding), decoded images freed after reading; data PNG G channel = 0 or 1 + exact class where the truncated score misclassifies; GeoTIFFs deflate 6 + float predictor, tiled; `morilles_probability.tif` is a hard link; per-species criteria and factor masks released after scoring unless `--export-vector`/`--debug-layers`; D56 closing via two EDTs |
 | **D63** | DEM = IGN RGE ALTI® (bare-earth terrain model, Etalab 2.0) read from the Géoplateforme raster WMS (`ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES`, BIL float32) in 25 km tiles requested at 5 m and averaged 2×2 onto the bbox grid at `config.DEM_RESOLUTION_M` = 10 m (`DataLoader._download_rgealti_dem`, per-tile resume cache, cache `data/dem_rgealti10m_*.tif`); slope/aspect/roughness/TWI computed at 10 m whatever the cell size; Copernicus DSM fallback (`DEM_SOURCE`). Grey-morel checkpoints 7/11 → 10/11. `tests/test_rgealti.py` |
+| **D64** | Recent forest-cover loss (Hansen Global Forest Change v1.13, CC BY 4.0; loss year 2001–2025, ~20×28 m pixels; tile `50N_000E` downloaded once, cropped pixel-aligned, cache `data/forest_loss_GFC-2025-v1.13_*.tif` — `DataLoader.load_forest_loss`) feeds the disturbance criterion per species: age = reference year (`FOREST_LOSS_REFERENCE_YEAR`, current year by default, written in the JSON report) − loss year; weight 1 at 1–4 years, then 0.8…0.2 up to 8 years; morels (`recent_loss` = "boost") max(disturbance, weight), porcini ("penalty") disturbance × (1 − weight) — a penalty, never a host elimination (a 2022 porcini lies 40–60 m inside a 2020 Hansen loss: partial cuts). Grid: nearest, or the cell's latest loss year above 30 m (`GridBuilder.set_forest_loss`); step-2 disturbance kept in `_disturbance_base`, applied by `recompute_habitat_scores(species)`. Map layer "Coupes et chablis récents". `tests/test_forest_loss.py` |
 
 ## Session / Branch Workflow
 

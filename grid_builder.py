@@ -36,6 +36,7 @@ from affine import Affine
 from pyproj import Transformer
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
+from rasterio.warp import Resampling, reproject
 from scipy.ndimage import (
     binary_dilation,
     binary_erosion,
@@ -247,6 +248,10 @@ class GridBuilder:
         # Peuplements d'arbres hôtes et distance à eux (D57)
         self.host_forest_mask: np.ndarray | None = None
         self.dist_host_forest: np.ndarray | None = None
+        # Année de perte du couvert forestier (Hansen GFC, D64), 0 = aucune
+        self.forest_loss_year: np.ndarray | None = None
+        # Perturbation commune aux espèces, avant l'effet des coupes (D64)
+        self._disturbance_base: np.ndarray | None = None
 
         # Rasters intermédiaires (pour diagnostics)
         self.tree_raster: np.ndarray | None = None
@@ -853,7 +858,7 @@ class GridBuilder:
         return self
 
 
-    def recompute_habitat_scores(self) -> GridBuilder:
+    def recompute_habitat_scores(self, species: str = "esculenta") -> GridBuilder:
         """Recalcule canopy_openness et ground_cover pour l'espèce en cours.
 
         Leurs bonus « essence favorable » (tree_species > 0.40 / 0.60) et
@@ -861,7 +866,9 @@ class GridBuilder:
         l'espèce : calculés une fois à l'étape 2, ils gardaient la table de
         la 1re espèce pour les suivantes (D60). À appeler après
         l'enrichissement IFN de l'espèce (D47). Le masque des plans d'eau
-        et la modulation landcover sont réappliqués aux deux critères.
+        et la modulation landcover sont réappliqués aux deux critères. La
+        perturbation reçoit l'effet des coupes récentes propre à l'espèce
+        (D64).
         """
         self.score_canopy_openness()
         self.score_ground_cover()
@@ -873,6 +880,8 @@ class GridBuilder:
         if isinstance(green, np.ndarray) and green.shape == (self.ny, self.nx):
             for name in names:
                 self.scores[name] = (self.scores[name] * green).astype(np.float32)
+        # Perturbation : coupes et chablis récents selon l'espèce (D64)
+        self.apply_forest_loss_disturbance(species)
         return self
 
     # ═══════════════════════════════════════════════════════
@@ -2707,6 +2716,85 @@ class GridBuilder:
             int(_um.sum()),
         )
         self._log_score_stats("urban_proximity", score)
+        return self
+
+    def set_forest_loss(self, loss: dict[str, Any] | None) -> GridBuilder:
+        """Année de perte du couvert forestier sur la grille (Hansen GFC,
+        D64 ; 0 = aucune) : plus proche voisin, ou année la plus récente des
+        pixels couverts quand la maille dépasse le pixel Hansen (~30 m),
+        pour qu'une coupe ne disparaisse pas à 50 m."""
+        self.forest_loss_year = None
+        if not loss or loss.get("data") is None:
+            return self
+        dst = np.zeros((self.ny, self.nx), dtype=np.uint8)
+        reproject(
+            source=np.asarray(loss["data"], dtype=np.uint8),
+            destination=dst,
+            src_transform=loss["transform"],
+            src_crs=loss.get("crs", "EPSG:4326"),
+            dst_transform=self.transform,
+            dst_crs="EPSG:2154",
+            resampling=(
+                Resampling.max if self.cell_size > 30.0 else Resampling.nearest
+            ),
+        )
+        self.forest_loss_year = np.where(
+            dst > 0, dst.astype(np.int16) + 2000, 0,
+        ).astype(np.int16)
+        age = self.forest_loss_age()
+        assert age is not None
+        lo, hi = config.FOREST_LOSS_FRESH_AGES
+        logger.info(
+            "   🌲 Pertes de couvert (Hansen %s) : %d cellules, dont %d de "
+            "%d à %d ans (D64)",
+            loss.get("version", "GFC"), int(np.count_nonzero(dst)),
+            int(np.count_nonzero((age >= lo) & (age <= hi))), lo, hi,
+        )
+        return self
+
+    def forest_loss_age(self) -> np.ndarray | None:
+        """Âge (ans) de la perte de couvert de chaque cellule, −1 sans perte
+        (référence : `config.forest_loss_reference_year()`)."""
+        year = self.forest_loss_year
+        if year is None:
+            return None
+        ref = config.forest_loss_reference_year()
+        return np.where(year > 0, ref - year, -1).astype(np.int16)
+
+    def apply_forest_loss_disturbance(self, species: str) -> GridBuilder:
+        """Critère perturbation de l'espèce (D64) : celui de l'étape 2,
+        modulé par l'âge des pertes de couvert (coupe, chablis, incendie) :
+        poids 1 de 1 à 4 ans, puis 0,8 / 0,6 / 0,4 / 0,2 jusqu'à 8 ans.
+        Morilles (`recent_loss` = « boost ») : perturbation pleine (1,0),
+        au moins celle de l'étape 2. Cèpe (« penalty ») : perturbation
+        nulle, ses arbres hôtes ayant été coupés — un malus et non une
+        élimination, Hansen comptant aussi des coupes partielles."""
+        if "disturbance" not in self.scores:
+            return self
+        if self._disturbance_base is None:
+            self._disturbance_base = self.scores["disturbance"].copy()
+        base = self._disturbance_base
+        age = self.forest_loss_age()
+        params = config.SPECIES_PARAMS.get(
+            species, config.SPECIES_PARAMS[config.DEFAULT_SPECIES],
+        )
+        effect = params.get("recent_loss")
+        if effect not in ("boost", "penalty") or age is None:
+            self.scores["disturbance"] = base.copy()
+            return self
+        lo, hi = config.FOREST_LOSS_FRESH_AGES
+        fade = config.FOREST_LOSS_FADE_AGE
+        weight = np.zeros(base.shape, dtype=np.float32)
+        weight[(age >= lo) & (age <= hi)] = 1.0
+        fading = (age > hi) & (age <= fade)
+        weight[fading] = 1.0 - (age[fading] - hi) / float(fade - hi + 1)
+        score = (
+            np.maximum(base, weight) if effect == "boost"
+            else base * (1.0 - weight)
+        )
+        if self.water_mask is not None and self.water_mask.any():
+            score[self.water_mask] = 0.0
+        self.scores["disturbance"] = self._apply_nodata(score).astype(np.float32)
         return self
 
     def _stand_mask(

@@ -1555,6 +1555,8 @@ def main(args: argparse.Namespace) -> int:
     hydro_gdf = loader.load_hydro(args.hydro)
     # Surfaces en eau BD TOPO : rives des lacs et des rivières larges (D55)
     water_surfaces_gdf = loader.load_water_surfaces()
+    # Pertes de couvert forestier (Hansen GFC) : coupes, chablis (D64)
+    forest_loss = loader.load_forest_loss()
 
     urban_gdf = None
     if not args.no_urban:
@@ -1615,6 +1617,7 @@ def main(args: argparse.Namespace) -> int:
         _layer_label(hydro_gdf, "hydrographie"),
         _layer_label(water_surfaces_gdf, "surfaces en eau"),
         _layer_label(urban_gdf, "urbain"),
+        "pertes de couvert" if forest_loss else None,
         "occupation du sol OSM" if landcover_data else None,
     ]
     logger.info(
@@ -1660,6 +1663,8 @@ def main(args: argparse.Namespace) -> int:
     grid.compute_terrain(
         dem_data, streams=[hydro_gdf, water_surfaces_gdf],
     )
+    # Coupes, chablis récents : critère perturbation de chaque espèce (D64)
+    grid.set_forest_loss(forest_loss)
 
     # ── 2b. Scores terrain ────────────────────────────────────
     # Tables de la 1re espèce modélisée, comme l'enrichissement (2c') :
@@ -1821,7 +1826,7 @@ def main(args: argparse.Namespace) -> int:
         # Ouverture de canopée et couvert du sol lisent l'essence et la
         # géologie de l'espèce (bonus « essence favorable », « calcaire ») :
         # recalculés après l'enrichissement de l'espèce (D60)
-        grid.recompute_habitat_scores()
+        grid.recompute_habitat_scores(species)
 
         sp_model = MorilleScoring(grid, species=species)
         sp_model.compute_weighted_score()
@@ -1996,6 +2001,14 @@ def main(args: argparse.Namespace) -> int:
         # ceux de l'espèce, sous species_params (ici ils étaient ceux de la
         # morille grise dans les trois rapports — D60)
         "geology_source": geology_source,
+        "dem_source": getattr(grid, "dem_source", None),
+        # Âge des coupes compté depuis l'année de référence : le critère
+        # perturbation en dépend (D64)
+        "forest_loss": (
+            {"source": f"Hansen {forest_loss.get('version')}",
+             "reference_year": config.forest_loss_reference_year()}
+            if forest_loss else None
+        ),
         "bd_foret_path": bd_foret_path,
         "geology_path": geology_path,
         "regions_path": regions_path,

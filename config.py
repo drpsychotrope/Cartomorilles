@@ -85,6 +85,9 @@ __all__ = [
     # Emprise
     "BBOX_WGS84", "BBOX", "CELL_SIZE", "MAP_CENTER", "DATA_BUFFER",
     "DEM_SOURCE", "DEM_RESOLUTION_M", "RGEALTI_WMS_URL", "RGEALTI_LAYER",
+    "HANSEN_GFC_VERSION", "HANSEN_GFC_URL", "FOREST_LOSS_REFERENCE_YEAR",
+    "FOREST_LOSS_FRESH_AGES", "FOREST_LOSS_FADE_AGE",
+    "forest_loss_reference_year",
     # Chemins données
     "DEM_FILE", "FOREST_SHAPEFILE",
     "DATA_SUBDIR_GEOLOGY", "GEOLOGY_SHAPEFILE",
@@ -201,6 +204,23 @@ DEM_SOURCE: Final[str] = "rgealti"            # "rgealti" | "copernicus"
 DEM_RESOLUTION_M: Final[float] = 10.0
 RGEALTI_WMS_URL: Final[str] = "https://data.geopf.fr/wms-r/wms"
 RGEALTI_LAYER: Final[str] = "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES"
+
+# ── Coupes, chablis, dépérissements récents (D64) ────────────────
+# Perte de couvert forestier de Hansen Global Forest Change (Hansen et al.
+# 2013, UMD/Google/USGS/NASA, CC BY 4.0) : année de perte, pixel d'une
+# seconde d'arc (~25 × 30 m), 2001–2025 pour la version v1.13. Âge d'une
+# perte = année de référence (l'année en cours si None) − année de perte.
+# Effet de 1 à 4 ans, puis décroissant jusqu'à 8 ans : perturbation pleine
+# pour les morilles, nulle pour le cèpe (arbres hôtes coupés ; un malus et
+# non une élimination : Hansen compte aussi des coupes partielles).
+HANSEN_GFC_VERSION: Final[str] = "GFC-2025-v1.13"
+HANSEN_GFC_URL: Final[str] = (
+    "https://storage.googleapis.com/earthenginepartners-hansen/"
+    "{version}/Hansen_{version}_lossyear_{tile}.tif"
+)
+FOREST_LOSS_REFERENCE_YEAR: Final[int | None] = None
+FOREST_LOSS_FRESH_AGES: Final[tuple[int, int]] = (1, 4)
+FOREST_LOSS_FADE_AGE: Final[int] = 8
 
 # ── Auto-scaling résolution ──────────────────────────────────────
 # (seuil_km², cell_m) — premier seuil ≥ emprise gagne.
@@ -1275,6 +1295,8 @@ _SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
         "apply_calcdry":         True,
         "apply_monotony":        True,
         "taxon":                 ("Morchella", "GENUS"),
+        # Coupe, chablis récents : perturbation pleine (D64)
+        "recent_loss":           "boost",
     }),
     "elata": MappingProxyType({
         "common_name":           "Morille noire",
@@ -1298,6 +1320,7 @@ _SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
         "apply_calcdry":         False,                   # anti-habitat xérique de plaine
         "apply_monotony":        True,
         "taxon":                 ("Morchella", "GENUS"),  # occurrences partagées avec la grise
+        "recent_loss":           "boost",                 # morille des coupes et brûlis (D64)
     }),
     "edulis": MappingProxyType({
         "common_name":           "Cèpe",
@@ -1326,6 +1349,8 @@ _SPECIES_PARAMS_DICT: dict[str, MappingProxyType[str, Any]] = {
         "apply_calcdry":         False,                   # OFF — cèpe pas anti-xérique
         "apply_monotony":        True,
         "taxon":                 ("Boletus edulis", "SPECIES"),
+        # Coupe récente : arbres hôtes coupés, perturbation nulle (D64)
+        "recent_loss":           "penalty",
     }),
 }
 
@@ -1351,6 +1376,15 @@ def species_with_taxon(taxon_name: str) -> tuple[str, ...]:
 # ═══════════════════════════════════════════════════════════════
 #  VALIDATION GLOBALE
 # ═══════════════════════════════════════════════════════════════
+
+def forest_loss_reference_year() -> int:
+    """Année de référence de l'âge des pertes de couvert (D64)."""
+    if FOREST_LOSS_REFERENCE_YEAR is not None:
+        return int(FOREST_LOSS_REFERENCE_YEAR)
+    import datetime
+
+    return datetime.date.today().year
+
 
 def slope_breaks(params: Mapping[str, Any]) -> tuple[float, float, float, float]:
     """Bornes du score de pente d'une espèce : (fin de l'optimum, fin du
