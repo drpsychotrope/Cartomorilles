@@ -217,8 +217,8 @@ RGEALTI_LAYER: Final[str] = "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES"
 # mélange par l'étage et le substrat ; frêne, charme, érables… gardent leur
 # part IFN, « Sapin, épicéa » est partagé dans le rapport du mélange.
 # Surfaces comptées sur une maille de STAND_NEIGHBOUR_RES_M.
-STAND_NEIGHBOUR_RADIUS_M: Final[float] = 5000.0
-STAND_NEIGHBOUR_INNER_M: Final[float] = 1000.0
+STAND_NEIGHBOUR_RADIUS_M: Final[float] = 8000.0
+STAND_NEIGHBOUR_INNER_M: Final[float] = 300.0
 STAND_NEIGHBOUR_N0_HA: Final[float] = 100.0
 STAND_NEIGHBOUR_RES_M: Final[float] = 100.0
 

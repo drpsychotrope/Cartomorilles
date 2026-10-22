@@ -17,6 +17,15 @@ import species_enricher as se
 from species_enricher import SpeciesEnricher
 
 _CELL, _N, _C = 20.0, 400, 200           # grille de 8 km, centre (200, 200)
+
+
+@pytest.fixture(autouse=True)
+def _ring(monkeypatch):
+    """Anneau de 1 à 5 km, 100 ha : réglages propres aux tests."""
+    monkeypatch.setattr(config, "STAND_NEIGHBOUR_INNER_M", 1000.0)
+    monkeypatch.setattr(config, "STAND_NEIGHBOUR_RADIUS_M", 5000.0)
+    monkeypatch.setattr(config, "STAND_NEIGHBOUR_N0_HA", 100.0)
+    monkeypatch.setattr(config, "STAND_NEIGHBOUR_RES_M", 100.0)
 _UNKNOWN, _CHAT, _HETRE, _SAPIN = 1, 2, 3, 4
 _NAMES = {_UNKNOWN: "unknown", _CHAT: "châtaignier", _HETRE: "hêtre", _SAPIN: "sapin"}
 
