@@ -85,6 +85,8 @@ __all__ = [
     # Emprise
     "BBOX_WGS84", "BBOX", "CELL_SIZE", "MAP_CENTER", "DATA_BUFFER",
     "DEM_SOURCE", "DEM_RESOLUTION_M", "RGEALTI_WMS_URL", "RGEALTI_LAYER",
+    "STAND_NEIGHBOUR_RADIUS_M", "STAND_NEIGHBOUR_INNER_M",
+    "STAND_NEIGHBOUR_N0_HA", "STAND_NEIGHBOUR_RES_M",
     "HANSEN_GFC_VERSION", "HANSEN_GFC_URL", "FOREST_LOSS_REFERENCE_YEAR",
     "FOREST_LOSS_FRESH_AGES", "FOREST_LOSS_FADE_AGE",
     "forest_loss_reference_year",
@@ -204,6 +206,21 @@ DEM_SOURCE: Final[str] = "rgealti"            # "rgealti" | "copernicus"
 DEM_RESOLUTION_M: Final[float] = 10.0
 RGEALTI_WMS_URL: Final[str] = "https://data.geopf.fr/wms-r/wms"
 RGEALTI_LAYER: Final[str] = "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES"
+
+# ── Essence des peuplements sans essence précise (D65) ───────────
+# Un polygone BD Forêt « Feuillus », « Conifères » ou « Mixte » est noté par
+# le mélange régional IFN (D47) dont la part des essences repérables en
+# peuplement pur est redistribuée selon la composition des peuplements
+# d'essence connue du même type (feuillus / conifères) situés entre
+# STAND_NEIGHBOUR_INNER_M et STAND_NEIGHBOUR_RADIUS_M, de poids
+# N / (N + STAND_NEIGHBOUR_N0_HA), N = leur surface (ha), modulée comme le
+# mélange par l'étage et le substrat ; frêne, charme, érables… gardent leur
+# part IFN, « Sapin, épicéa » est partagé dans le rapport du mélange.
+# Surfaces comptées sur une maille de STAND_NEIGHBOUR_RES_M.
+STAND_NEIGHBOUR_RADIUS_M: Final[float] = 5000.0
+STAND_NEIGHBOUR_INNER_M: Final[float] = 1000.0
+STAND_NEIGHBOUR_N0_HA: Final[float] = 100.0
+STAND_NEIGHBOUR_RES_M: Final[float] = 100.0
 
 # ── Coupes, chablis, dépérissements récents (D64) ────────────────
 # Perte de couvert forestier de Hansen Global Forest Change (Hansen et al.

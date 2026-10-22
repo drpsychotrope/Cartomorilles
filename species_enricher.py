@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import time as _time
+import unicodedata
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any, Final
@@ -30,6 +31,7 @@ from typing import Any, Final
 import requests
 
 import numpy as np
+from scipy.signal import fftconvolve
 
 import _accel
 import config
@@ -461,6 +463,55 @@ _CX: float = 913_100.0
 _CY: float = 6_458_800.0
 
 
+# Vocabulaire des essences de l'enrichissement (accentué, essences fines) ;
+# config.resolve_tree_name rend la forme des tables du modèle (sans accent,
+# chênes regroupés) : correspondance pour les essences du raster (D65)
+_ENRICHER_NAMES: frozenset[str] = (
+    frozenset(_ALT_AFFINITY) | _DECIDUOUS | _CONIFEROUS
+    | {s for p in _REGIONAL_PROPORTIONS.values() for s in p}
+)
+
+
+def _plain(name: str) -> str:
+    """Nom en minuscules, sans accents."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", name.strip().lower())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+_PLAIN_TO_NAME: dict[str, str] = {
+    **{_plain(n): n for n in _ENRICHER_NAMES},
+    "chene": "chêne_sessile", "erable": "érable_champêtre",
+}
+
+
+def _enricher_name(raw: str) -> str:
+    """Nom d'une essence dans le vocabulaire de l'enrichissement."""
+    if raw in _ENRICHER_NAMES:
+        return raw
+    plain = _plain(raw)
+    if plain in _PLAIN_TO_NAME:
+        return _PLAIN_TO_NAME[plain]
+    canon = config.resolve_tree_name(raw)
+    return _PLAIN_TO_NAME.get(canon, canon)
+
+
+def _mix_weights(proportions: Mapping[str, float], band_idx: int) -> dict[str, float]:
+    """Poids proportion × affinité de l'étage de chaque essence d'un mélange
+    (ceux de `SpeciesEnricher._mix_score_strength`), essences de poids nul
+    omises."""
+    weights: dict[str, float] = {}
+    for essence, proportion in proportions.items():
+        if proportion <= 0:
+            continue
+        aff = _ALT_AFFINITY.get(essence)
+        affinity = aff[band_idx] if aff and band_idx < len(aff) else 1.0
+        if proportion * affinity > 0:
+            weights[essence] = proportion * affinity
+    return weights
+
+
 # ═══════════════════════════════════════════════════════════════════
 # FIABILITÉ DU MÉLANGE IFN — poids par cellule de tree_species (D51)
 # ═══════════════════════════════════════════════════════════════════
@@ -802,9 +853,15 @@ class SpeciesEnricher:
             self._inat_fetched = True
 
         # ── Niveaux B+D — vectorisé par combo keys ────────────────
+        # Peuplements d'essence connue voisins (D65)
+        local = (
+            self._local_stand_area(grid, int_raster, code_to_name)
+            if int_raster is not None and code_to_name is not None
+            else None
+        )
         enriched, strength = self._compute_regional_scores(
             _alt, rg_grid, ft_grid, enrichable,
-            substrate_grid=sub_grid, species=species,
+            substrate_grid=sub_grid, species=species, local=local,
         )
 
         n_final = int(np.count_nonzero(enrichable))
@@ -903,6 +960,7 @@ class SpeciesEnricher:
         mask: np.ndarray,
         substrate_grid: np.ndarray | None = None,
         species: str = config.DEFAULT_SPECIES,
+        local: tuple[tuple[str, ...], np.ndarray, int] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Calcule les scores enrichis — vectorisé par combo keys.
@@ -914,6 +972,10 @@ class SpeciesEnricher:
         Retourne (scores, fiabilités) : score NaN là où le mélange régional
         n'apporte aucune essence notée (D46) ; fiabilité du mélange retenu
         (`_mix_score_strength`, D51), 0 sans essence notée. NaN hors masque.
+
+        `local` (`_local_stand_area`) : là où des peuplements d'essence
+        connue du même type entourent la cellule, leur composition est mêlée
+        au mélange régional (`_mix_local`, D65).
         """
         result = np.full_like(altitude, np.nan, dtype=np.float32)
         strength = np.full_like(altitude, np.nan, dtype=np.float32)
@@ -930,6 +992,8 @@ class SpeciesEnricher:
 
         # ── Pré-calcul lookup (region_key, ft, band, sub) → (score, fiabilité) ─
         lookup: dict[tuple[str, int, int, int], tuple[float, float]] = {}
+        # Mélange (essences, proportions) de chaque clé, pour D65
+        mixes: dict[tuple[str, int, int, int], dict[str, float]] = {}
         all_keys = set(self._region_key_map.values()) | {"_default"}
 
         for rk in all_keys:
@@ -942,6 +1006,7 @@ class SpeciesEnricher:
                     lookup[(rk, ft, bi, 0)] = self._mix_score_strength(
                         filtered, bi, species,
                     )
+                    mixes[(rk, ft, bi, 0)] = filtered
                     if has_substrate:
                         for sub_code in range(1, len(_SUB_NAMES)):
                             sub_key = _SUB_NAMES[sub_code]
@@ -953,6 +1018,7 @@ class SpeciesEnricher:
                                     modulated, bi, species,
                                 )
                             )
+                            mixes[(rk, ft, bi, sub_code)] = modulated
 
         # ── Combo key int32 : region*1000 + ft*100 + band*10 + sub ─
         region_i32 = np.asarray(region_grid, dtype=np.int32)
@@ -972,6 +1038,8 @@ class SpeciesEnricher:
         score_lut = np.full(unique_keys.size, np.nan, dtype=np.float32)
         strength_lut = np.zeros(unique_keys.size, dtype=np.float32)
         no_mix: tuple[float, float] = (float("nan"), 0.0)
+        # Mélange retenu de chaque clé : (proportions, type, étage, substrat)
+        chosen: list[tuple[dict[str, float], int, int, int]] = []
 
         for i, key in enumerate(unique_keys):
             r_int = int(key // 1000)
@@ -984,22 +1052,220 @@ class SpeciesEnricher:
             # Mélange le plus précis qui ait un score, sinon régional,
             # sinon défaut ; NaN si aucun n'en a. La fiabilité suit le
             # mélange retenu.
-            candidates = (
-                lookup.get((rk, ft, bi, sv), no_mix),
-                lookup.get((rk, ft, bi, 0), no_mix),
-                lookup.get(("_default", ft, bi, 0), no_mix),
+            cand_keys = ((rk, ft, bi, sv), (rk, ft, bi, 0), ("_default", ft, bi, 0))
+            candidates = tuple(lookup.get(k, no_mix) for k in cand_keys)
+            pick = next(
+                (j for j, c in enumerate(candidates) if not np.isnan(c[0])),
+                None,
             )
-            score, rel = next(
-                (c for c in candidates if not np.isnan(c[0])), no_mix,
-            )
+            score, rel = candidates[pick] if pick is not None else no_mix
             score_lut[i] = score
             strength_lut[i] = rel
+            k_used = cand_keys[pick if pick is not None else 0]
+            chosen.append((mixes.get(k_used, {}), ft, bi, k_used[3]))
 
         # Une seule affectation par grille (au lieu d'un masque par combo)
         result[mask] = score_lut[inverse.ravel()]
         strength[mask] = strength_lut[inverse.ravel()]
 
+        if local is not None:
+            self._mix_local(
+                result, strength, mask, inverse.ravel(), chosen, local, species,
+            )
         return result, strength
+
+    def _local_stand_area(
+        self,
+        grid: Any,
+        int_raster: np.ndarray,
+        code_to_name: Mapping[int, str],
+    ) -> tuple[tuple[str, ...], np.ndarray, int] | None:
+        """Surface (ha) des peuplements de chaque essence connue entre
+        `config.STAND_NEIGHBOUR_INNER_M` et `STAND_NEIGHBOUR_RADIUS_M` de
+        chaque maille de `STAND_NEIGHBOUR_RES_M` (D65) : (essences, surfaces
+        (essence, ligne, colonne), mailles de la grille par maille de
+        calcul). None sans peuplement d'essence connue."""
+        codes_of: dict[str, list[int]] = {}
+        for code, name in code_to_name.items():
+            canon = _enricher_name(str(name))
+            if int(code) > 0 and canon and canon != "unknown":
+                codes_of.setdefault(canon, []).append(int(code))
+        if not codes_of:
+            return None
+        names = tuple(sorted(codes_of))
+        lut = np.full(int(max(code_to_name)) + 1, -1, dtype=np.int8)
+        for k, name in enumerate(names):
+            lut[codes_of[name]] = k
+
+        cell = float(grid.cell_size)
+        f = max(1, int(round(config.STAND_NEIGHBOUR_RES_M / cell)))
+        ny, nx = int_raster.shape
+        cy, cx = -(-ny // f), -(-nx // f)
+        counts = np.zeros(len(names) * cy * cx, dtype=np.float64)
+        step = f * max(1, 4096 // f)   # bandes de lignes : mémoire bornée
+        for r0 in range(0, ny, step):
+            band = lut[np.clip(int_raster[r0:r0 + step], 0, lut.size - 1)]
+            rr, cc = np.nonzero(band >= 0)
+            idx = (band[rr, cc].astype(np.int64) * cy + (rr + r0) // f) * cx + cc // f
+            counts += np.bincount(idx, minlength=counts.size)
+        area = (counts.reshape(len(names), cy, cx) * cell * cell / 1e4).astype(np.float32)
+
+        res = f * cell
+        r_out = config.STAND_NEIGHBOUR_RADIUS_M / res
+        r_in = config.STAND_NEIGHBOUR_INNER_M / res
+        half = int(np.floor(r_out))
+        yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
+        d2 = (xx * xx + yy * yy).astype(np.float64)
+        ring = ((d2 <= r_out * r_out) & (d2 >= r_in * r_in)).astype(np.float32)
+        out = np.zeros_like(area)
+        for k in range(len(names)):
+            if area[k].any():
+                out[k] = np.clip(fftconvolve(area[k], ring, mode="same"), 0.0, None)
+        logger.info(
+            "  Peuplements voisins (D65) : %d essences connues, %.0f ha, "
+            "anneau %.0f–%.0f m, maille %.0f m",
+            len(names), float(area.sum()), config.STAND_NEIGHBOUR_INNER_M,
+            config.STAND_NEIGHBOUR_RADIUS_M, res,
+        )
+        return names, out, f
+
+    def _mix_local(
+        self,
+        result: np.ndarray,
+        strength: np.ndarray,
+        mask: np.ndarray,
+        key_of_cell: np.ndarray,
+        chosen: list[tuple[dict[str, float], int, int, int]],
+        local: tuple[tuple[str, ...], np.ndarray, int],
+        species: str,
+    ) -> None:
+        """Mêle au mélange régional de chaque cellule du masque la
+        composition des peuplements d'essence connue de son type (D65),
+        puis score et fiabilité comme `_mix_score_strength`. Cellules sans
+        voisin connu : inchangées.
+
+        Poids w = N / (N + STAND_NEIGHBOUR_N0_HA), N = surface voisine du
+        type (ha). Composition locale modulée comme le mélange (affinité de
+        l'étage, substrat). Seule la part régionale des essences repérables
+        en peuplement pur (celles des voisins) est redistribuée :
+        q = p + w·(P_K·local − p·[s ∈ K]) ; frêne, charme, érables…, jamais
+        purs dans la BD Forêt, gardent leur part IFN. La classe « Sapin,
+        épicéa » (essence « sapin ») est partagée entre sapin et épicéa dans
+        le rapport du mélange régional."""
+        names, area, f = local
+        rows, cols = np.nonzero(mask)
+        cy, cx = area.shape[1:]
+        coarse = (rows // f).astype(np.int64) * cx + cols // f
+        flat = area.reshape(len(names), -1)
+        n0 = float(config.STAND_NEIGHBOUR_N0_HA)
+
+        # Univers d'essences, scores de l'espèce modélisée
+        universe = sorted(
+            set(names) | {"épicéa"} | {s for mix, *_ in chosen for s in mix}
+        )
+        pos = {s: j for j, s in enumerate(universe)}
+        sc = np.array([config.get_tree_score(s, species) for s in universe])
+        sc = np.where(np.isfinite(sc) & (sc < 0), 0.25, sc)
+        scored = np.isfinite(sc)
+        sc0 = np.where(scored, sc, 0.0)
+        var_ref = _table_variance(species)
+        in_k = np.zeros(len(universe), dtype=bool)          # repérables
+        in_k[[pos[s] for s in names]] = True
+        fir = names.index("sapin") if "sapin" in names else -1
+        if fir >= 0:
+            in_k[pos["épicéa"]] = True
+
+        def affinity(s: str, bi: int) -> float:
+            aff = _ALT_AFFINITY.get(s)
+            return aff[bi] if aff and bi < len(aff) else 1.0
+
+        # Par clé : mélange régional (poids normalisés), essences du type,
+        # modulation étage × substrat de la composition locale, part de
+        # l'épicéa dans « Sapin, épicéa »
+        nk = len(chosen)
+        prior = np.zeros((nk, len(universe)))
+        in_type = np.zeros((nk, len(names)), dtype=bool)
+        modul = np.ones((nk, len(names)))
+        spruce = np.zeros(nk)                    # masse épicéa par ha « sapin »
+        for k, (mix, ft, bi, sv) in enumerate(chosen):
+            w = _mix_weights(mix, bi)
+            tot = sum(w.values())
+            for s, v in w.items():
+                prior[k, pos[s]] = v / tot if tot > 0 else 0.0
+            types = (
+                _DECIDUOUS if ft == _FT_FEUILLUS
+                else _CONIFEROUS if ft == _FT_CONIFERES
+                else _DECIDUOUS | _CONIFEROUS
+            )
+            mods = _SUBSTRATE_MODIFIERS.get(_SUB_NAMES[sv], {}) if sv > 0 else {}
+            for j, s in enumerate(names):
+                in_type[k, j] = s in types
+                modul[k, j] = affinity(s, bi) * mods.get(s, 1.0)
+            if fir >= 0:
+                ps, pe = mix.get("sapin", 0.0), mix.get("épicéa", 0.0)
+                share_fir = ps / (ps + pe) if ps + pe > 0 else 1.0
+                modul[k, fir] *= share_fir
+                spruce[k] = (
+                    (1.0 - share_fir) * affinity("épicéa", bi)
+                    * mods.get("épicéa", 1.0)
+                )
+
+        # Surface voisine du type de chaque cellule ; seules les cellules
+        # entourées de peuplements connus changent
+        n_area = np.zeros(rows.size)
+        for j in range(len(names)):
+            hit = in_type[key_of_cell, j]
+            n_area[hit] += flat[j, coarse[hit]]
+        touched = np.flatnonzero(n_area > 0)
+        if touched.size == 0:
+            return
+        pair = key_of_cell[touched].astype(np.int64) * flat.shape[1] + coarse[touched]
+        uniq, inv = np.unique(pair, return_inverse=True)
+        u_key = (uniq // flat.shape[1]).astype(np.int64)
+        u_cell = uniq % flat.shape[1]
+        u_score = np.empty(uniq.size, dtype=np.float32)
+        u_rel = np.empty(uniq.size, dtype=np.float32)
+        name_pos = np.array([pos[s] for s in names])
+        chunk = 100_000
+        for c0 in range(0, uniq.size, chunk):
+            kk, cc = u_key[c0:c0 + chunk], u_cell[c0:c0 + chunk]
+            loc = flat[:, cc].T * in_type[kk]                 # (paires, essences)
+            n_loc = loc.sum(axis=1)
+            mass = np.zeros((kk.size, len(universe)))
+            mass[:, name_pos] = loc * modul[kk]
+            if fir >= 0:
+                mass[:, pos["épicéa"]] += loc[:, fir] * spruce[kk]
+            tot = mass.sum(axis=1)
+            share = np.divide(mass, tot[:, None], out=np.zeros_like(mass), where=tot[:, None] > 0)
+            w_loc = np.where(tot > 0, n_loc / (n_loc + n0), 0.0)[:, None]
+            p = prior[kk]
+            p_k = (p * in_k).sum(axis=1, keepdims=True)
+            q = np.where(
+                p_k > 0,
+                p + w_loc * (p_k * share - p * in_k),
+                (1.0 - w_loc) * p + w_loc * share,
+            )
+            w_all = q.sum(axis=1)
+            ws = q * scored
+            w_sc = ws.sum(axis=1)
+            ok = w_sc > 1e-10
+            mean = np.divide((ws * sc0).sum(axis=1), w_sc, out=np.full_like(w_sc, np.nan), where=ok)
+            dev = (sc0[None, :] - np.nan_to_num(mean)[:, None]) ** 2
+            var = np.divide((ws * dev).sum(axis=1), w_sc, out=np.zeros_like(w_sc), where=ok)
+            explained = 1.0 - var / var_ref if var_ref > 0 else np.ones_like(var)
+            rel = np.where(ok, (w_sc / np.maximum(w_all, 1e-12)) * np.maximum(0.0, explained), 0.0)
+            u_score[c0:c0 + chunk] = np.where(ok, np.clip(mean, 0.05, 1.0), np.nan)
+            u_rel[c0:c0 + chunk] = np.clip(rel, 0.0, 1.0)
+
+        rr, cc = rows[touched], cols[touched]
+        result[rr, cc] = u_score[inv]
+        strength[rr, cc] = u_rel[inv]
+        logger.info(
+            "  Peuplements voisins (D65) [%s] : %d cellules (%.0f %% des "
+            "cellules à enrichir) mêlées à leur composition, poids moyen %.2f",
+            species, touched.size, touched.size / max(rows.size, 1) * 100,
+            float((n_area[touched] / (n_area[touched] + n0)).mean()),
+        )
 
     @staticmethod
     def _apply_substrate_modifiers(
