@@ -112,9 +112,10 @@ _WARN_CELLS = 50_000_000  # 50M — avertit sur la mémoire et la durée
 # Mémoire de pointe mesurée (trois espèces, carte HD) : 13,0 Go pour 35,2 M
 # cellules (20 m), 36,1 Go pour 140,9 M (10 m) ≈ 5,3 Go fixes + 220 octets
 # par cellule (D62) ; terrain calculé sur le RGE ALTI à 10 m : 38,2 Go à
-# 10 m (D63), d'où ~2 Go fixes de plus
+# 10 m (D63), d'où ~2 Go fixes de plus ; pertes de couvert (année par
+# cellule, perturbation de l'étape 2 gardée à part) : 39,0 Go (D64)
 _PEAK_FIXED_BYTES = 7.3e9
-_PEAK_BYTES_PER_CELL = 220
+_PEAK_BYTES_PER_CELL = 226
 
 # ── Résumé console / carte ────────────────────────────────────
 _CONSOLE_HOTSPOTS_DEFAULT = 5   # hotspots listés par espèce en fin de run
